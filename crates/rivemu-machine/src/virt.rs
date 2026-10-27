@@ -5,11 +5,16 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use rivemu_core::{GuestAddr, align_up, size::MIB};
+use rivemu_core::{GuestAddr, HostTimebase, Timebase, align_down, align_up, size::MIB};
+use rivemu_cpu_riscv::csr::envcfg;
+use rivemu_cpu_riscv::{Hart, HartIrqs};
+use rivemu_devices::{Clint, GoldfishRtc, Plic, PowerControl, PowerEvent, SifiveTest, Uart16550};
 use rivemu_mem::{AddressSpace, MapError, Ram};
 use thiserror::Error;
 
+use crate::fdt::{self, FdtParams};
 use crate::loader::{self, LoadError};
 
 /// Physical memory map of the `virt` board (base, size).
@@ -38,6 +43,21 @@ pub mod memmap {
 
 /// Default RAM size (QEMU's default for `-machine virt`).
 pub const DEFAULT_RAM_SIZE: u64 = 128 * MIB;
+/// Frequency of `mtime` / the `time` CSR (same as QEMU).
+pub const TIMEBASE_FREQ: u64 = 10_000_000;
+/// PLIC source of the UART.
+pub const UART0_IRQ: u32 = 10;
+/// PLIC source of the RTC.
+pub const RTC_IRQ: u32 = 11;
+/// PLIC source of the first virtio-mmio transport.
+pub const VIRTIO_IRQ: u32 = 1;
+/// Number of PLIC sources (including the reserved source 0).
+pub const PLIC_NUM_SOURCES: usize = 96;
+/// Instructions each hart executes per scheduling slice.
+pub const QUANTUM: u64 = 10_000;
+/// Longest time the machine loop sleeps while all harts are idle.
+pub const MAX_IDLE: Duration = Duration::from_millis(10);
+
 /// Maximum number of harts supported by the board.
 pub const MAX_HARTS: u32 = 512;
 
@@ -152,6 +172,20 @@ pub struct Machine {
     pub ram: Arc<Ram>,
     /// Image placement.
     pub boot: BootInfo,
+    /// Guest physical address of the device tree.
+    pub fdt_addr: GuestAddr,
+    /// The harts.
+    pub harts: Vec<Hart>,
+    /// Console UART.
+    pub uart: Arc<Uart16550>,
+    /// Timer / software interrupt controller.
+    pub clint: Arc<Clint>,
+    /// External interrupt controller.
+    pub plic: Arc<Plic>,
+    /// Guest power requests.
+    pub power: Arc<PowerControl>,
+    /// Platform timebase.
+    pub timebase: Arc<HostTimebase>,
 }
 
 fn read_file(what: &'static str, path: &Path) -> Result<Vec<u8>, MachineError> {
@@ -225,6 +259,40 @@ impl Machine {
         bus.add_ram("riscv_virt_board.ram", memmap::DRAM_BASE, ram.clone())?;
         let ram_end = memmap::DRAM_BASE + config.ram_size;
 
+        // Harts and devices.
+        let timebase = Arc::new(HostTimebase::new(TIMEBASE_FREQ));
+        let tb: Arc<dyn Timebase> = timebase.clone();
+        let mut harts: Vec<Hart> = (0..config.smp)
+            .map(|i| Hart::new(u64::from(i), tb.clone()))
+            .collect();
+        let lines: Vec<Arc<HartIrqs>> = harts.iter().map(|h| h.irqs.clone()).collect();
+        let clint = Arc::new(Clint::new(tb, lines.clone()));
+        let plic = Arc::new(Plic::new(PLIC_NUM_SOURCES, lines));
+        let uart = Arc::new(Uart16550::new(plic.line(UART0_IRQ)));
+        let power = PowerControl::new();
+        let mrom = Arc::new(
+            Ram::new(memmap::MROM.1).map_err(|source| MachineError::Ram {
+                size: memmap::MROM.1,
+                source,
+            })?,
+        );
+        bus.add_rom("riscv_virt_board.mrom", memmap::MROM.0, mrom)?;
+        let (b, s) = memmap::TEST;
+        bus.add_mmio(
+            "riscv.sifive.test",
+            b,
+            s,
+            Arc::new(SifiveTest::new(power.clone())),
+        )?;
+        let (b, s) = memmap::RTC;
+        bus.add_mmio("goldfish_rtc", b, s, Arc::new(GoldfishRtc::new()))?;
+        let (b, s) = memmap::CLINT;
+        bus.add_mmio("riscv.sifive.clint", b, s, clint.clone())?;
+        let (b, s) = memmap::PLIC;
+        bus.add_mmio("riscv.sifive.plic", b, s, plic.clone())?;
+        let (b, s) = memmap::UART0;
+        bus.add_mmio("serial", b, s, uart.clone())?;
+
         let mut boot = BootInfo::default();
 
         if let Some(path) = &config.bios {
@@ -273,13 +341,124 @@ impl Machine {
             .or(boot.kernel.as_ref())
             .map_or(memmap::DRAM_BASE, |img| img.entry);
 
+        // Device tree: user supplied or generated, placed at the end of
+        // (low) DRAM like QEMU does.
+        let fdt = match &boot.dtb {
+            Some(d) => d.clone(),
+            None => fdt::build(&FdtParams {
+                harts: config.smp,
+                ram_size: config.ram_size,
+                bootargs: config.append.as_deref(),
+                initrd: boot.initrd,
+                plic_ndev: PLIC_NUM_SOURCES as u32 - 1,
+                virtio: Vec::new(),
+            }),
+        };
+        let fdt_top = ram_end.min(3072 * MIB);
+        let fdt_addr = align_down(fdt_top - fdt.len() as u64, 2 * MIB);
+        let used_end = [boot.firmware.as_ref(), boot.kernel.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|i| i.end)
+            .chain(boot.initrd.map(|(_, e)| e))
+            .max()
+            .unwrap_or(memmap::DRAM_BASE);
+        if fdt_addr < used_end {
+            return Err(MachineError::Config(
+                "not enough guest RAM for the device tree; increase -m".into(),
+            ));
+        }
+        bus.load_bytes(fdt_addr, &fdt)
+            .map_err(|e| MachineError::Config(format!("cannot place device tree: {e}")))?;
+
+        // Reset vector + fw_dynamic info in the mask ROM.
+        let next_addr = boot.kernel.as_ref().map_or(0, |k| k.entry);
+        bus.load_bytes(
+            memmap::MROM.0,
+            &reset_vector(boot.entry, fdt_addr, next_addr),
+        )
+        .expect("mask ROM is mapped");
+        for h in &mut harts {
+            h.reset(memmap::MROM.0);
+        }
+
         Ok(Self {
             config,
             bus,
             ram,
             boot,
+            fdt_addr,
+            harts,
+            uart,
+            clint,
+            plic,
+            power,
+            timebase,
         })
     }
+
+    /// Runs every hart for one scheduling slice. Returns a pending power
+    /// event (poweroff / reset) requested by the guest, if any.
+    pub fn run_slice(&mut self) -> Option<PowerEvent> {
+        self.clint.update();
+        for h in &mut self.harts {
+            h.run(&self.bus, QUANTUM);
+        }
+        self.power.take()
+    }
+
+    /// Whether all harts are waiting for an interrupt.
+    pub fn all_idle(&self) -> bool {
+        self.harts.iter().all(|h| h.wfi)
+    }
+
+    /// How long the host may sleep before the next timer event.
+    pub fn idle_timeout(&self) -> Duration {
+        let now = self.timebase.now();
+        let stimecmp = self
+            .harts
+            .iter()
+            .filter(|h| h.csr.menvcfg & envcfg::STCE != 0 && h.csr.stimecmp > now)
+            .map(|h| h.csr.stimecmp);
+        match self.clint.next_deadline().into_iter().chain(stimecmp).min() {
+            Some(d) => {
+                Duration::from_nanos(self.timebase.ticks_to_ns(d.saturating_sub(now))).min(MAX_IDLE)
+            }
+            None => MAX_IDLE,
+        }
+    }
+
+    /// Total instructions retired by all harts.
+    pub fn instret(&self) -> u64 {
+        self.harts.iter().map(Hart::instret).sum()
+    }
+}
+
+/// QEMU-compatible reset vector followed by `fw_dynamic_info` (version 2).
+fn reset_vector(start: GuestAddr, fdt_addr: GuestAddr, next_addr: GuestAddr) -> Vec<u8> {
+    const CODE: [u32; 6] = [
+        0x0000_0297, // auipc t0, 0
+        0x0282_8613, // addi  a2, t0, 40   (&fw_dynamic_info)
+        0xf140_2573, // csrr  a0, mhartid
+        0x0202_b583, // ld    a1, 32(t0)   (fdt address)
+        0x0182_b283, // ld    t0, 24(t0)   (start address)
+        0x0002_8067, // jr    t0
+    ];
+    const FW_DYNAMIC_MAGIC: u64 = 0x4942_534f; // "OSBI"
+    let mut v: Vec<u8> = CODE.iter().flat_map(|w| w.to_le_bytes()).collect();
+    for word in [
+        start,
+        fdt_addr,
+        FW_DYNAMIC_MAGIC,
+        2,         // version
+        next_addr, // next_addr
+        1,         // next_mode: S-mode
+        0,         // options
+        0,         // boot_hart
+    ] {
+        v.extend_from_slice(&word.to_le_bytes());
+    }
+    v
 }
 
 #[cfg(test)]

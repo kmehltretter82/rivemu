@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod console;
 pub mod opts;
 
 use std::path::{Path, PathBuf};

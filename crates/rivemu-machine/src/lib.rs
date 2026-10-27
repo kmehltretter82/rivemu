@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+mod fdt;
 pub mod loader;
 pub mod virt;
 

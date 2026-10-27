@@ -14,12 +14,15 @@ publish = false
 [workspace.dependencies]
 rivemu-core = { path = "crates/rivemu-core" }
 rivemu-cpu-riscv = { path = "crates/rivemu-cpu-riscv" }
+rivemu-devices = { path = "crates/rivemu-devices" }
+rivemu-fdt = { path = "crates/rivemu-fdt" }
 rivemu-mem = { path = "crates/rivemu-mem" }
 rivemu-machine = { path = "crates/rivemu-machine" }
 rivemu-softfloat = { path = "crates/rivemu-softfloat" }
 
 anyhow = "1"
 memmap2 = "0.9"
+rustix = "1"
 thiserror = "2"
 
 [workspace.lints.rust]

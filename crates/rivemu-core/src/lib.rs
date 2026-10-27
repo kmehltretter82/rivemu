@@ -106,6 +106,43 @@ impl Timebase for FrozenTimebase {
     }
 }
 
+/// A timebase derived from the host monotonic clock.
+#[derive(Clone, Copy, Debug)]
+pub struct HostTimebase {
+    clock: HostClock,
+    freq_hz: u64,
+}
+
+impl HostTimebase {
+    /// Creates a timebase ticking at `freq_hz`, starting at 0.
+    pub fn new(freq_hz: u64) -> Self {
+        assert!(
+            freq_hz > 0 && 1_000_000_000 % freq_hz == 0,
+            "unsupported frequency"
+        );
+        Self {
+            clock: HostClock::new(),
+            freq_hz,
+        }
+    }
+
+    /// Ticks per second.
+    pub fn freq_hz(&self) -> u64 {
+        self.freq_hz
+    }
+
+    /// Converts a tick count into nanoseconds.
+    pub fn ticks_to_ns(&self, ticks: u64) -> u64 {
+        ticks.saturating_mul(1_000_000_000 / self.freq_hz)
+    }
+}
+
+impl Timebase for HostTimebase {
+    fn now(&self) -> u64 {
+        self.clock.now_ns() / (1_000_000_000 / self.freq_hz)
+    }
+}
+
 /// Monotonic host clock, used as the default time source for guest timers.
 #[derive(Clone, Copy, Debug)]
 pub struct HostClock {

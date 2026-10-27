@@ -14,7 +14,9 @@ name = "rivemu-system-riscv64"
 path = "src/main.rs"
 
 [dependencies]
+rivemu-devices.workspace = true
 rivemu-machine.workspace = true
+rustix = { workspace = true, features = ["termios"] }
 anyhow.workspace = true
 thiserror.workspace = true
 

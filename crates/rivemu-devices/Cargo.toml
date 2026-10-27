@@ -1,0 +1,18 @@
+[package]
+name = "rivemu-devices"
+description = "Platform devices for rivemu: UART, CLINT, PLIC, RTC, test/power device"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+rivemu-core.workspace = true
+rivemu-cpu-riscv.workspace = true
+rivemu-mem.workspace = true
+
+[lints]
+workspace = true

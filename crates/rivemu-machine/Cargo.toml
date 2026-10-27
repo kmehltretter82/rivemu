@@ -11,6 +11,9 @@ publish.workspace = true
 
 [dependencies]
 rivemu-core.workspace = true
+rivemu-cpu-riscv.workspace = true
+rivemu-devices.workspace = true
+rivemu-fdt.workspace = true
 rivemu-mem.workspace = true
 thiserror.workspace = true
 
