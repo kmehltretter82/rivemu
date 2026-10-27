@@ -9,6 +9,7 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/kmehltretter82/rivemu"
 authors = ["Karl Mehltretter <kmehltretter@gmail.com>"]
+publish = false
 
 [workspace.dependencies]
 rivemu-core = { path = "crates/rivemu-core" }
