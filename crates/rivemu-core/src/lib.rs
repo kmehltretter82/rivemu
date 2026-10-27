@@ -90,6 +90,22 @@ pub trait IrqLine: Send + Sync {
     }
 }
 
+/// Source of the platform timebase (RISC-V `mtime` / `time` CSR), in ticks.
+pub trait Timebase: Send + Sync {
+    /// Current timebase value.
+    fn now(&self) -> u64;
+}
+
+/// A timebase that never advances (useful for tests).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrozenTimebase(pub u64);
+
+impl Timebase for FrozenTimebase {
+    fn now(&self) -> u64 {
+        self.0
+    }
+}
+
 /// Monotonic host clock, used as the default time source for guest timers.
 #[derive(Clone, Copy, Debug)]
 pub struct HostClock {

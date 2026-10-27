@@ -27,6 +27,23 @@ jobs:
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
 
+  riscv-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang lld binutils-riscv64-unknown-elf
+      - uses: actions/cache@v4
+        with:
+          path: images/riscv-tests
+          key: riscv-tests-${{ hashFiles('scripts/build-riscv-tests.sh', 'scripts/riscv-tests-include/*') }}
+      - run: scripts/build-riscv-tests.sh
+      - run: cargo test --release -p rivemu-cpu-riscv --test riscv_tests -- --nocapture
+        env:
+          RIVEMU_REQUIRE_RISCV_TESTS: 1
+
   msrv:
     name: msrv (1.85)
     runs-on: ubuntu-latest

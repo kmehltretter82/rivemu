@@ -1,0 +1,13 @@
+[package]
+name = "rivemu-softfloat"
+description = "Bit-exact IEEE-754 binary32/binary64 arithmetic with RISC-V F/D semantics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

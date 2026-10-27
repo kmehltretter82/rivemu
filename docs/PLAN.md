@@ -140,3 +140,5 @@ Total for P0–P5: roughly **4 months** for one developer.
 
 ## 7. Progress
 - [x] **P0** – workspace, CI, `rivemu-core`, `rivemu-mem`, loaders, CLI skeleton
+- [x] **P1** – RV64GC interpreter, `rivemu-softfloat` (exact IEEE, all rounding modes)
+- [x] **P2** – M/S/U, traps/delegation, Sv39/Sv48 + TLB, Sstc; all 244 riscv-tests (`-p` and `-v`) pass

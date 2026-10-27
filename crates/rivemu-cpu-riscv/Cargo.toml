@@ -1,0 +1,21 @@
+[package]
+name = "rivemu-cpu-riscv"
+description = "RISC-V RV64GC hart: decoder, interpreter, CSRs, MMU and traps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+rivemu-core.workspace = true
+rivemu-mem.workspace = true
+rivemu-softfloat.workspace = true
+
+[dev-dependencies]
+rivemu-machine.workspace = true
+
+[lints]
+workspace = true

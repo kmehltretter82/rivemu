@@ -55,6 +55,16 @@ name = "rivemu-core"
 version = "0.1.0"
 
 [[package]]
+name = "rivemu-cpu-riscv"
+version = "0.1.0"
+dependencies = [
+ "rivemu-core",
+ "rivemu-machine",
+ "rivemu-mem",
+ "rivemu-softfloat",
+]
+
+[[package]]
 name = "rivemu-machine"
 version = "0.1.0"
 dependencies = [
@@ -71,6 +81,10 @@ dependencies = [
  "rivemu-core",
  "thiserror",
 ]
+
+[[package]]
+name = "rivemu-softfloat"
+version = "0.1.0"
 
 [[package]]
 name = "syn"
