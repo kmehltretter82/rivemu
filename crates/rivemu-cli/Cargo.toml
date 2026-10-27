@@ -1,0 +1,21 @@
+[package]
+name = "rivemu-cli"
+description = "QEMU-compatible command line front end for rivemu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rivemu-system-riscv64"
+path = "src/main.rs"
+
+[dependencies]
+rivemu-machine.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

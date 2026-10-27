@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kmehltretter82/rivemu"
+authors = ["Karl Mehltretter <kmehltretter@gmail.com>"]
+
+[workspace.dependencies]
+rivemu-core = { path = "crates/rivemu-core" }
+rivemu-mem = { path = "crates/rivemu-mem" }
+rivemu-machine = { path = "crates/rivemu-machine" }
+
+anyhow = "1"
+memmap2 = "0.9"
+thiserror = "2"
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"
+codegen-units = 1
