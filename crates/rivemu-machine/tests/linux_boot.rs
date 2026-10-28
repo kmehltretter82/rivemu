@@ -17,8 +17,7 @@ fn image_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../images/linux-test")
 }
 
-#[test]
-fn boots_linux_with_virtio_blk_net_console_rng_and_powers_off() {
+fn run_linux_boot_test(use_external_opensbi: bool) {
     let required = std::env::var_os("RIVEMU_REQUIRE_LINUX_TEST").is_some();
     let enabled = required || std::env::var_os("RIVEMU_LINUX_TEST").is_some();
     if !enabled {
@@ -27,10 +26,15 @@ fn boots_linux_with_virtio_blk_net_console_rng_and_powers_off() {
     }
 
     let dir = image_dir();
-    let bios = dir.join("fw_dynamic.bin");
+    let bios_path = dir.join("fw_dynamic.bin");
     let kernel = dir.join("Image");
     let initrd = dir.join("rootfs.cpio");
-    for p in [&bios, &kernel, &initrd] {
+    let required_files: Vec<&PathBuf> = if use_external_opensbi {
+        vec![&bios_path, &kernel, &initrd]
+    } else {
+        vec![&kernel, &initrd]
+    };
+    for p in required_files {
         if !p.is_file() {
             assert!(
                 !required,
@@ -51,7 +55,7 @@ fn boots_linux_with_virtio_blk_net_console_rng_and_powers_off() {
         ram_size: 256 * MIB,
         smp: 4,
         icount: None,
-        bios: Some(bios),
+        bios: use_external_opensbi.then_some(bios_path),
         kernel: Some(kernel),
         initrd: Some(initrd),
         dtb: None,
@@ -178,4 +182,14 @@ echo VCONSOLE_OK > /dev/hvc0 2>/dev/null || true\n\
         Some(0),
         "expected clean guest poweroff, console:\n{console_out}"
     );
+}
+
+#[test]
+fn boots_linux_with_virtio_blk_net_console_rng_and_powers_off() {
+    run_linux_boot_test(true);
+}
+
+#[test]
+fn boots_linux_with_builtin_rust_sbi_no_firmware() {
+    run_linux_boot_test(false);
 }

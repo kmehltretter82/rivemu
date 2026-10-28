@@ -337,7 +337,7 @@ where
             }
             "bios" => {
                 o.bios = match value()?.as_str() {
-                    "none" => Bios::None,
+                    "none" | "builtin" => Bios::None,
                     "default" => Bios::Default,
                     p => Bios::Path(p.into()),
                 }
@@ -439,18 +439,24 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
     let bios = match &o.bios {
         Bios::None => None,
         Bios::Path(p) => Some(p.clone()),
-        Bios::Default => Some(
-            firmware_search_path()
+        Bios::Default => {
+            let found = firmware_search_path()
                 .into_iter()
                 .map(|d| d.join(DEFAULT_FIRMWARE))
-                .find(|p| p.is_file())
-                .ok_or_else(|| {
-                    format!(
+                .find(|p| p.is_file());
+            match (found, &o.kernel) {
+                (Some(p), _) => Some(p),
+                // When booting a kernel and no external OpenSBI binary is
+                // installed on disk, fall back to rivemu's built-in Rust SBI.
+                (None, Some(_)) => None,
+                (None, None) => {
+                    return Err(format!(
                         "unable to find default firmware '{DEFAULT_FIRMWARE}' \
-                         (set RIVEMU_FIRMWARE_DIR, or use -bios <file> / -bios none)"
-                    )
-                })?,
-        ),
+                         (set RIVEMU_FIRMWARE_DIR, or use -bios <file> / -bios builtin / -bios none)"
+                    ));
+                }
+            }
+        }
     };
 
     let mut drives: HashMap<String, Arc<dyn BlockBackend>> = HashMap::new();

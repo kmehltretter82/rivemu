@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use rivemu_backends::{BlockBackend, Chardev, NetBackend};
 use rivemu_core::{
-    GuestAddr, HostTimebase, IcountTimebase, Timebase, align_down, align_up, size::MIB,
+    AccessSize, GuestAddr, HostTimebase, IcountTimebase, Timebase, align_down, align_up, size::MIB,
 };
-use rivemu_cpu_riscv::csr::envcfg;
+use rivemu_cpu_riscv::csr::{envcfg, irq};
 use rivemu_cpu_riscv::{Hart, HartIrqs, Logger};
 use rivemu_devices::{Clint, GoldfishRtc, Plic, PowerControl, PowerEvent, SifiveTest, Uart16550};
 use rivemu_mem::{AddressSpace, MapError, Ram};
@@ -180,6 +180,8 @@ pub struct ImageInfo {
     pub end: GuestAddr,
     /// Whether the image was an ELF file.
     pub elf: bool,
+    /// Whether the image carries a RISC-V Linux `Image` header (`RSC\x05`).
+    pub linux_image: bool,
 }
 
 /// Result of image placement; consumed by the reset vector / FDT code.
@@ -255,14 +257,25 @@ fn load_image(
             start: img.low,
             end: img.high,
             elf: true,
+            linux_image: false,
         })
     } else {
-        let (start, end) = loader::load_raw(bus, raw_addr, &data).map_err(wrap)?;
+        let linux_image =
+            data.len() >= 64 && (&data[48..56] == b"RISCV\0\0\0" || &data[56..60] == b"RSC\x05");
+        let load_addr = if linux_image {
+            let text_offset =
+                u64::from_le_bytes(data[8..16].try_into().expect("8-byte slice")).min(64 * MIB);
+            raw_addr.max(memmap::DRAM_BASE + text_offset)
+        } else {
+            raw_addr
+        };
+        let (start, end) = loader::load_raw(bus, load_addr, &data).map_err(wrap)?;
         Ok(ImageInfo {
             entry: start,
             start,
             end,
             elf: false,
+            linux_image,
         })
     }
 }
@@ -462,6 +475,18 @@ impl Machine {
             h.reset(memmap::MROM.0);
         }
 
+        // If booting a RISC-V Linux `Image` without external firmware
+        // (`-bios none` / `-bios builtin`), boot directly into S-mode using
+        // rivemu's built-in pure-Rust SBI v2.0 handler.
+        if boot.firmware.is_none() && boot.kernel.as_ref().is_some_and(|k| k.linux_image) {
+            harts[0].init_smode_boot(boot.entry, fdt_addr);
+            for h in &mut harts[1..] {
+                h.handle_sbi = true;
+                h.hsm_stopped = true;
+                h.wfi = true;
+            }
+        }
+
         Ok(Self {
             config,
             bus,
@@ -486,10 +511,22 @@ impl Machine {
         for v in &self.virtio {
             v.poll();
         }
-        for h in &mut self.harts {
-            let ran = h.run(&self.bus, QUANTUM);
-            if let Some(ic) = &self.icount {
-                ic.advance(ran);
+        for i in 0..self.harts.len() {
+            let mut rem = QUANTUM;
+            while rem > 0 {
+                let ran = self.harts[i].run(&self.bus, rem);
+                if let Some(ic) = &self.icount {
+                    ic.advance(ran);
+                }
+                rem = rem.saturating_sub(ran);
+                if self.harts[i].pending_sbi {
+                    self.harts[i].pending_sbi = false;
+                    if self.handle_sbi_call(i) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
             }
         }
         if let Some((ic, d)) = self
@@ -504,9 +541,183 @@ impl Machine {
         self.power.take()
     }
 
+    /// Services a machine-wide SBI v2.0 call from `hart_idx`. Returns `true`
+    /// if the calling hart should yield the remainder of its scheduling slice.
+    fn handle_sbi_call(&mut self, hart_idx: usize) -> bool {
+        let eid = self.harts[hart_idx].x[17];
+        let fid = self.harts[hart_idx].x[16];
+        let a0 = self.harts[hart_idx].x[10];
+        let a1 = self.harts[hart_idx].x[11];
+        let a2 = self.harts[hart_idx].x[12];
+        let num_harts = self.harts.len();
+
+        let target_harts = |mask: u64, base: u64| -> Result<Vec<usize>, u64> {
+            if base == u64::MAX {
+                return Ok((0..num_harts).collect());
+            }
+            if base >= num_harts as u64 {
+                return Err((-3i64) as u64);
+            }
+            let mut out = Vec::new();
+            for bit in 0..64u64 {
+                if (mask >> bit) & 1 != 0 {
+                    let h = base.saturating_add(bit) as usize;
+                    if h < num_harts {
+                        out.push(h);
+                    }
+                }
+            }
+            Ok(out)
+        };
+
+        let mut yield_slice = false;
+        let (err, val): (u64, u64) = match (eid, fid) {
+            // IPI extension (sPI) and legacy send_ipi.
+            (0x0073_5049, 0) => match target_harts(a0, a1) {
+                Ok(targets) => {
+                    for t in targets {
+                        self.harts[t].csr.mip |= irq::SSIP;
+                        self.harts[t].notify_irq();
+                    }
+                    yield_slice = true;
+                    (0, 0)
+                }
+                Err(e) => (e, 0),
+            },
+            (0x04, _) => {
+                for h in &mut self.harts {
+                    h.csr.mip |= irq::SSIP;
+                    h.notify_irq();
+                }
+                yield_slice = true;
+                (0, 0)
+            }
+            // RFENCE extension and legacy remote fence calls.
+            (0x5246_4e43, 0..=6) => match target_harts(a0, a1) {
+                Ok(targets) => {
+                    for t in targets {
+                        if fid == 0 {
+                            self.harts[t].invalidate_icache();
+                        } else {
+                            self.harts[t].invalidate_tlb();
+                        }
+                    }
+                    (0, 0)
+                }
+                Err(e) => (e, 0),
+            },
+            (0x05, _) => {
+                for h in &mut self.harts {
+                    h.invalidate_icache();
+                }
+                (0, 0)
+            }
+            (0x06 | 0x07, _) => {
+                for h in &mut self.harts {
+                    h.invalidate_tlb();
+                }
+                (0, 0)
+            }
+            // Hart State Management (HSM) extension.
+            (0x0048_534d, 0) => {
+                let target = a0 as usize;
+                if target >= num_harts {
+                    ((-3i64) as u64, 0)
+                } else if !self.harts[target].hsm_stopped {
+                    ((-6i64) as u64, 0)
+                } else {
+                    self.harts[target].init_smode_boot(a1, a2);
+                    yield_slice = true;
+                    (0, 0)
+                }
+            }
+            (0x0048_534d, 1) => {
+                self.harts[hart_idx].hsm_stopped = true;
+                self.harts[hart_idx].wfi = true;
+                yield_slice = true;
+                (0, 0)
+            }
+            (0x0048_534d, 2) => {
+                let target = a0 as usize;
+                if target >= num_harts {
+                    ((-3i64) as u64, 0)
+                } else {
+                    (0, u64::from(self.harts[target].hsm_stopped))
+                }
+            }
+            (0x0048_534d, 3) => {
+                let suspend_type = a0 as u32;
+                if suspend_type == 0 {
+                    self.harts[hart_idx].wfi = true;
+                    self.harts[hart_idx].notify_irq();
+                    yield_slice = true;
+                    (0, 0)
+                } else if suspend_type & 0x8000_0000 != 0 {
+                    self.harts[hart_idx].init_smode_boot(a1, a2);
+                    self.harts[hart_idx].wfi = true;
+                    self.harts[hart_idx].notify_irq();
+                    return true;
+                } else {
+                    ((-3i64) as u64, 0)
+                }
+            }
+            // System Reset (SRST) extension and legacy shutdown.
+            (0x5352_5354, 0) => {
+                match a0 as u32 {
+                    0 => self.power.request(PowerEvent::Poweroff(0)),
+                    1 | 2 => self.power.request(PowerEvent::Reset),
+                    _ => return false,
+                }
+                for h in &mut self.harts {
+                    h.hsm_stopped = true;
+                    h.wfi = true;
+                }
+                yield_slice = true;
+                (0, 0)
+            }
+            (0x08, _) => {
+                self.power.request(PowerEvent::Poweroff(0));
+                for h in &mut self.harts {
+                    h.hsm_stopped = true;
+                    h.wfi = true;
+                }
+                yield_slice = true;
+                (0, 0)
+            }
+            // Debug Console (DBCN) and legacy console putchar/getchar.
+            (0x4442_434e, 0) => {
+                if a2 != 0 {
+                    ((-3i64) as u64, 0)
+                } else {
+                    let mut written = 0u64;
+                    for off in 0..a0 {
+                        match self.bus.read(a1.wrapping_add(off), AccessSize::Byte) {
+                            Ok(b) => {
+                                let _ = self.bus.write(memmap::UART0.0, AccessSize::Byte, b);
+                                written += 1;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    (0, written)
+                }
+            }
+            (0x4442_434e, 1) => (0, 0),
+            (0x4442_434e, 2) | (0x01, _) => {
+                let _ = self.bus.write(memmap::UART0.0, AccessSize::Byte, a0 & 0xff);
+                (0, 0)
+            }
+            (0x02, _) => (u64::MAX, 0),
+            _ => ((-2i64) as u64, 0),
+        };
+        self.harts[hart_idx].x[10] = err;
+        self.harts[hart_idx].x[11] = val;
+        yield_slice
+    }
+
     /// Whether all harts are waiting for an interrupt.
     pub fn all_idle(&self) -> bool {
-        self.harts.iter().all(|h| h.wfi)
+        self.harts.iter().all(|h| h.wfi || h.hsm_stopped)
     }
 
     fn now_ticks(&self) -> u64 {
@@ -521,7 +732,7 @@ impl Machine {
         let stimecmp = self
             .harts
             .iter()
-            .filter(|h| h.csr.menvcfg & envcfg::STCE != 0 && h.csr.stimecmp > now)
+            .filter(|h| !h.hsm_stopped && h.csr.menvcfg & envcfg::STCE != 0 && h.csr.stimecmp > now)
             .map(|h| h.csr.stimecmp);
         self.clint.next_deadline().into_iter().chain(stimecmp).min()
     }

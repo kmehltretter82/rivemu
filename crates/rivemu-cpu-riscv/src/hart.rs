@@ -158,6 +158,12 @@ pub struct Hart {
     pub breakpoints: Vec<u64>,
     /// Set by [`Self::run`] when execution stops on a breakpoint.
     pub hit_breakpoint: bool,
+    /// Intercept S-mode `ecall` instructions with the built-in Rust SBI handler.
+    pub handle_sbi: bool,
+    /// Set when an S-mode `ecall` needs machine-level SBI servicing (`IPI`, `RFENCE`, `HSM`, `SRST`, `DBCN`).
+    pub pending_sbi: bool,
+    /// Whether the hart is parked in the SBI HSM `STOPPED` state.
+    pub hsm_stopped: bool,
 }
 
 impl std::fmt::Debug for Hart {
@@ -201,6 +207,9 @@ impl Hart {
             logger: None,
             breakpoints: Vec::new(),
             hit_breakpoint: false,
+            handle_sbi: false,
+            pending_sbi: false,
+            hsm_stopped: false,
         }
     }
 
@@ -218,6 +227,40 @@ impl Hart {
         self.check_irq = true;
         self.yield_slice = false;
         self.hit_breakpoint = false;
+        self.pending_sbi = false;
+        self.hsm_stopped = false;
+    }
+
+    /// Resets the hart directly into S-mode for built-in Rust SBI boot or
+    /// `sbi_hsm_hart_start`, setting `a0 = hartid` and `a1 = opaque`.
+    pub fn init_smode_boot(&mut self, entry: u64, opaque: u64) {
+        self.reset(entry);
+        self.prv = Priv::Supervisor;
+        self.x[10] = self.id;
+        self.x[11] = opaque;
+        self.csr.mstatus = (2 << 32) | (2 << 34);
+        self.csr.medeleg = 0xb109;
+        self.csr.mideleg = irq::S_MASK;
+        self.csr.mcounteren = 0xffff_ffff;
+        self.csr.scounteren = 0xffff_ffff;
+        self.csr.menvcfg = envcfg::STCE;
+        self.handle_sbi = true;
+        self.hsm_stopped = false;
+    }
+
+    /// Flushes the per-hart TLB (e.g. on remote `sfence.vma`).
+    #[inline]
+    pub fn invalidate_tlb(&mut self) {
+        self.flush_tlb();
+    }
+
+    /// Marks interrupts for re-evaluation and wakes from `wfi` if not HSM-stopped.
+    #[inline]
+    pub fn notify_irq(&mut self) {
+        self.check_irq = true;
+        if !self.hsm_stopped {
+            self.wfi = false;
+        }
     }
 
     /// Flushes the decoded-instruction cache (e.g. after debugger memory writes).
@@ -264,6 +307,9 @@ impl Hart {
     pub fn run(&mut self, bus: &AddressSpace, budget: u64) -> u64 {
         self.hit_breakpoint = false;
         self.yield_slice = false;
+        if self.hsm_stopped {
+            return 0;
+        }
         self.take_pending_interrupt();
         if self.wfi {
             return 0;
@@ -655,12 +701,19 @@ impl Hart {
             }
             Op::FenceI => self.flush_icache(),
             Op::Ecall => {
-                let c = match self.prv {
-                    Priv::User => cause::ECALL_U,
-                    Priv::Supervisor => cause::ECALL_S,
-                    Priv::Machine => cause::ECALL_M,
-                };
-                return Err(Exception::new(c, 0));
+                if self.handle_sbi && self.prv == Priv::Supervisor {
+                    if !self.try_local_sbi() {
+                        self.pending_sbi = true;
+                        self.yield_slice = true;
+                    }
+                } else {
+                    let c = match self.prv {
+                        Priv::User => cause::ECALL_U,
+                        Priv::Supervisor => cause::ECALL_S,
+                        Priv::Machine => cause::ECALL_M,
+                    };
+                    return Err(Exception::new(c, 0));
+                }
             }
             Op::Ebreak => return Err(Exception::new(cause::BREAKPOINT, pc)),
 
@@ -1138,6 +1191,47 @@ impl Hart {
             _ => return None,
         }
         Some(())
+    }
+
+    /// Handles hart-local SBI calls (`BASE` and `TIME`) inline without leaving
+    /// the inner execution loop. Returns `false` if the call requires
+    /// machine-wide servicing (`IPI`, `RFENCE`, `HSM`, `SRST`, `DBCN`).
+    fn try_local_sbi(&mut self) -> bool {
+        let eid = self.x[17];
+        let fid = self.x[16];
+        let a0 = self.x[10];
+        let (err, val): (i64, u64) = match (eid, fid) {
+            // Base extension (0x10).
+            (0x10, 0) => (0, 2 << 24), // SBI spec v2.0
+            (0x10, 1) => (0, 4),       // Implementation ID (RustSBI / rivemu-sbi)
+            (0x10, 2) => (0, 0x0001_0000),
+            (0x10, 3) => {
+                let supported = matches!(
+                    a0,
+                    0x10 | 0x5449_4d45
+                        | 0x0073_5049
+                        | 0x5246_4e43
+                        | 0x0048_534d
+                        | 0x5352_5354
+                        | 0x4442_434e
+                );
+                (0, u64::from(supported))
+            }
+            (0x10, 4..=6) => (0, 0), // mvendorid / marchid / mimpid
+            (0x10, _) => (-2, 0),    // SBI_ERR_NOT_SUPPORTED
+            // Timer extension ("TIME" = 0x54494d45, or legacy 0x00).
+            (0x5449_4d45, 0) | (0x00, _) => {
+                self.csr.stimecmp = a0;
+                self.csr.mip &= !irq::STIP;
+                self.check_irq = true;
+                (0, 0)
+            }
+            (0x5449_4d45, _) => (-2, 0),
+            _ => return false,
+        };
+        self.x[10] = err as u64;
+        self.x[11] = val;
+        true
     }
 }
 
