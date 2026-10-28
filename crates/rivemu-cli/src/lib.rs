@@ -9,10 +9,16 @@
 pub mod console;
 pub mod opts;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use rivemu_machine::MachineConfig;
+use rivemu_backends::{
+    BlockBackend, Chardev, FileChardev, HostFwdRule, NetBackend, NullChardev, SocketChardev,
+    UserNet, UserNetConfig, block::open_block_image,
+};
 use rivemu_machine::virt::DEFAULT_RAM_SIZE;
+use rivemu_machine::{MachineConfig, VirtioDeviceConfig};
 use thiserror::Error;
 
 pub use opts::{OptsError, QemuOpts};
@@ -446,6 +452,148 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
                 })?,
         ),
     };
+
+    let mut drives: HashMap<String, Arc<dyn BlockBackend>> = HashMap::new();
+    let mut virtio = Vec::new();
+
+    for (idx, d) in o.drives.iter().enumerate() {
+        let file = d
+            .get("file")
+            .ok_or_else(|| "-drive: missing 'file=' parameter".to_string())?;
+        let ro = matches!(d.get("readonly"), Some("on" | "true" | "1"));
+        let fmt = d.get("format");
+        let backend = open_block_image(Path::new(file), fmt, ro)
+            .map_err(|e| format!("-drive file={file}: {e}"))?;
+        let id = d
+            .get("id")
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("drive{idx}"));
+        if d.get("if") == Some("virtio") {
+            virtio.push(VirtioDeviceConfig::Blk {
+                backend: backend.clone(),
+                serial: id.clone(),
+            });
+        }
+        drives.insert(id, backend);
+    }
+
+    let mut netdevs: HashMap<String, Arc<dyn NetBackend>> = HashMap::new();
+    for (idx, n) in o.netdevs.iter().enumerate() {
+        let kind = n.get("type").unwrap_or("user");
+        if kind != "user" {
+            return Err(format!(
+                "-netdev {kind}: unsupported backend (supported: user)"
+            ));
+        }
+        let id = n
+            .get("id")
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("net{idx}"));
+        let mut hostfwd = Vec::new();
+        for (k, v) in n.params() {
+            if k == "hostfwd" {
+                hostfwd.push(HostFwdRule::parse(v).map_err(|e| format!("-netdev {id}: {e}"))?);
+            }
+        }
+        let backend: Arc<dyn NetBackend> = UserNet::new(UserNetConfig {
+            hostfwd,
+            ..Default::default()
+        });
+        netdevs.insert(id, backend);
+    }
+
+    let mut chardevs: HashMap<String, Arc<dyn Chardev>> = HashMap::new();
+    for (idx, c) in o.chardevs.iter().enumerate() {
+        let backend_name = c.get("backend").unwrap_or("null");
+        let id = c
+            .get("id")
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("char{idx}"));
+        let ch: Arc<dyn Chardev> = match backend_name {
+            "null" => Arc::new(NullChardev),
+            "file" => {
+                let path = c
+                    .get("path")
+                    .ok_or_else(|| format!("-chardev file,id={id}: missing 'path='"))?;
+                FileChardev::create(Path::new(path))
+                    .map_err(|e| format!("-chardev file,path={path}: {e}"))?
+            }
+            "socket" => {
+                let host = c.get("host").unwrap_or("127.0.0.1");
+                let port = c
+                    .get("port")
+                    .ok_or_else(|| format!("-chardev socket,id={id}: missing 'port='"))?;
+                let addr = format!("{host}:{port}");
+                let is_server = c.get("server") == Some("on");
+                let wait = is_server && c.get("nowait") != Some("on");
+                if is_server {
+                    SocketChardev::bind_tcp(&addr, wait)
+                        .map_err(|e| format!("-chardev socket,{addr}: {e}"))?
+                } else {
+                    SocketChardev::connect_tcp(&addr)
+                        .map_err(|e| format!("-chardev socket,{addr}: {e}"))?
+                }
+            }
+            other => {
+                return Err(format!(
+                    "-chardev {other}: unsupported backend (supported: null, file, socket)"
+                ));
+            }
+        };
+        chardevs.insert(id, ch);
+    }
+
+    for dev in &o.devices {
+        let driver = dev
+            .get("driver")
+            .ok_or_else(|| "-device: missing driver name".to_string())?;
+        match driver {
+            "virtio-blk-device" => {
+                let drive_id = dev
+                    .get("drive")
+                    .ok_or_else(|| "-device virtio-blk-device: missing 'drive='".to_string())?;
+                let backend = drives.get(drive_id).ok_or_else(|| {
+                    format!("-device virtio-blk-device: unknown drive '{drive_id}'")
+                })?;
+                let serial = dev.get("serial").unwrap_or(drive_id).to_owned();
+                virtio.push(VirtioDeviceConfig::Blk {
+                    backend: backend.clone(),
+                    serial,
+                });
+            }
+            "virtio-net-device" => {
+                let backend = match dev.get("netdev") {
+                    Some(net_id) => netdevs
+                        .get(net_id)
+                        .ok_or_else(|| {
+                            format!("-device virtio-net-device: unknown netdev '{net_id}'")
+                        })?
+                        .clone(),
+                    None => UserNet::new(UserNetConfig::default()),
+                };
+                virtio.push(VirtioDeviceConfig::Net { backend });
+            }
+            "virtio-serial-device" | "virtio-console" => {
+                let chardev = match dev.get("chardev") {
+                    Some(ch_id) => chardevs
+                        .get(ch_id)
+                        .ok_or_else(|| format!("-device {driver}: unknown chardev '{ch_id}'"))?
+                        .clone(),
+                    None => Arc::new(NullChardev),
+                };
+                virtio.push(VirtioDeviceConfig::Console { chardev });
+            }
+            "virtio-rng-device" => {
+                virtio.push(VirtioDeviceConfig::Rng);
+            }
+            other => {
+                return Err(format!(
+                    "-device {other}: unsupported device (use -device help)"
+                ));
+            }
+        }
+    }
+
     Ok(MachineConfig {
         ram_size: o.memory,
         smp: o.smp,
@@ -454,6 +602,7 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
         initrd: o.initrd.clone(),
         dtb: o.dtb.clone(),
         append: o.append.clone(),
+        virtio,
     })
 }
 

@@ -64,14 +64,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rivemu-backends"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "rivemu-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "rivemu-backends",
  "rivemu-cpu-riscv",
  "rivemu-devices",
  "rivemu-gdbstub",
  "rivemu-machine",
+ "rivemu-monitor",
  "rustix",
  "thiserror",
 ]
@@ -118,11 +127,13 @@ dependencies = [
 name = "rivemu-machine"
 version = "0.1.0"
 dependencies = [
+ "rivemu-backends",
  "rivemu-core",
  "rivemu-cpu-riscv",
  "rivemu-devices",
  "rivemu-fdt",
  "rivemu-mem",
+ "rivemu-virtio",
  "thiserror",
 ]
 
@@ -136,8 +147,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rivemu-monitor"
+version = "0.1.0"
+dependencies = [
+ "rivemu-core",
+ "rivemu-machine",
+]
+
+[[package]]
 name = "rivemu-softfloat"
 version = "0.1.0"
+
+[[package]]
+name = "rivemu-virtio"
+version = "0.1.0"
+dependencies = [
+ "rivemu-backends",
+ "rivemu-core",
+ "rivemu-mem",
+]
 
 [[package]]
 name = "rustix"

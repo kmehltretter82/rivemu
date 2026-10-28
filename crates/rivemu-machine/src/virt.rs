@@ -7,11 +7,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rivemu_backends::{BlockBackend, Chardev, NetBackend};
 use rivemu_core::{GuestAddr, HostTimebase, Timebase, align_down, align_up, size::MIB};
 use rivemu_cpu_riscv::csr::envcfg;
 use rivemu_cpu_riscv::{Hart, HartIrqs, Logger};
 use rivemu_devices::{Clint, GoldfishRtc, Plic, PowerControl, PowerEvent, SifiveTest, Uart16550};
 use rivemu_mem::{AddressSpace, MapError, Ram};
+use rivemu_virtio::{
+    DmaRam, VirtioBlk, VirtioConsole, VirtioDevice, VirtioMmio, VirtioNet, VirtioRng,
+};
 use thiserror::Error;
 
 use crate::fdt::{self, FdtParams};
@@ -61,6 +65,30 @@ pub const MAX_IDLE: Duration = Duration::from_millis(10);
 /// Maximum number of harts supported by the board.
 pub const MAX_HARTS: u32 = 512;
 
+/// Specification of a `virtio-mmio` device to attach to the `virt` board.
+#[derive(Debug, Clone)]
+pub enum VirtioDeviceConfig {
+    /// `virtio-blk-device`.
+    Blk {
+        /// Storage backend.
+        backend: Arc<dyn BlockBackend>,
+        /// Volume serial string.
+        serial: String,
+    },
+    /// `virtio-net-device`.
+    Net {
+        /// Network backend.
+        backend: Arc<dyn NetBackend>,
+    },
+    /// `virtio-serial-device` (`virtio-console`).
+    Console {
+        /// Character backend.
+        chardev: Arc<dyn Chardev>,
+    },
+    /// `virtio-rng-device`.
+    Rng,
+}
+
 /// Board configuration (already resolved from the command line).
 #[derive(Debug, Clone)]
 pub struct MachineConfig {
@@ -78,6 +106,8 @@ pub struct MachineConfig {
     pub dtb: Option<PathBuf>,
     /// Kernel command line.
     pub append: Option<String>,
+    /// Attached `virtio-mmio` devices (up to [`memmap::VIRTIO_COUNT`]).
+    pub virtio: Vec<VirtioDeviceConfig>,
 }
 
 impl Default for MachineConfig {
@@ -90,6 +120,7 @@ impl Default for MachineConfig {
             initrd: None,
             dtb: None,
             append: None,
+            virtio: Vec::new(),
         }
     }
 }
@@ -184,6 +215,8 @@ pub struct Machine {
     pub plic: Arc<Plic>,
     /// Guest power requests.
     pub power: Arc<PowerControl>,
+    /// Attached `virtio-mmio` transports.
+    pub virtio: Vec<Arc<VirtioMmio>>,
     /// Platform timebase.
     pub timebase: Arc<HostTimebase>,
 }
@@ -293,6 +326,40 @@ impl Machine {
         let (b, s) = memmap::UART0;
         bus.add_mmio("serial", b, s, uart.clone())?;
 
+        if config.virtio.len() as u64 > memmap::VIRTIO_COUNT {
+            return Err(MachineError::Config(format!(
+                "too many virtio devices ({}; maximum is {})",
+                config.virtio.len(),
+                memmap::VIRTIO_COUNT
+            )));
+        }
+        let dma = DmaRam::new(memmap::DRAM_BASE, ram.clone());
+        let mut virtio = Vec::with_capacity(config.virtio.len());
+        let mut virtio_fdt = Vec::with_capacity(config.virtio.len());
+        for (idx, vcfg) in config.virtio.iter().enumerate() {
+            let base = memmap::VIRTIO.0 + idx as u64 * memmap::VIRTIO.1;
+            let irq = VIRTIO_IRQ + idx as u32;
+            let dev: Box<dyn VirtioDevice> = match vcfg {
+                VirtioDeviceConfig::Blk { backend, serial } => {
+                    Box::new(VirtioBlk::new(backend.clone(), serial))
+                }
+                VirtioDeviceConfig::Net { backend } => Box::new(VirtioNet::new(backend.clone())),
+                VirtioDeviceConfig::Console { chardev } => {
+                    Box::new(VirtioConsole::new(chardev.clone()))
+                }
+                VirtioDeviceConfig::Rng => Box::new(VirtioRng::default()),
+            };
+            let mmio = VirtioMmio::new(dev, dma.clone(), plic.line(irq));
+            bus.add_mmio(
+                &format!("virtio-mmio.{idx}"),
+                base,
+                memmap::VIRTIO.1,
+                mmio.clone(),
+            )?;
+            virtio.push(mmio);
+            virtio_fdt.push((base, irq));
+        }
+
         let mut boot = BootInfo::default();
 
         if let Some(path) = &config.bios {
@@ -351,7 +418,7 @@ impl Machine {
                 bootargs: config.append.as_deref(),
                 initrd: boot.initrd,
                 plic_ndev: PLIC_NUM_SOURCES as u32 - 1,
-                virtio: Vec::new(),
+                virtio: virtio_fdt,
             }),
         };
         let fdt_top = ram_end.min(3072 * MIB);
@@ -393,6 +460,7 @@ impl Machine {
             clint,
             plic,
             power,
+            virtio,
             timebase,
         })
     }
@@ -401,6 +469,9 @@ impl Machine {
     /// event (poweroff / reset) requested by the guest, if any.
     pub fn run_slice(&mut self) -> Option<PowerEvent> {
         self.clint.update();
+        for v in &self.virtio {
+            v.poll();
+        }
         for h in &mut self.harts {
             h.run(&self.bus, QUANTUM);
         }

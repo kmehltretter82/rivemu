@@ -10,11 +10,13 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+rivemu-backends.workspace = true
 rivemu-core.workspace = true
 rivemu-cpu-riscv.workspace = true
 rivemu-devices.workspace = true
 rivemu-fdt.workspace = true
 rivemu-mem.workspace = true
+rivemu-virtio.workspace = true
 thiserror.workspace = true
 
 [lints]

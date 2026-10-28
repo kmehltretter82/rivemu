@@ -9,4 +9,4 @@ mod fdt;
 pub mod loader;
 pub mod virt;
 
-pub use virt::{BootInfo, ImageInfo, Machine, MachineConfig, MachineError};
+pub use virt::{BootInfo, ImageInfo, Machine, MachineConfig, MachineError, VirtioDeviceConfig};

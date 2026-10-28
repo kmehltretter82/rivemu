@@ -1,22 +1,24 @@
-//! End-to-end Linux + OpenSBI + BusyBox shell smoke test.
+//! End-to-end Linux + OpenSBI + BusyBox + VirtIO (`blk`, `net`, `console`, `rng`)
+//! smoke test.
 //!
-//! Fetches artifacts from `images/linux-test/` (created by
+//! Uses artifacts from `images/linux-test/` (created by
 //! `scripts/fetch-linux-test.sh`). Enabled when `RIVEMU_LINUX_TEST` or
 //! `RIVEMU_REQUIRE_LINUX_TEST` is set.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use rivemu_backends::{BlockBackend, BufferChardev, MemoryBlock, UserNet, UserNetConfig};
 use rivemu_core::size::MIB;
 use rivemu_devices::PowerEvent;
-use rivemu_machine::{Machine, MachineConfig};
+use rivemu_machine::{Machine, MachineConfig, VirtioDeviceConfig};
 
 fn image_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../images/linux-test")
 }
 
 #[test]
-fn boots_linux_to_busybox_shell_and_powers_off() {
+fn boots_linux_with_virtio_blk_net_console_rng_and_powers_off() {
     let required = std::env::var_os("RIVEMU_REQUIRE_LINUX_TEST").is_some();
     let enabled = required || std::env::var_os("RIVEMU_LINUX_TEST").is_some();
     if !enabled {
@@ -40,6 +42,11 @@ fn boots_linux_to_busybox_shell_and_powers_off() {
         }
     }
 
+    let disk = MemoryBlock::new(64 * 1024, false);
+    disk.write_at(0, b"RIVEMU_BLK_MAGIC_OK\n").unwrap();
+    let net = UserNet::new(UserNetConfig::default());
+    let vconsole = BufferChardev::new();
+
     let mut machine = Machine::new(MachineConfig {
         ram_size: 256 * MIB,
         smp: 1,
@@ -48,6 +55,17 @@ fn boots_linux_to_busybox_shell_and_powers_off() {
         initrd: Some(initrd),
         dtb: None,
         append: Some("console=ttyS0".into()),
+        virtio: vec![
+            VirtioDeviceConfig::Blk {
+                backend: disk.clone(),
+                serial: "testdisk0".into(),
+            },
+            VirtioDeviceConfig::Net { backend: net },
+            VirtioDeviceConfig::Console {
+                chardev: vconsole.clone(),
+            },
+            VirtioDeviceConfig::Rng,
+        ],
     })
     .expect("machine init");
 
@@ -71,9 +89,16 @@ fn boots_linux_to_busybox_shell_and_powers_off() {
         if !bytes.is_empty() {
             console_out.push_str(&String::from_utf8_lossy(&bytes));
             if !sent_cmd && console_out.contains("=== rivemu BusyBox initramfs ===") {
-                machine
-                    .uart
-                    .push_input(b"echo SHELL_CMD_OK$((20+22))\n/bin/busybox poweroff -f\n");
+                let script = "\
+echo SHELL_CMD_OK$((20+22))\n\
+/bin/busybox dd if=/dev/vda bs=20 count=1 2>/dev/null\n\
+echo -n GUEST_BLK_WRITE | /bin/busybox dd of=/dev/vda bs=512 seek=1 conv=notrunc 2>/dev/null\n\
+/bin/busybox sync\n\
+/bin/busybox ip link set eth0 up && /bin/busybox ip addr add 10.0.2.15/24 dev eth0\n\
+/bin/busybox ping -c 1 10.0.2.2\n\
+echo VCONSOLE_OK > /dev/hvc0 2>/dev/null || true\n\
+/bin/busybox poweroff -f\n";
+                machine.uart.push_input(script.as_bytes());
                 sent_cmd = true;
             }
         }
@@ -86,7 +111,7 @@ fn boots_linux_to_busybox_shell_and_powers_off() {
     console_out.push_str(&String::from_utf8_lossy(&bytes));
     let elapsed = start.elapsed();
     eprintln!(
-        "Linux boot + BusyBox shell + poweroff completed in {:.2}s ({} instructions)",
+        "Linux + VirtIO smoke test completed in {:.2}s ({} instructions)",
         elapsed.as_secs_f64(),
         machine.instret()
     );
@@ -97,6 +122,20 @@ fn boots_linux_to_busybox_shell_and_powers_off() {
     assert!(
         console_out.contains("SHELL_CMD_OK42"),
         "expected BusyBox shell arithmetic output in console:\n{console_out}"
+    );
+    assert!(
+        console_out.contains("RIVEMU_BLK_MAGIC_OK"),
+        "expected virtio-blk read output in console:\n{console_out}"
+    );
+    assert!(
+        console_out.contains("1 packets received"),
+        "expected virtio-net ping reply from 10.0.2.2 in console:\n{console_out}"
+    );
+    let mut sector1 = [0u8; 15];
+    disk.read_at(512, &mut sector1).unwrap();
+    assert_eq!(
+        &sector1, b"GUEST_BLK_WRITE",
+        "expected guest write to sector 1 of virtio-blk"
     );
     assert_eq!(poweroff_code, Some(0), "expected clean guest poweroff");
 }

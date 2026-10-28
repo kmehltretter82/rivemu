@@ -13,6 +13,8 @@ use rustix::termios::{self, OptionalActions, Termios};
 pub enum ConsoleEvent {
     /// Bytes for the guest.
     Input(Vec<u8>),
+    /// An HMP monitor command line entered in `Ctrl-A c` monitor mode.
+    MonitorCmd(String),
     /// The user requested exit (`Ctrl-A x`) or stdin closed in mux mode.
     Quit,
 }
@@ -21,6 +23,8 @@ pub enum ConsoleEvent {
 #[derive(Debug, Default)]
 pub struct Mux {
     escape: bool,
+    monitor: bool,
+    mon_line: String,
 }
 
 const CTRL_A: u8 = 0x01;
@@ -29,30 +33,66 @@ impl Mux {
     /// Processes raw input. Returns guest bytes, whether to quit and an
     /// optional message for the user.
     pub fn process(&mut self, data: &[u8]) -> (Vec<u8>, bool, Option<&'static str>) {
+        let (out, quit, msg, _) = self.process_ext(data);
+        (out, quit, msg)
+    }
+
+    /// Processes raw input, also returning any completed HMP monitor command lines.
+    pub fn process_ext(
+        &mut self,
+        data: &[u8],
+    ) -> (Vec<u8>, bool, Option<&'static str>, Vec<String>) {
         let mut out = Vec::with_capacity(data.len());
         let mut msg = None;
+        let mut cmds = Vec::new();
         for &b in data {
             if self.escape {
                 self.escape = false;
                 match b {
-                    b'x' | b'X' => return (out, true, msg),
-                    CTRL_A | b'a' => out.push(CTRL_A),
+                    b'x' | b'X' => return (out, true, msg, cmds),
+                    CTRL_A | b'a' => {
+                        if !self.monitor {
+                            out.push(CTRL_A);
+                        }
+                    }
                     b'h' | b'?' => msg = Some(MUX_HELP),
-                    b'c' => msg = Some("\r\nrivemu: monitor is not available yet\r\n"),
+                    b'c' => {
+                        self.monitor = !self.monitor;
+                        self.mon_line.clear();
+                        msg = Some(if self.monitor {
+                            "\r\nQEMU/rivemu monitor - type 'help' for more information\r\n(qemu) "
+                        } else {
+                            "\r\n"
+                        });
+                    }
                     _ => {}
                 }
             } else if b == CTRL_A {
                 self.escape = true;
+            } else if self.monitor {
+                match b {
+                    b'\r' | b'\n' => {
+                        cmds.push(std::mem::take(&mut self.mon_line));
+                    }
+                    0x08 | 0x7f => {
+                        self.mon_line.pop();
+                    }
+                    c if c.is_ascii_graphic() || c == b' ' => {
+                        self.mon_line.push(c as char);
+                    }
+                    _ => {}
+                }
             } else {
                 out.push(b);
             }
         }
-        (out, false, msg)
+        (out, false, msg, cmds)
     }
 }
 
 const MUX_HELP: &str = "\r\nC-a h    print this help\r\n\
 C-a x    exit emulator\r\n\
+C-a c    switch between console and monitor\r\n\
 C-a C-a  sends C-a\r\n";
 
 /// Restores the terminal mode on drop.
@@ -132,25 +172,31 @@ impl Console {
         }
     }
 
-    fn handle(&mut self, data: Option<Vec<u8>>) -> Option<ConsoleEvent> {
+    fn handle(&mut self, data: Option<Vec<u8>>) -> Vec<ConsoleEvent> {
         let Some(data) = data else {
             self.closed = true;
-            return None;
+            return Vec::new();
         };
         match &mut self.mux {
-            None => Some(ConsoleEvent::Input(data)),
+            None => vec![ConsoleEvent::Input(data)],
             Some(mux) => {
-                let (out, quit, msg) = mux.process(&data);
+                let (out, quit, msg, cmds) = mux.process_ext(&data);
                 if let Some(m) = msg {
                     let mut o = std::io::stdout().lock();
                     let _ = o.write_all(m.as_bytes());
                     let _ = o.flush();
                 }
-                if quit {
-                    Some(ConsoleEvent::Quit)
-                } else {
-                    Some(ConsoleEvent::Input(out))
+                let mut evs = Vec::new();
+                if !out.is_empty() {
+                    evs.push(ConsoleEvent::Input(out));
                 }
+                for cmd in cmds {
+                    evs.push(ConsoleEvent::MonitorCmd(cmd));
+                }
+                if quit {
+                    evs.push(ConsoleEvent::Quit);
+                }
+                evs
             }
         }
     }

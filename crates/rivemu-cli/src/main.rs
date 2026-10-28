@@ -13,6 +13,7 @@ use rivemu_cpu_riscv::{LogFlags, Logger};
 use rivemu_devices::PowerEvent;
 use rivemu_gdbstub::{GdbAction, GdbServer};
 use rivemu_machine::Machine;
+use rivemu_monitor::{MonitorAction, QmpServer, exec_hmp};
 
 fn main() -> ExitCode {
     match run() {
@@ -69,12 +70,7 @@ fn run() -> Result<ExitCode> {
     }
 
     for (used, what) in [
-        (!opts.drives.is_empty(), "-drive"),
-        (!opts.devices.is_empty(), "-device"),
-        (!opts.netdevs.is_empty(), "-netdev"),
-        (!opts.chardevs.is_empty(), "-chardev"),
         (opts.monitor.is_some(), "-monitor"),
-        (!opts.qmp.is_empty(), "-qmp"),
         (opts.icount.is_some(), "-icount"),
     ] {
         if used {
@@ -98,14 +94,20 @@ fn run() -> Result<ExitCode> {
         None => None,
     };
 
+    let mut qmp_servers = Vec::with_capacity(opts.qmp.len());
+    for spec in &opts.qmp {
+        qmp_servers
+            .push(QmpServer::bind(spec).with_context(|| format!("cannot bind -qmp '{spec}'"))?);
+    }
+
     let serial = SerialBackend::parse(opts.serials.first().map(String::as_str))?;
     let config = rivemu_cli::machine_config(&opts).map_err(|e| anyhow!(e))?;
     let mut machine = Machine::new(config.clone()).context("failed to initialise machine")?;
     machine.set_logger(logger.clone());
 
     let mut paused = opts.start_paused;
-    if paused && gdb.is_none() {
-        eprintln!("{PROG}: warning: -S specified without -s/-gdb; starting guest");
+    if paused && gdb.is_none() && qmp_servers.is_empty() && serial != SerialBackend::MonStdio {
+        eprintln!("{PROG}: warning: -S specified without debugger or monitor; starting guest");
         paused = false;
     }
 
@@ -125,7 +127,21 @@ fn run() -> Result<ExitCode> {
     };
 
     let started = Instant::now();
-    let exit = loop {
+    let exit = 'main: loop {
+        for qmp in &mut qmp_servers {
+            for act in qmp.poll(paused) {
+                match act {
+                    MonitorAction::Stop => paused = true,
+                    MonitorAction::Cont => paused = false,
+                    MonitorAction::Powerdown | MonitorAction::Quit => break 'main 0,
+                    MonitorAction::Reset => {
+                        machine =
+                            Machine::new(config.clone()).context("failed to reset machine")?;
+                        machine.set_logger(logger.clone());
+                    }
+                }
+            }
+        }
         if let Some(server) = &mut gdb {
             if paused {
                 match server.handle_paused(&mut machine)? {
@@ -138,21 +154,24 @@ fn run() -> Result<ExitCode> {
                 continue;
             }
         }
-        match machine.run_slice() {
-            Some(PowerEvent::Poweroff(code)) => break code,
-            Some(PowerEvent::Reset) if opts.no_reboot => break 0,
-            Some(PowerEvent::Reset) => {
-                let out = machine.uart.take_output();
-                sink.write_all(&out)?;
-                machine = Machine::new(config.clone()).context("failed to reset machine")?;
-                machine.set_logger(logger.clone());
+        if !paused {
+            match machine.run_slice() {
+                Some(PowerEvent::Poweroff(code)) if !opts.no_shutdown => break code,
+                Some(PowerEvent::Poweroff(_)) => paused = true,
+                Some(PowerEvent::Reset) if opts.no_reboot => break 0,
+                Some(PowerEvent::Reset) => {
+                    let out = machine.uart.take_output();
+                    sink.write_all(&out)?;
+                    machine = Machine::new(config.clone()).context("failed to reset machine")?;
+                    machine.set_logger(logger.clone());
+                }
+                None => {}
             }
-            None => {}
-        }
-        if machine.harts.iter().any(|h| h.hit_breakpoint) {
-            if let Some(server) = &mut gdb {
-                server.notify_stop()?;
-                paused = true;
+            if machine.harts.iter().any(|h| h.hit_breakpoint) {
+                if let Some(server) = &mut gdb {
+                    server.notify_stop()?;
+                    paused = true;
+                }
             }
         }
         let out = machine.uart.take_output();
@@ -160,22 +179,40 @@ fn run() -> Result<ExitCode> {
             sink.write_all(&out)?;
             sink.flush()?;
         }
-        let timeout = if machine.all_idle() {
+        let timeout = if paused {
+            Duration::from_millis(10)
+        } else if machine.all_idle() {
             machine.idle_timeout()
         } else {
             Duration::ZERO
         };
         match &mut console {
             Some(c) => {
-                let mut quit = false;
                 for ev in c.poll(timeout) {
                     match ev {
                         ConsoleEvent::Input(d) => machine.uart.push_input(&d),
-                        ConsoleEvent::Quit => quit = true,
+                        ConsoleEvent::MonitorCmd(line) => {
+                            let (reply, act) = exec_hmp(&line, &machine, paused);
+                            let out_str = format!("\r\n{}(qemu) ", reply.replace('\n', "\r\n"));
+                            sink.write_all(out_str.as_bytes())?;
+                            sink.flush()?;
+                            if let Some(act) = act {
+                                match act {
+                                    MonitorAction::Stop => paused = true,
+                                    MonitorAction::Cont => paused = false,
+                                    MonitorAction::Powerdown | MonitorAction::Quit => {
+                                        break 'main 0;
+                                    }
+                                    MonitorAction::Reset => {
+                                        machine = Machine::new(config.clone())
+                                            .context("failed to reset machine")?;
+                                        machine.set_logger(logger.clone());
+                                    }
+                                }
+                            }
+                        }
+                        ConsoleEvent::Quit => break 'main 0,
                     }
-                }
-                if quit {
-                    break 0;
                 }
             }
             None if !timeout.is_zero() => std::thread::sleep(timeout),

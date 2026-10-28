@@ -1,0 +1,18 @@
+[package]
+name = "rivemu-virtio"
+description = "VirtIO MMIO v2 transport, split virtqueues and blk/net/console/rng devices"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+rivemu-backends.workspace = true
+rivemu-core.workspace = true
+rivemu-mem.workspace = true
+
+[lints]
+workspace = true

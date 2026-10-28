@@ -143,3 +143,4 @@ Total for P0–P5: roughly **4 months** for one developer.
 - [x] **P1** – RV64GC interpreter, `rivemu-softfloat` (exact IEEE, all rounding modes)
 - [x] **P2** – M/S/U, traps/delegation, Sv39/Sv48 + TLB, Sstc; all 244 riscv-tests (`-p` and `-v`) pass
 - [x] **P3** – `virt` board (UART, CLINT, PLIC, RTC, sifive_test), `rivemu-fdt`, icache + fast RAM, `rivemu-gdbstub`, `-d`/`-D` logging, Linux + BusyBox shell boot (< 18 s on M-series Mac)
+- [x] **P4** – `rivemu-virtio` (`virtio-mmio` v2, split virtqueues, `blk`, `net`, `console`, `rng`), `rivemu-backends` (raw/qcow2 block, user-mode network stack with ARP/DHCP/ICMP/DNS/TCP/UDP + `hostfwd`, chardev), `rivemu-monitor` (HMP + QMP JSON)

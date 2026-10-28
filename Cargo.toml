@@ -12,6 +12,7 @@ authors = ["Karl Mehltretter <kmehltretter@gmail.com>"]
 publish = false
 
 [workspace.dependencies]
+rivemu-backends = { path = "crates/rivemu-backends" }
 rivemu-core = { path = "crates/rivemu-core" }
 rivemu-cpu-riscv = { path = "crates/rivemu-cpu-riscv" }
 rivemu-devices = { path = "crates/rivemu-devices" }
@@ -19,7 +20,9 @@ rivemu-fdt = { path = "crates/rivemu-fdt" }
 rivemu-gdbstub = { path = "crates/rivemu-gdbstub" }
 rivemu-mem = { path = "crates/rivemu-mem" }
 rivemu-machine = { path = "crates/rivemu-machine" }
+rivemu-monitor = { path = "crates/rivemu-monitor" }
 rivemu-softfloat = { path = "crates/rivemu-softfloat" }
+rivemu-virtio = { path = "crates/rivemu-virtio" }
 
 anyhow = "1"
 memmap2 = "0.9"
