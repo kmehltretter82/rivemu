@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// A guest physical (or, in CPU code, virtual) address.
@@ -140,6 +141,58 @@ impl HostTimebase {
 impl Timebase for HostTimebase {
     fn now(&self) -> u64 {
         self.clock.now_ns() / (1_000_000_000 / self.freq_hz)
+    }
+}
+
+/// Deterministic instruction-count timebase (`-icount [shift=N]`).
+///
+/// Virtual time advances by `1 << shift` nanoseconds per retired instruction,
+/// and warps forward to the next timer deadline whenever all harts are idle
+/// (`wfi`).
+#[derive(Debug)]
+pub struct IcountTimebase {
+    ns: AtomicU64,
+    freq_hz: u64,
+    shift: u8,
+}
+
+impl IcountTimebase {
+    /// Creates an instruction-counted timebase ticking at `freq_hz`.
+    pub fn new(freq_hz: u64, shift: u8) -> Self {
+        assert!(
+            freq_hz > 0 && 1_000_000_000 % freq_hz == 0,
+            "unsupported frequency"
+        );
+        Self {
+            ns: AtomicU64::new(0),
+            freq_hz,
+            shift: shift.min(16),
+        }
+    }
+
+    /// Advances virtual time by `insns` executed instructions.
+    #[inline]
+    pub fn advance(&self, insns: u64) {
+        self.ns.fetch_add(insns << self.shift, Ordering::Relaxed);
+    }
+
+    /// Warps virtual time forward so [`Self::now`] is at least `target_ticks`.
+    pub fn warp_to(&self, target_ticks: u64) {
+        let ns_per_tick = 1_000_000_000 / self.freq_hz;
+        let target_ns = target_ticks.saturating_mul(ns_per_tick);
+        let _ = self.ns.fetch_max(target_ns, Ordering::Relaxed);
+    }
+
+    /// Converts a tick count into nanoseconds.
+    pub fn ticks_to_ns(&self, ticks: u64) -> u64 {
+        ticks.saturating_mul(1_000_000_000 / self.freq_hz)
+    }
+}
+
+impl Timebase for IcountTimebase {
+    #[inline]
+    fn now(&self) -> u64 {
+        self.ns.load(Ordering::Relaxed) / (1_000_000_000 / self.freq_hz)
     }
 }
 

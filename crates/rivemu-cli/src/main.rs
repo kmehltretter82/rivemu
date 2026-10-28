@@ -69,13 +69,8 @@ fn run() -> Result<ExitCode> {
         }
     }
 
-    for (used, what) in [
-        (opts.monitor.is_some(), "-monitor"),
-        (opts.icount.is_some(), "-icount"),
-    ] {
-        if used {
-            eprintln!("{PROG}: warning: {what} is not implemented yet; ignoring");
-        }
+    if opts.monitor.is_some() {
+        eprintln!("{PROG}: warning: -monitor is only supported via mon:stdio (Ctrl-A c)");
     }
 
     let logger = if !opts.log_items.is_empty() {

@@ -147,6 +147,109 @@ impl Ram {
         }
         Some(())
     }
+
+    /// Atomic compare-and-exchange for 32-bit or 64-bit aligned guest accesses
+    /// (`sc.w` / `sc.d`). Returns `Some(true)` on success, `Some(false)` on
+    /// mismatch, or `None` if out of bounds or unaligned.
+    #[inline]
+    pub fn compare_exchange(
+        &self,
+        offset: u64,
+        size: AccessSize,
+        expected: u64,
+        new: u64,
+    ) -> Option<bool> {
+        if !self.in_bounds(offset, size.bytes()) {
+            return None;
+        }
+        let p = self.at(offset);
+        // SAFETY: bounds checked above; alignment verified in each arm.
+        unsafe {
+            match size {
+                AccessSize::Word if p.cast::<u32>().is_aligned() => {
+                    let atom = AtomicU32::from_ptr(p.cast());
+                    Some(
+                        atom.compare_exchange(
+                            (expected as u32).to_le(),
+                            (new as u32).to_le(),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok(),
+                    )
+                }
+                AccessSize::Double if p.cast::<u64>().is_aligned() => {
+                    let atom = AtomicU64::from_ptr(p.cast());
+                    Some(
+                        atom.compare_exchange(
+                            expected.to_le(),
+                            new.to_le(),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok(),
+                    )
+                }
+                _ => None,
+            }
+        }
+    }
+
+    /// Atomic read-modify-write for 32-bit or 64-bit aligned guest accesses
+    /// (`amo*.w` / `amo*.d`). Returns the old value (`u64`), or `None` if out
+    /// of bounds or unaligned.
+    #[inline]
+    pub fn atomic_rmw(
+        &self,
+        offset: u64,
+        size: AccessSize,
+        mut f: impl FnMut(u64) -> u64,
+    ) -> Option<u64> {
+        if !self.in_bounds(offset, size.bytes()) {
+            return None;
+        }
+        let p = self.at(offset);
+        // SAFETY: bounds checked above; alignment verified in each arm.
+        unsafe {
+            match size {
+                AccessSize::Word if p.cast::<u32>().is_aligned() => {
+                    let atom = AtomicU32::from_ptr(p.cast());
+                    let mut cur_le = atom.load(Ordering::Acquire);
+                    loop {
+                        let cur = u64::from(u32::from_le(cur_le));
+                        let next_le = (f(cur) as u32).to_le();
+                        match atom.compare_exchange_weak(
+                            cur_le,
+                            next_le,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => return Some(cur),
+                            Err(actual) => cur_le = actual,
+                        }
+                    }
+                }
+                AccessSize::Double if p.cast::<u64>().is_aligned() => {
+                    let atom = AtomicU64::from_ptr(p.cast());
+                    let mut cur_le = atom.load(Ordering::Acquire);
+                    loop {
+                        let cur = u64::from_le(cur_le);
+                        let next_le = f(cur).to_le();
+                        match atom.compare_exchange_weak(
+                            cur_le,
+                            next_le,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => return Some(cur),
+                            Err(actual) => cur_le = actual,
+                        }
+                    }
+                }
+                _ => None,
+            }
+        }
+    }
 }
 
 /// # Safety
@@ -269,5 +372,29 @@ mod tests {
         let mut buf = [0u8; 10];
         ram.read_bytes(3, &mut buf).unwrap();
         assert_eq!(buf, [0, 0xaa, 0xaa, 1, 2, 0xaa, 0xaa, 0xaa, 0xaa, 0]);
+    }
+
+    #[test]
+    fn atomic_compare_exchange_and_rmw() {
+        let ram = Ram::new(32).unwrap();
+        ram.write(0, AccessSize::Word, 10).unwrap();
+        assert_eq!(
+            ram.compare_exchange(0, AccessSize::Word, 9, 20),
+            Some(false)
+        );
+        assert_eq!(
+            ram.compare_exchange(0, AccessSize::Word, 10, 20),
+            Some(true)
+        );
+        assert_eq!(ram.read(0, AccessSize::Word), Some(20));
+
+        let old = ram.atomic_rmw(0, AccessSize::Word, |v| v + 5).unwrap();
+        assert_eq!(old, 20);
+        assert_eq!(ram.read(0, AccessSize::Word), Some(25));
+
+        ram.write(8, AccessSize::Double, 0x1000_0000_0000).unwrap();
+        let old64 = ram.atomic_rmw(8, AccessSize::Double, |v| v | 0xff).unwrap();
+        assert_eq!(old64, 0x1000_0000_0000);
+        assert_eq!(ram.read(8, AccessSize::Double), Some(0x1000_0000_00ff));
     }
 }

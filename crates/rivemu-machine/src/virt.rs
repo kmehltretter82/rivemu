@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rivemu_backends::{BlockBackend, Chardev, NetBackend};
-use rivemu_core::{GuestAddr, HostTimebase, Timebase, align_down, align_up, size::MIB};
+use rivemu_core::{
+    GuestAddr, HostTimebase, IcountTimebase, Timebase, align_down, align_up, size::MIB,
+};
 use rivemu_cpu_riscv::csr::envcfg;
 use rivemu_cpu_riscv::{Hart, HartIrqs, Logger};
 use rivemu_devices::{Clint, GoldfishRtc, Plic, PowerControl, PowerEvent, SifiveTest, Uart16550};
@@ -108,6 +110,8 @@ pub struct MachineConfig {
     pub append: Option<String>,
     /// Attached `virtio-mmio` devices (up to [`memmap::VIRTIO_COUNT`]).
     pub virtio: Vec<VirtioDeviceConfig>,
+    /// Deterministic instruction-count timing shift (`-icount [shift=]N`).
+    pub icount: Option<u8>,
 }
 
 impl Default for MachineConfig {
@@ -121,6 +125,7 @@ impl Default for MachineConfig {
             dtb: None,
             append: None,
             virtio: Vec::new(),
+            icount: None,
         }
     }
 }
@@ -217,8 +222,10 @@ pub struct Machine {
     pub power: Arc<PowerControl>,
     /// Attached `virtio-mmio` transports.
     pub virtio: Vec<Arc<VirtioMmio>>,
-    /// Platform timebase.
+    /// Host monotonic timebase.
     pub timebase: Arc<HostTimebase>,
+    /// Instruction-counted timebase when `-icount` is enabled.
+    pub icount: Option<Arc<IcountTimebase>>,
 }
 
 fn read_file(what: &'static str, path: &Path) -> Result<Vec<u8>, MachineError> {
@@ -294,7 +301,13 @@ impl Machine {
 
         // Harts and devices.
         let timebase = Arc::new(HostTimebase::new(TIMEBASE_FREQ));
-        let tb: Arc<dyn Timebase> = timebase.clone();
+        let icount = config
+            .icount
+            .map(|shift| Arc::new(IcountTimebase::new(TIMEBASE_FREQ, shift)));
+        let tb: Arc<dyn Timebase> = match &icount {
+            Some(ic) => ic.clone(),
+            None => timebase.clone(),
+        };
         let mut harts: Vec<Hart> = (0..config.smp)
             .map(|i| Hart::new(u64::from(i), tb.clone()))
             .collect();
@@ -462,6 +475,7 @@ impl Machine {
             power,
             virtio,
             timebase,
+            icount,
         })
     }
 
@@ -473,7 +487,19 @@ impl Machine {
             v.poll();
         }
         for h in &mut self.harts {
-            h.run(&self.bus, QUANTUM);
+            let ran = h.run(&self.bus, QUANTUM);
+            if let Some(ic) = &self.icount {
+                ic.advance(ran);
+            }
+        }
+        if let Some((ic, d)) = self
+            .icount
+            .as_ref()
+            .filter(|_| self.all_idle())
+            .zip(self.next_timer_deadline())
+        {
+            ic.warp_to(d);
+            self.clint.update();
         }
         self.power.take()
     }
@@ -483,15 +509,30 @@ impl Machine {
         self.harts.iter().all(|h| h.wfi)
     }
 
-    /// How long the host may sleep before the next timer event.
-    pub fn idle_timeout(&self) -> Duration {
-        let now = self.timebase.now();
+    fn now_ticks(&self) -> u64 {
+        match &self.icount {
+            Some(ic) => ic.now(),
+            None => self.timebase.now(),
+        }
+    }
+
+    fn next_timer_deadline(&self) -> Option<u64> {
+        let now = self.now_ticks();
         let stimecmp = self
             .harts
             .iter()
             .filter(|h| h.csr.menvcfg & envcfg::STCE != 0 && h.csr.stimecmp > now)
             .map(|h| h.csr.stimecmp);
-        match self.clint.next_deadline().into_iter().chain(stimecmp).min() {
+        self.clint.next_deadline().into_iter().chain(stimecmp).min()
+    }
+
+    /// How long the host may sleep before the next timer event.
+    pub fn idle_timeout(&self) -> Duration {
+        if self.icount.is_some() {
+            return Duration::ZERO;
+        }
+        let now = self.now_ticks();
+        match self.next_timer_deadline() {
             Some(d) => {
                 Duration::from_nanos(self.timebase.ticks_to_ns(d.saturating_sub(now))).min(MAX_IDLE)
             }
@@ -651,5 +692,28 @@ mod tests {
         })
         .unwrap_err();
         assert!(e.to_string().contains("does not fit"), "{e}");
+    }
+
+    #[test]
+    fn icount_deterministic_timer_warp() {
+        let mut m = Machine::new(MachineConfig {
+            icount: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(m.idle_timeout(), Duration::ZERO);
+        // Set mtimecmp[0] = 500_000 and enable MTIE on hart 0, then enter WFI.
+        m.bus
+            .write(memmap::CLINT.0 + 0x4000, AccessSize::Double, 500_000)
+            .unwrap();
+        m.harts[0].csr.mie = 1 << 7; // MTIE
+        m.harts[0].wfi = true;
+        m.run_slice();
+        assert!(m.now_ticks() >= 500_000);
+        m.run_slice();
+        assert!(
+            !m.harts[0].wfi,
+            "hart 0 should wake after icount timer warp"
+        );
     }
 }

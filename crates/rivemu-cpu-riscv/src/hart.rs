@@ -147,6 +147,8 @@ pub struct Hart {
     fetch_pa_page: u64,
     /// Re-check interrupts before the next instruction.
     check_irq: bool,
+    /// Yield the current scheduling slice early (e.g. on `pause` or IPI send).
+    yield_slice: bool,
     /// The current instruction wrote `minstret` (suppresses its increment).
     instret_written: bool,
     /// Active `-d` flags (`0` when logging is disabled).
@@ -193,6 +195,7 @@ impl Hart {
             fetch_vpn: 0,
             fetch_pa_page: 0,
             check_irq: true,
+            yield_slice: false,
             instret_written: false,
             log_flags: LogFlags::default(),
             logger: None,
@@ -213,6 +216,7 @@ impl Hart {
         self.flush_tlb();
         self.flush_icache();
         self.check_irq = true;
+        self.yield_slice = false;
         self.hit_breakpoint = false;
     }
 
@@ -259,6 +263,7 @@ impl Hart {
     /// debugger breakpoint.
     pub fn run(&mut self, bus: &AddressSpace, budget: u64) -> u64 {
         self.hit_breakpoint = false;
+        self.yield_slice = false;
         self.take_pending_interrupt();
         if self.wfi {
             return 0;
@@ -275,10 +280,11 @@ impl Hart {
             if self.check_irq {
                 self.take_pending_interrupt();
             }
-            if self.wfi {
+            if self.wfi || self.yield_slice {
                 break;
             }
         }
+        self.reservation = None;
         n
     }
 
@@ -511,6 +517,12 @@ impl Hart {
         }
         let pa = self.translate(bus, va, Access::Store)?;
         self.invalidate_reservation(pa);
+        if pa < 0x8000_0000 {
+            self.check_irq = true;
+            if (0x0200_0000..0x0200_4000).contains(&pa) && value & 1 != 0 {
+                self.yield_slice = true;
+            }
+        }
         bus.write(pa, size, value).map_err(|e| {
             if self.log_flags.has(LogFlags::GUEST_ERRORS) {
                 self.log_guest_error(format_args!("store fault at va={va:#x} pa={pa:#x}: {e}"));
@@ -634,7 +646,13 @@ impl Hart {
             Op::Sllw => self.set_x(rd, sext32(rs1 << (rs2 & 31))),
             Op::Srlw => self.set_x(rd, sext32(u64::from((rs1 as u32) >> (rs2 & 31)))),
             Op::Sraw => self.set_x(rd, ((rs1 as i32) >> (rs2 & 31)) as i64 as u64),
-            Op::Fence => {}
+            Op::Fence => {
+                std::sync::atomic::fence(Ordering::SeqCst);
+                if insn.raw == 0x0100_000f {
+                    // Zihintpause `pause` (`fence w, 0` in `cpu_relax()`).
+                    self.yield_slice = true;
+                }
+            }
             Op::FenceI => self.flush_icache(),
             Op::Ecall => {
                 let c = match self.prv {
@@ -752,6 +770,9 @@ impl Hart {
                 }
                 if self.mip() & self.csr.mie == 0 {
                     self.wfi = true;
+                } else {
+                    self.check_irq = true;
+                    self.yield_slice = true;
                 }
             }
             Op::SfenceVma => {
@@ -803,42 +824,38 @@ impl Hart {
             Op::Sc => {
                 let pa = self.translate(bus, addr, Access::Store)?;
                 let ok = match self.reservation.take() {
-                    Some((r, v)) if r == pa => {
-                        bus.read(pa, size)
-                            .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?
-                            == v
-                    }
+                    Some((r, v)) if r == pa => bus
+                        .compare_exchange(pa, size, v, src)
+                        .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?,
                     _ => false,
                 };
-                if ok {
-                    bus.write(pa, size, src)
-                        .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
-                }
                 self.set_x(insn.rd, u64::from(!ok));
             }
             _ => {
                 let pa = self.translate(bus, addr, Access::Store)?;
+                let b = fix(src);
+                let funct = insn.funct;
+                let dbl = insn.dbl;
                 let old = bus
-                    .read(pa, size)
+                    .atomic_rmw(pa, size, |old_raw| {
+                        let a = fix(old_raw);
+                        match funct {
+                            amo::SWAP => b,
+                            amo::ADD => a.wrapping_add(b),
+                            amo::XOR => a ^ b,
+                            amo::AND => a & b,
+                            amo::OR => a | b,
+                            amo::MIN => (a as i64).min(b as i64) as u64,
+                            amo::MAX => (a as i64).max(b as i64) as u64,
+                            amo::MINU if dbl => a.min(b),
+                            amo::MAXU if dbl => a.max(b),
+                            amo::MINU => u64::from((a as u32).min(b as u32)),
+                            _ => u64::from((a as u32).max(b as u32)),
+                        }
+                    })
                     .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
-                let (a, b) = (fix(old), fix(src));
-                let new = match insn.funct {
-                    amo::SWAP => b,
-                    amo::ADD => a.wrapping_add(b),
-                    amo::XOR => a ^ b,
-                    amo::AND => a & b,
-                    amo::OR => a | b,
-                    amo::MIN => (a as i64).min(b as i64) as u64,
-                    amo::MAX => (a as i64).max(b as i64) as u64,
-                    amo::MINU if insn.dbl => a.min(b),
-                    amo::MAXU if insn.dbl => a.max(b),
-                    amo::MINU => u64::from((a as u32).min(b as u32)),
-                    _ => u64::from((a as u32).max(b as u32)),
-                };
                 self.invalidate_reservation(pa);
-                bus.write(pa, size, new)
-                    .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
-                self.set_x(insn.rd, a);
+                self.set_x(insn.rd, fix(old));
             }
         }
         Ok(())
@@ -871,10 +888,13 @@ impl Hart {
             0
         };
         if writes {
+            // Per RISC-V Privileged Spec 3.1.9, RMW operations on `mip` use only
+            // the software-writable bits as their input, not external IRQ lines.
+            let base = if num == csr::MIP { self.csr.mip } else { old };
             let new = match insn.op {
                 Op::Csrrw | Op::Csrrwi => src,
-                Op::Csrrs | Op::Csrrsi => old | src,
-                _ => old & !src,
+                Op::Csrrs | Op::Csrrsi => base | src,
+                _ => base & !src,
             };
             self.csr_write(num, new).ok_or_else(illegal)?;
             self.check_irq = true;

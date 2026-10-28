@@ -289,6 +289,72 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Atomic compare-and-exchange on guest RAM (`sc.w` / `sc.d`).
+    #[inline]
+    pub fn compare_exchange(
+        &self,
+        addr: GuestAddr,
+        size: AccessSize,
+        expected: u64,
+        new: u64,
+    ) -> Result<bool, BusError> {
+        if let Some((base, len, ref ram)) = self.fast_ram {
+            let off = addr.wrapping_sub(base);
+            if off < len {
+                return ram.compare_exchange(off, size, expected, new).ok_or(
+                    BusError::CrossesBoundary {
+                        addr,
+                        size: size.bytes(),
+                    },
+                );
+            }
+        }
+        let r = self.find_access(addr, size)?;
+        let off = addr - r.base;
+        match &r.kind {
+            RegionKind::Ram(m) => {
+                m.compare_exchange(off, size, expected, new)
+                    .ok_or(BusError::CrossesBoundary {
+                        addr,
+                        size: size.bytes(),
+                    })
+            }
+            RegionKind::Rom(_) => Err(BusError::ReadOnly { addr }),
+            RegionKind::Mmio(_) => Err(BusError::NotMemory { addr }),
+        }
+    }
+
+    /// Atomic read-modify-write on guest RAM (`amo*.w` / `amo*.d`).
+    #[inline]
+    pub fn atomic_rmw(
+        &self,
+        addr: GuestAddr,
+        size: AccessSize,
+        f: impl FnMut(u64) -> u64,
+    ) -> Result<u64, BusError> {
+        if let Some((base, len, ref ram)) = self.fast_ram {
+            let off = addr.wrapping_sub(base);
+            if off < len {
+                return ram
+                    .atomic_rmw(off, size, f)
+                    .ok_or(BusError::CrossesBoundary {
+                        addr,
+                        size: size.bytes(),
+                    });
+            }
+        }
+        let r = self.find_access(addr, size)?;
+        let off = addr - r.base;
+        match &r.kind {
+            RegionKind::Ram(m) => m.atomic_rmw(off, size, f).ok_or(BusError::CrossesBoundary {
+                addr,
+                size: size.bytes(),
+            }),
+            RegionKind::Rom(_) => Err(BusError::ReadOnly { addr }),
+            RegionKind::Mmio(_) => Err(BusError::NotMemory { addr }),
+        }
+    }
+
     /// Applies `f(memory, offset_in_region, offset_in_request, chunk_len)` to
     /// every memory chunk covering `[addr, addr + len)`. Spans adjacent
     /// RAM/ROM regions; fails on holes or MMIO.

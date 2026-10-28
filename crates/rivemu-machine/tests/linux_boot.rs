@@ -49,7 +49,8 @@ fn boots_linux_with_virtio_blk_net_console_rng_and_powers_off() {
 
     let mut machine = Machine::new(MachineConfig {
         ram_size: 256 * MIB,
-        smp: 1,
+        smp: 4,
+        icount: None,
         bios: Some(bios),
         kernel: Some(kernel),
         initrd: Some(initrd),
@@ -88,9 +89,16 @@ fn boots_linux_with_virtio_blk_net_console_rng_and_powers_off() {
         let bytes = machine.uart.take_output();
         if !bytes.is_empty() {
             console_out.push_str(&String::from_utf8_lossy(&bytes));
-            if !sent_cmd && console_out.contains("=== rivemu BusyBox initramfs ===") {
+            if console_out.contains("NETDEV WATCHDOG")
+                || console_out.contains("hard LOCKUP")
+                || console_out.contains("rcu_sched detected stalls")
+            {
+                break;
+            }
+            if !sent_cmd && console_out.contains("~ # ") {
                 let script = "\
 echo SHELL_CMD_OK$((20+22))\n\
+echo CPUS=$(/bin/busybox grep -c ^processor /proc/cpuinfo)\n\
 /bin/busybox dd if=/dev/vda bs=20 count=1 2>/dev/null\n\
 echo -n GUEST_BLK_WRITE | /bin/busybox dd of=/dev/vda bs=512 seek=1 conv=notrunc 2>/dev/null\n\
 /bin/busybox sync\n\
@@ -115,6 +123,30 @@ echo VCONSOLE_OK > /dev/hvc0 2>/dev/null || true\n\
         elapsed.as_secs_f64(),
         machine.instret()
     );
+    if poweroff_code != Some(0) {
+        for h in &machine.harts {
+            let pa = h.debug_translate(&machine.bus, h.pc);
+            let insn = pa.and_then(|p| machine.bus.read(p, rivemu_core::AccessSize::Word).ok());
+            eprintln!(
+                "HART {}: pc={:#x} (pa={:?} insn={:#x?}) prv={:?} wfi={} mstatus={:#x} mip={:#x} mie={:#x} sepc={:#x} mepc={:#x} ra={:#x} a0={:#x} a1={:#x} a2={:#x}",
+                h.id,
+                h.pc,
+                pa,
+                insn,
+                h.prv,
+                h.wfi,
+                h.csr.mstatus,
+                h.mip(),
+                h.csr.mie,
+                h.csr.sepc,
+                h.csr.mepc,
+                h.x[1],
+                h.x[10],
+                h.x[11],
+                h.x[12]
+            );
+        }
+    }
     assert!(
         console_out.contains("Linux 6."),
         "expected uname output in console:\n{console_out}"
@@ -122,6 +154,10 @@ echo VCONSOLE_OK > /dev/hvc0 2>/dev/null || true\n\
     assert!(
         console_out.contains("SHELL_CMD_OK42"),
         "expected BusyBox shell arithmetic output in console:\n{console_out}"
+    );
+    assert!(
+        console_out.contains("CPUS=4"),
+        "expected 4 online CPUs in /proc/cpuinfo:\n{console_out}"
     );
     assert!(
         console_out.contains("RIVEMU_BLK_MAGIC_OK"),
@@ -137,5 +173,9 @@ echo VCONSOLE_OK > /dev/hvc0 2>/dev/null || true\n\
         &sector1, b"GUEST_BLK_WRITE",
         "expected guest write to sector 1 of virtio-blk"
     );
-    assert_eq!(poweroff_code, Some(0), "expected clean guest poweroff");
+    assert_eq!(
+        poweroff_code,
+        Some(0),
+        "expected clean guest poweroff, console:\n{console_out}"
+    );
 }

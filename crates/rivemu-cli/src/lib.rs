@@ -594,6 +594,21 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
         }
     }
 
+    let icount = match &o.icount {
+        Some(ic) => {
+            let s = ic.get("shift").unwrap_or("auto");
+            if s == "auto" {
+                Some(5u8)
+            } else {
+                Some(
+                    s.parse::<u8>()
+                        .map_err(|_| format!("-icount: invalid shift '{s}'"))?,
+                )
+            }
+        }
+        None => None,
+    };
+
     Ok(MachineConfig {
         ram_size: o.memory,
         smp: o.smp,
@@ -603,6 +618,7 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
         dtb: o.dtb.clone(),
         append: o.append.clone(),
         virtio,
+        icount,
     })
 }
 
