@@ -309,11 +309,19 @@ fn main() {
     // 3. Mount /proc and inspect /proc/cpuinfo (verifying Zba/Zbb/Zbc/Zbs and 4 CPUs).
     unsafe {
         mount(b"proc\0".as_ptr(), b"/proc\0".as_ptr(), b"proc\0".as_ptr(), 0, std::ptr::null());
+        mount(b"sysfs\0".as_ptr(), b"/sys\0".as_ptr(), b"sysfs\0".as_ptr(), 0, std::ptr::null());
     }
     if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
         let cpus = cpuinfo.lines().filter(|l| l.starts_with("processor")).count();
         let has_zbb = cpuinfo.contains("zbb");
         println!("RUST_PROC_CPUS={cpus} HAS_ZBB={has_zbb}");
+    }
+    if let Ok(entries) = fs::read_dir("/sys/bus/pci/devices") {
+        let mut devs: Vec<String> = entries
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+        devs.sort();
+        println!("RUST_PCI_DEVS={}", devs.join(","));
     }
 
     // 3. Mount virtio-9p share ("host0") at /mnt, read host file, write guest file.
@@ -435,6 +443,10 @@ fn main() {
     );
     assert!(
         console_out.contains("RUST_PROC_CPUS=4 HAS_ZBB=true"),
+        "{console_out}"
+    );
+    assert!(
+        console_out.contains("RUST_PCI_DEVS=0000:00:00.0,0000:00:01.0"),
         "{console_out}"
     );
     if console_out.contains("RUST_9P_READ=") {

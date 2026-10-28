@@ -2,7 +2,7 @@
 
 use rivemu_fdt::FdtBuilder;
 
-use crate::virt::{RTC_IRQ, TIMEBASE_FREQ, UART0_IRQ, memmap};
+use crate::virt::{PCIE_IRQ, RTC_IRQ, TIMEBASE_FREQ, UART0_IRQ, memmap};
 
 /// Inputs for device tree generation.
 #[derive(Debug, Clone)]
@@ -168,6 +168,68 @@ pub(crate) fn build(p: &FdtParams<'_>) -> Vec<u8> {
         f.prop_u32("interrupt-parent", plic_ph);
         f.end_node();
     }
+
+    f.begin_node(&format!("fw-cfg@{:x}", memmap::FW_CFG.0));
+    f.prop_str("compatible", "qemu,fw-cfg-mmio");
+    reg(&mut f, memmap::FW_CFG);
+    f.prop_null("dma-coherent");
+    f.end_node();
+
+    f.begin_node(&format!("flash@{:x}", memmap::FLASH.0));
+    f.prop_str("compatible", "cfi-flash");
+    let bank_size = memmap::FLASH.1 / 2;
+    f.prop_u64s(
+        "reg",
+        &[
+            memmap::FLASH.0,
+            bank_size,
+            memmap::FLASH.0 + bank_size,
+            bank_size,
+        ],
+    );
+    f.prop_u32("bank-width", 4);
+    f.end_node();
+
+    f.begin_node(&format!("pci@{:x}", memmap::PCIE_ECAM.0));
+    f.prop_str("compatible", "pci-host-ecam-generic");
+    f.prop_str("device_type", "pci");
+    f.prop_u32("#address-cells", 3);
+    f.prop_u32("#size-cells", 2);
+    f.prop_u32("#interrupt-cells", 1);
+    f.prop_cells("bus-range", &[0x00, 0xff]);
+    f.prop_null("dma-coherent");
+    reg(&mut f, memmap::PCIE_ECAM);
+    f.prop_cells(
+        "ranges",
+        &[
+            // I/O space (0x01000000): 64 KiB at 0x0300_0000
+            0x0100_0000,
+            0,
+            0,
+            (memmap::PCIE_PIO.0 >> 32) as u32,
+            memmap::PCIE_PIO.0 as u32,
+            (memmap::PCIE_PIO.1 >> 32) as u32,
+            memmap::PCIE_PIO.1 as u32,
+            // 32-bit MMIO space (0x02000000): 1 GiB at 0x4000_0000
+            0x0200_0000,
+            (memmap::PCIE_MMIO.0 >> 32) as u32,
+            memmap::PCIE_MMIO.0 as u32,
+            (memmap::PCIE_MMIO.0 >> 32) as u32,
+            memmap::PCIE_MMIO.0 as u32,
+            (memmap::PCIE_MMIO.1 >> 32) as u32,
+            memmap::PCIE_MMIO.1 as u32,
+        ],
+    );
+    f.prop_cells("interrupt-map-mask", &[0x1800, 0, 0, 0x7]);
+    let mut imap = Vec::with_capacity(16 * 6);
+    for slot in 0..4u32 {
+        for pin in 1..=4u32 {
+            let irq = PCIE_IRQ + ((slot + pin - 1) % 4);
+            imap.extend_from_slice(&[slot << 11, 0, 0, pin, plic_ph, irq]);
+        }
+    }
+    f.prop_cells("interrupt-map", &imap);
+    f.end_node();
 
     f.end_node(); // soc
     f.end_node(); // root

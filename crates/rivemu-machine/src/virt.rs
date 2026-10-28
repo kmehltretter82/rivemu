@@ -14,10 +14,13 @@ use rivemu_core::{
 };
 use rivemu_cpu_riscv::csr::{envcfg, irq};
 use rivemu_cpu_riscv::{Hart, HartIrqs, Logger};
-use rivemu_devices::{Clint, GoldfishRtc, Plic, PowerControl, PowerEvent, SifiveTest, Uart16550};
+use rivemu_devices::{
+    Clint, FwCfg, GoldfishRtc, PflashCfi01, Plic, PowerControl, PowerEvent, SifiveTest, Uart16550,
+};
 use rivemu_mem::{AddressSpace, MapError, Ram};
 use rivemu_virtio::{
-    DmaRam, Virtio9p, VirtioBlk, VirtioConsole, VirtioDevice, VirtioMmio, VirtioNet, VirtioRng,
+    DmaRam, PciBus, Virtio9p, VirtioBlk, VirtioConsole, VirtioDevice, VirtioMmio, VirtioNet,
+    VirtioRng,
 };
 use thiserror::Error;
 
@@ -36,6 +39,8 @@ pub mod memmap {
     pub const RTC: (GuestAddr, u64) = (0x0010_1000, 0x1000);
     /// CLINT / ACLINT MTIMER + MSWI.
     pub const CLINT: (GuestAddr, u64) = (0x0200_0000, 0x1_0000);
+    /// PCIe I/O port window (64 KiB).
+    pub const PCIE_PIO: (GuestAddr, u64) = (0x0300_0000, 0x0001_0000);
     /// PLIC.
     pub const PLIC: (GuestAddr, u64) = (0x0c00_0000, 0x0060_0000);
     /// NS16550A UART.
@@ -44,6 +49,14 @@ pub mod memmap {
     pub const VIRTIO: (GuestAddr, u64) = (0x1000_1000, 0x1000);
     /// Number of virtio-mmio transports.
     pub const VIRTIO_COUNT: u64 = 8;
+    /// QEMU firmware configuration device (`qemu,fw-cfg-mmio`).
+    pub const FW_CFG: (GuestAddr, u64) = (0x1010_0000, 0x18);
+    /// Dual 32 MiB CFI01 NOR flash banks (`pflash0` + `pflash1`, 64 MiB total).
+    pub const FLASH: (GuestAddr, u64) = (0x2000_0000, 0x0400_0000);
+    /// Generic PCIe ECAM configuration space (256 MiB, buses 0..=255).
+    pub const PCIE_ECAM: (GuestAddr, u64) = (0x3000_0000, 0x1000_0000);
+    /// 32-bit PCIe MMIO BAR window (1 GiB).
+    pub const PCIE_MMIO: (GuestAddr, u64) = (0x4000_0000, 0x4000_0000);
     /// Start of main memory.
     pub const DRAM_BASE: GuestAddr = 0x8000_0000;
 }
@@ -58,6 +71,8 @@ pub const UART0_IRQ: u32 = 10;
 pub const RTC_IRQ: u32 = 11;
 /// PLIC source of the first virtio-mmio transport.
 pub const VIRTIO_IRQ: u32 = 1;
+/// First PLIC source for PCIe INTx (`INTA..INTD` = `32..=35`).
+pub const PCIE_IRQ: u32 = 32;
 /// Number of PLIC sources (including the reserved source 0).
 pub const PLIC_NUM_SOURCES: usize = 96;
 /// Instructions each hart executes per scheduling slice.
@@ -243,6 +258,12 @@ pub struct Machine {
     pub power: Arc<PowerControl>,
     /// Attached `virtio-mmio` transports.
     pub virtio: Vec<Arc<VirtioMmio>>,
+    /// Generic PCIe host bridge (`pci-host-ecam-generic`) and `virtio-pci` devices.
+    pub pci: Arc<PciBus>,
+    /// QEMU firmware configuration device (`qemu,fw-cfg-mmio` at `0x1010_0000`).
+    pub fw_cfg: Arc<FwCfg>,
+    /// Dual 32 MiB CFI01 NOR flash banks (`0x2000_0000` and `0x2200_0000`).
+    pub pflash: [Arc<PflashCfi01>; 2],
     /// Host monotonic timebase.
     pub timebase: Arc<HostTimebase>,
     /// Instruction-counted timebase when `-icount` is enabled.
@@ -380,6 +401,26 @@ impl Machine {
         let (b, s) = memmap::UART0;
         bus.add_mmio("serial", b, s, uart.clone())?;
 
+        let fw_cfg = Arc::new(FwCfg::new(
+            config.ram_size,
+            config.smp as u16,
+            memmap::DRAM_BASE,
+            Some(ram.clone()),
+        ));
+        let (b, s) = memmap::FW_CFG;
+        bus.add_mmio("fw_cfg", b, s, fw_cfg.clone())?;
+
+        let bank_size = memmap::FLASH.1 / 2;
+        let pflash0 = Arc::new(PflashCfi01::new(bank_size));
+        let pflash1 = Arc::new(PflashCfi01::new(bank_size));
+        bus.add_mmio("virt.flash0", memmap::FLASH.0, bank_size, pflash0.clone())?;
+        bus.add_mmio(
+            "virt.flash1",
+            memmap::FLASH.0 + bank_size,
+            bank_size,
+            pflash1.clone(),
+        )?;
+
         if config.virtio.len() as u64 > memmap::VIRTIO_COUNT {
             return Err(MachineError::Config(format!(
                 "too many virtio devices ({}; maximum is {})",
@@ -388,6 +429,28 @@ impl Machine {
             )));
         }
         let dma = DmaRam::new(memmap::DRAM_BASE, ram.clone());
+        let pci = PciBus::new(
+            dma.clone(),
+            [
+                plic.line(PCIE_IRQ),
+                plic.line(PCIE_IRQ + 1),
+                plic.line(PCIE_IRQ + 2),
+                plic.line(PCIE_IRQ + 3),
+            ],
+        );
+        pci.add_virtio_device(Box::new(VirtioRng::default()));
+        bus.add_mmio(
+            "pcie-ecam",
+            memmap::PCIE_ECAM.0,
+            memmap::PCIE_ECAM.1,
+            pci.ecam_window(),
+        )?;
+        bus.add_mmio(
+            "pcie-mmio",
+            memmap::PCIE_MMIO.0,
+            memmap::PCIE_MMIO.1,
+            pci.mmio_window(),
+        )?;
         let mut virtio = Vec::with_capacity(config.virtio.len());
         let mut virtio_fdt = Vec::with_capacity(config.virtio.len());
         for (idx, vcfg) in config.virtio.iter().enumerate() {
@@ -540,6 +603,9 @@ impl Machine {
             plic,
             power,
             virtio,
+            pci,
+            fw_cfg,
+            pflash: [pflash0, pflash1],
             timebase,
             icount,
         })
@@ -552,6 +618,7 @@ impl Machine {
         for v in &self.virtio {
             v.poll();
         }
+        self.pci.poll();
         for i in 0..self.harts.len() {
             let mut rem = QUANTUM;
             while rem > 0 {
@@ -1227,6 +1294,88 @@ mod tests {
                 .read(memmap::DRAM_BASE + 0x4000, AccessSize::Double)
                 .unwrap(),
             0x1122_3344_5566_7788
+        );
+    }
+
+    #[test]
+    fn pcie_ecam_fw_cfg_and_pflash_cfi01() {
+        let m = Machine::new(MachineConfig::default()).unwrap();
+
+        // 1. fw_cfg (`0x1010_0000`): signature ("QEMU") and RAM size.
+        m.bus
+            .write(memmap::FW_CFG.0 + 8, AccessSize::Half, 0x0000)
+            .unwrap();
+        assert_eq!(
+            m.bus.read(memmap::FW_CFG.0, AccessSize::Word).unwrap(),
+            u32::from_le_bytes(*b"QEMU") as u64
+        );
+        m.bus
+            .write(memmap::FW_CFG.0 + 8, AccessSize::Half, 0x0300) // BE 0x0003
+            .unwrap();
+        assert_eq!(
+            m.bus.read(memmap::FW_CFG.0, AccessSize::Double).unwrap(),
+            DEFAULT_RAM_SIZE
+        );
+
+        // 2. pflash (`0x2000_0000`): CFI query, word program, and block erase.
+        let flash = memmap::FLASH.0;
+        assert_eq!(
+            m.bus.read(flash, AccessSize::Word).unwrap(),
+            0xffff_ffff,
+            "fresh NOR flash reads all ones"
+        );
+        m.bus.write(flash, AccessSize::Byte, 0x98).unwrap();
+        assert_eq!(
+            m.bus.read(flash + 0x10 * 4, AccessSize::Word).unwrap(),
+            u64::from(b'Q')
+        );
+        assert_eq!(
+            m.bus.read(flash + 0x11 * 4, AccessSize::Word).unwrap(),
+            u64::from(b'R')
+        );
+        assert_eq!(
+            m.bus.read(flash + 0x12 * 4, AccessSize::Word).unwrap(),
+            u64::from(b'Y')
+        );
+        m.bus.write(flash, AccessSize::Byte, 0x40).unwrap();
+        m.bus.write(flash, AccessSize::Word, 0xdead_beef).unwrap();
+        m.bus.write(flash, AccessSize::Byte, 0xff).unwrap();
+        assert_eq!(m.bus.read(flash, AccessSize::Word).unwrap(), 0xdead_beef);
+        m.bus.write(flash, AccessSize::Byte, 0x20).unwrap();
+        m.bus.write(flash, AccessSize::Byte, 0xd0).unwrap();
+        m.bus.write(flash, AccessSize::Byte, 0xff).unwrap();
+        assert_eq!(m.bus.read(flash, AccessSize::Word).unwrap(), 0xffff_ffff);
+
+        // 3. PCIe ECAM (`0x3000_0000`) & BAR0 (`0x4000_0000`):
+        let ecam = memmap::PCIE_ECAM.0;
+        assert_eq!(
+            m.bus.read(ecam, AccessSize::Word).unwrap(),
+            0x0008_1b36,
+            "00:00.0 is Red Hat QEMU PCIe Host Bridge"
+        );
+        let slot1 = ecam + (1 << 15);
+        assert_eq!(
+            m.bus.read(slot1, AccessSize::Word).unwrap(),
+            0x1044_1af4,
+            "00:01.0 is Red Hat Modern VirtIO 1.0 RNG"
+        );
+        m.bus
+            .write(slot1 + 0x10, AccessSize::Word, 0xffff_ffff)
+            .unwrap();
+        assert_eq!(
+            m.bus.read(slot1 + 0x10, AccessSize::Word).unwrap(),
+            0xffff_c000,
+            "BAR0 size probe reports 16 KiB"
+        );
+        m.bus
+            .write(slot1 + 0x10, AccessSize::Word, 0x4000_0000)
+            .unwrap();
+        assert_eq!(
+            m.bus
+                .read(memmap::PCIE_MMIO.0 + 0x12, AccessSize::Half)
+                .unwrap(),
+            1,
+            "VirtIO-PCI Common Config num_queues == 1"
         );
     }
 }

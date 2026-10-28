@@ -3,12 +3,16 @@
 #![forbid(unsafe_code)]
 
 mod clint;
+mod fw_cfg;
+mod pflash;
 mod plic;
 mod power;
 mod rtc;
 mod uart;
 
 pub use clint::Clint;
+pub use fw_cfg::FwCfg;
+pub use pflash::PflashCfi01;
 pub use plic::{Plic, PlicLine};
 pub use power::{PowerControl, PowerEvent, SifiveTest};
 pub use rtc::GoldfishRtc;

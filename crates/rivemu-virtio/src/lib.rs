@@ -6,6 +6,7 @@ pub mod blk;
 pub mod console;
 pub mod net;
 pub mod p9;
+pub mod pci;
 pub mod queue;
 pub mod rng;
 
@@ -19,6 +20,7 @@ pub use blk::VirtioBlk;
 pub use console::VirtioConsole;
 pub use net::VirtioNet;
 pub use p9::Virtio9p;
+pub use pci::{PCIE_MMIO_BASE, PciBus, PciEcamWindow, PciMmioWindow, VIRTIO_PCI_BAR0_SIZE};
 pub use queue::{DmaRam, QUEUE_MAX_SIZE, VirtQueue};
 pub use rng::VirtioRng;
 
