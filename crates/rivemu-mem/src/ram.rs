@@ -20,6 +20,8 @@ pub struct Ram {
     _map: MmapMut,
     ptr: *mut u8,
     len: u64,
+    /// Bitmap of 4 KiB pages that have been written since creation or reset.
+    dirty: Box<[AtomicU64]>,
 }
 
 // SAFETY: the mapping is owned by `Ram` and every access through `ptr` uses
@@ -54,11 +56,121 @@ impl Ram {
         })?;
         let mut map = MmapMut::map_anon(len)?;
         let ptr = map.as_mut_ptr();
+        let pages = size.div_ceil(4096);
+        let words = pages.div_ceil(64) as usize;
+        let dirty = (0..words)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Ok(Self {
             _map: map,
             ptr,
             len: size,
+            dirty,
         })
+    }
+
+    #[inline]
+    fn mark_dirty_range(&self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let first_page = (offset >> 12) as usize;
+        let last_page = (offset.saturating_add(len - 1) >> 12) as usize;
+        for p in first_page..=last_page {
+            if let Some(w) = self.dirty.get(p >> 6) {
+                w.fetch_or(1u64 << (p & 63), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Returns the indices of all 4 KiB pages that have been written and are
+    /// currently non-zero.
+    pub fn dirty_non_zero_pages(&self) -> Vec<u32> {
+        let total_pages = (self.len / 4096) as usize;
+        let mut out = Vec::new();
+        for (word_idx, atom) in self.dirty.iter().enumerate() {
+            let mut bits = atom.load(Ordering::Relaxed);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let page = word_idx * 64 + bit;
+                if page < total_pages && !self.is_page_zero((page as u64) * 4096) {
+                    out.push(page as u32);
+                }
+            }
+        }
+        out
+    }
+
+    /// Zeroes all pages currently marked dirty and clears the dirty bitmap.
+    pub fn clear_dirty_pages(&self) {
+        let total_pages = (self.len / 4096) as usize;
+        for (word_idx, atom) in self.dirty.iter().enumerate() {
+            let mut bits = atom.swap(0, Ordering::Relaxed);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let page = word_idx * 64 + bit;
+                if page < total_pages {
+                    let base = self.at((page as u64) * 4096).cast::<u64>();
+                    for i in 0..512 {
+                        // SAFETY: page is within the page-aligned mmap.
+                        unsafe { AtomicU64::from_ptr(base.add(i)) }.store(0, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reads a 4 KiB page (`page_idx * 4096`) into `buf`.
+    #[inline]
+    pub fn read_page(&self, page_idx: u32, buf: &mut [u8; 4096]) {
+        let offset = u64::from(page_idx) * 4096;
+        if !self.in_bounds(offset, 4096) {
+            return;
+        }
+        // SAFETY: `offset + 4096 <= self.len`, single-threaded snapshot read.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.at(offset), buf.as_mut_ptr(), 4096);
+        }
+    }
+
+    /// Writes a 4 KiB page (`page_idx * 4096`) from `buf` and marks it dirty.
+    #[inline]
+    pub fn write_page(&self, page_idx: u32, buf: &[u8; 4096]) {
+        let offset = u64::from(page_idx) * 4096;
+        if !self.in_bounds(offset, 4096) {
+            return;
+        }
+        let p = page_idx as usize;
+        if let Some(w) = self.dirty.get(p >> 6) {
+            w.fetch_or(1u64 << (p & 63), Ordering::Relaxed);
+        }
+        // SAFETY: `offset + 4096 <= self.len`, single-threaded snapshot restore.
+        unsafe {
+            std::ptr::copy_nonoverlapping(buf.as_ptr(), self.at(offset), 4096);
+        }
+    }
+
+    /// Zeroes any dirty pages not present in the sorted `keep_pages` slice and
+    /// resets the dirty bitmap to `keep_pages`.
+    pub fn reset_dirty_for_restore(&self, keep_pages: &[u32]) {
+        let total_pages = (self.len / 4096) as usize;
+        for (word_idx, atom) in self.dirty.iter().enumerate() {
+            let mut bits = atom.swap(0, Ordering::Relaxed);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let page = word_idx * 64 + bit;
+                if page < total_pages && keep_pages.binary_search(&(page as u32)).is_err() {
+                    // SAFETY: `page * 4096 + 4096 <= self.len`.
+                    unsafe {
+                        std::ptr::write_bytes(self.at((page as u64) * 4096), 0, 4096);
+                    }
+                }
+            }
+        }
     }
 
     /// Size in bytes.
@@ -104,6 +216,7 @@ impl Ram {
         if !self.in_bounds(offset, size.bytes()) {
             return None;
         }
+        self.mark_dirty_range(offset, size.bytes());
         // SAFETY: bounds checked above; pointer is valid for `size` bytes.
         unsafe { store(self.at(offset), size, value) };
         Some(())
@@ -115,6 +228,17 @@ impl Ram {
             return None;
         }
         let base = self.at(offset);
+        if offset & 7 == 0 && buf.len() & 7 == 0 {
+            let base64 = base.cast::<u64>();
+            for (i, chunk) in buf.chunks_exact_mut(8).enumerate() {
+                // SAFETY: `self.ptr` is page-aligned and `offset` is 8-byte aligned.
+                let w = u64::from_le(
+                    unsafe { AtomicU64::from_ptr(base64.add(i)) }.load(Ordering::Relaxed),
+                );
+                chunk.copy_from_slice(&w.to_le_bytes());
+            }
+            return Some(());
+        }
         for (i, b) in buf.iter_mut().enumerate() {
             // SAFETY: bounds checked above; byte atomics have no alignment needs.
             *b = unsafe { AtomicU8::from_ptr(base.add(i)) }.load(Ordering::Relaxed);
@@ -127,7 +251,17 @@ impl Ram {
         if !self.in_bounds(offset, data.len() as u64) {
             return None;
         }
+        self.mark_dirty_range(offset, data.len() as u64);
         let base = self.at(offset);
+        if offset & 7 == 0 && data.len() & 7 == 0 {
+            let base64 = base.cast::<u64>();
+            for (i, chunk) in data.chunks_exact(8).enumerate() {
+                let w = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+                // SAFETY: `self.ptr` is page-aligned and `offset` is 8-byte aligned.
+                unsafe { AtomicU64::from_ptr(base64.add(i)) }.store(w.to_le(), Ordering::Relaxed);
+            }
+            return Some(());
+        }
         for (i, &b) in data.iter().enumerate() {
             // SAFETY: bounds checked above; byte atomics have no alignment needs.
             unsafe { AtomicU8::from_ptr(base.add(i)) }.store(b, Ordering::Relaxed);
@@ -140,12 +274,33 @@ impl Ram {
         if !self.in_bounds(offset, len) {
             return None;
         }
+        if byte != 0 {
+            self.mark_dirty_range(offset, len);
+        }
         let base = self.at(offset);
         for i in 0..len as usize {
             // SAFETY: bounds checked above; byte atomics have no alignment needs.
             unsafe { AtomicU8::from_ptr(base.add(i)) }.store(byte, Ordering::Relaxed);
         }
         Some(())
+    }
+
+    /// Returns `true` if the 4 KiB page at `offset` (`offset % 4096 == 0`) is
+    /// all zeroes.
+    pub fn is_page_zero(&self, offset: u64) -> bool {
+        if offset & 0xfff != 0 || !self.in_bounds(offset, 4096) {
+            return false;
+        }
+        let base = self.at(offset).cast::<u64>();
+        for i in 0..512 {
+            // SAFETY: `self.ptr` is page-aligned (`mmap`) and `offset` is a
+            // multiple of 4096 within bounds.
+            let w = unsafe { AtomicU64::from_ptr(base.add(i)) }.load(Ordering::Relaxed);
+            if w != 0 {
+                return false;
+            }
+        }
+        true
     }
 
     /// Atomic compare-and-exchange for 32-bit or 64-bit aligned guest accesses
@@ -162,6 +317,7 @@ impl Ram {
         if !self.in_bounds(offset, size.bytes()) {
             return None;
         }
+        self.mark_dirty_range(offset, size.bytes());
         let p = self.at(offset);
         // SAFETY: bounds checked above; alignment verified in each arm.
         unsafe {
@@ -208,6 +364,7 @@ impl Ram {
         if !self.in_bounds(offset, size.bytes()) {
             return None;
         }
+        self.mark_dirty_range(offset, size.bytes());
         let p = self.at(offset);
         // SAFETY: bounds checked above; alignment verified in each arm.
         unsafe {

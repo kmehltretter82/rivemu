@@ -108,10 +108,11 @@ impl Timebase for FrozenTimebase {
 }
 
 /// A timebase derived from the host monotonic clock.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct HostTimebase {
     clock: HostClock,
     freq_hz: u64,
+    offset_ticks: AtomicU64,
 }
 
 impl HostTimebase {
@@ -124,6 +125,7 @@ impl HostTimebase {
         Self {
             clock: HostClock::new(),
             freq_hz,
+            offset_ticks: AtomicU64::new(0),
         }
     }
 
@@ -136,11 +138,19 @@ impl HostTimebase {
     pub fn ticks_to_ns(&self, ticks: u64) -> u64 {
         ticks.saturating_mul(1_000_000_000 / self.freq_hz)
     }
+
+    /// Rebases the timebase so [`Self::now`] equals `ticks` at this instant.
+    pub fn set_now(&self, ticks: u64) {
+        let raw = self.clock.now_ns() / (1_000_000_000 / self.freq_hz);
+        self.offset_ticks
+            .store(ticks.wrapping_sub(raw), Ordering::Relaxed);
+    }
 }
 
 impl Timebase for HostTimebase {
     fn now(&self) -> u64 {
-        self.clock.now_ns() / (1_000_000_000 / self.freq_hz)
+        let raw = self.clock.now_ns() / (1_000_000_000 / self.freq_hz);
+        raw.wrapping_add(self.offset_ticks.load(Ordering::Relaxed))
     }
 }
 
@@ -181,6 +191,13 @@ impl IcountTimebase {
         let ns_per_tick = 1_000_000_000 / self.freq_hz;
         let target_ns = target_ticks.saturating_mul(ns_per_tick);
         let _ = self.ns.fetch_max(target_ns, Ordering::Relaxed);
+    }
+
+    /// Sets the timebase tick count directly (used when restoring snapshots).
+    pub fn set_now(&self, ticks: u64) {
+        let ns_per_tick = 1_000_000_000 / self.freq_hz;
+        self.ns
+            .store(ticks.saturating_mul(ns_per_tick), Ordering::Relaxed);
     }
 
     /// Converts a tick count into nanoseconds.

@@ -44,6 +44,7 @@ pub const LOG_ITEMS: &[(&str, &str)] = &[
         "log when the guest OS does something invalid",
     ),
     ("unimp", "log unimplemented functionality"),
+    ("sbi", "log Supervisor Binary Interface (SBI) calls"),
 ];
 
 /// Supported `-device` drivers (implemented in milestone P4).
@@ -52,6 +53,10 @@ pub const DEVICE_DRIVERS: &[(&str, &str)] = &[
     ("virtio-net-device", "virtio network device (virtio-mmio)"),
     ("virtio-serial-device", "virtio console (virtio-mmio)"),
     ("virtio-rng-device", "virtio entropy source (virtio-mmio)"),
+    (
+        "virtio-9p-device",
+        "virtio 9P host directory share (virtio-mmio)",
+    ),
 ];
 
 /// Command line error.
@@ -145,6 +150,8 @@ pub struct Options {
     pub devices: Vec<QemuOpts>,
     /// `-netdev`.
     pub netdevs: Vec<QemuOpts>,
+    /// `-fsdev` / `-virtfs`.
+    pub fsdevs: Vec<QemuOpts>,
     /// `-chardev`.
     pub chardevs: Vec<QemuOpts>,
     /// `-serial`.
@@ -171,6 +178,12 @@ pub struct Options {
     pub no_shutdown: bool,
     /// `-name`.
     pub name: Option<String>,
+    /// `-loadvm` snapshot path to restore before starting execution.
+    pub loadvm: Option<PathBuf>,
+    /// `-savevm` snapshot path to write when the guest exits or reaches init.
+    pub savevm: Option<PathBuf>,
+    /// `-run-init` guest ELF binary packaged on the fly as `/init` inside an ephemeral cpio initramfs.
+    pub run_init: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -189,6 +202,7 @@ impl Default for Options {
             drives: Vec::new(),
             devices: Vec::new(),
             netdevs: Vec::new(),
+            fsdevs: Vec::new(),
             chardevs: Vec::new(),
             serials: Vec::new(),
             monitor: None,
@@ -202,6 +216,9 @@ impl Default for Options {
             no_reboot: false,
             no_shutdown: false,
             name: None,
+            loadvm: None,
+            savevm: None,
+            run_init: None,
         }
     }
 }
@@ -363,6 +380,10 @@ where
                 let v = value()?;
                 o.netdevs.push(opts(&name, &v, Some("type"))?);
             }
+            "fsdev" | "virtfs" => {
+                let v = value()?;
+                o.fsdevs.push(opts(&name, &v, Some("fsdriver"))?);
+            }
             "chardev" => {
                 let v = value()?;
                 o.chardevs.push(opts(&name, &v, Some("backend"))?);
@@ -404,6 +425,9 @@ where
             "no-reboot" => o.no_reboot = true,
             "no-shutdown" => o.no_shutdown = true,
             "name" => o.name = Some(value()?),
+            "loadvm" => o.loadvm = Some(value()?.into()),
+            "savevm" => o.savevm = Some(value()?.into()),
+            "run-init" => o.run_init = Some(value()?.into()),
             _ => return Err(CliError::InvalidOption(name)),
         }
     }
@@ -508,6 +532,30 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
         netdevs.insert(id, backend);
     }
 
+    let mut fsdevs: HashMap<String, PathBuf> = HashMap::new();
+    for (idx, f) in o.fsdevs.iter().enumerate() {
+        let driver = f.get("fsdriver").unwrap_or("local");
+        if driver != "local" {
+            return Err(format!(
+                "-fsdev {driver}: unsupported fsdriver (supported: local)"
+            ));
+        }
+        let path = f
+            .get("path")
+            .ok_or_else(|| "-fsdev: missing 'path=' parameter".to_string())?;
+        let id = f
+            .get("id")
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("fs{idx}"));
+        if let Some(tag) = f.get("mount_tag") {
+            virtio.push(VirtioDeviceConfig::P9 {
+                path: PathBuf::from(path),
+                mount_tag: tag.to_owned(),
+            });
+        }
+        fsdevs.insert(id, PathBuf::from(path));
+    }
+
     let mut chardevs: HashMap<String, Arc<dyn Chardev>> = HashMap::new();
     for (idx, c) in o.chardevs.iter().enumerate() {
         let backend_name = c.get("backend").unwrap_or("null");
@@ -592,6 +640,21 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
             "virtio-rng-device" => {
                 virtio.push(VirtioDeviceConfig::Rng);
             }
+            "virtio-9p-device" => {
+                let fsdev_id = dev
+                    .get("fsdev")
+                    .ok_or_else(|| "-device virtio-9p-device: missing 'fsdev='".to_string())?;
+                let path = fsdevs.get(fsdev_id).ok_or_else(|| {
+                    format!("-device virtio-9p-device: unknown fsdev '{fsdev_id}'")
+                })?;
+                let mount_tag = dev
+                    .get("mount_tag")
+                    .ok_or_else(|| "-device virtio-9p-device: missing 'mount_tag='".to_string())?;
+                virtio.push(VirtioDeviceConfig::P9 {
+                    path: path.clone(),
+                    mount_tag: mount_tag.to_owned(),
+                });
+            }
             other => {
                 return Err(format!(
                     "-device {other}: unsupported device (use -device help)"
@@ -615,14 +678,21 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
         None => None,
     };
 
+    let initrd = o.run_init.clone().or_else(|| o.initrd.clone());
+    let append = match (&o.append, &o.run_init) {
+        (Some(a), _) => Some(a.clone()),
+        (None, Some(_)) => Some("console=ttyS0 panic=-1".into()),
+        (None, None) => None,
+    };
+
     Ok(MachineConfig {
         ram_size: o.memory,
         smp: o.smp,
         bios,
         kernel: o.kernel.clone(),
-        initrd: o.initrd.clone(),
+        initrd,
         dtb: o.dtb.clone(),
-        append: o.append.clone(),
+        append,
         virtio,
         icount,
     })

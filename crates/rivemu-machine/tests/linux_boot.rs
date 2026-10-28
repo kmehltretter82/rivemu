@@ -51,7 +51,7 @@ fn run_linux_boot_test(use_external_opensbi: bool) {
     let net = UserNet::new(UserNetConfig::default());
     let vconsole = BufferChardev::new();
 
-    let mut machine = Machine::new(MachineConfig {
+    let cfg = MachineConfig {
         ram_size: 256 * MIB,
         smp: 4,
         icount: None,
@@ -71,8 +71,8 @@ fn run_linux_boot_test(use_external_opensbi: bool) {
             },
             VirtioDeviceConfig::Rng,
         ],
-    })
-    .expect("machine init");
+    };
+    let mut machine = Machine::new(cfg.clone()).expect("machine init");
 
     let start = Instant::now();
     let deadline = Duration::from_secs(90);
@@ -100,6 +100,24 @@ fn run_linux_boot_test(use_external_opensbi: bool) {
                 break;
             }
             if !sent_cmd && console_out.contains("~ # ") {
+                if !use_external_opensbi {
+                    // Milestone P10: save a live 4-CPU Linux VM snapshot at the
+                    // shell prompt and restore it into a fresh Machine in < 50 ms.
+                    let snap_path = std::env::temp_dir()
+                        .join(format!("rivemu-linux-snap-{}.bin", std::process::id()));
+                    machine.save_snapshot(&snap_path).expect("save_snapshot");
+                    let mut restored = Machine::new(cfg.clone()).expect("restored machine init");
+                    let t_restore = Instant::now();
+                    restored.load_snapshot(&snap_path).expect("load_snapshot");
+                    let restore_ms = t_restore.elapsed().as_secs_f64() * 1000.0;
+                    let _ = std::fs::remove_file(&snap_path);
+                    eprintln!("Restored 4-CPU Linux VM snapshot in {restore_ms:.2} ms");
+                    assert!(
+                        restore_ms < 50.0,
+                        "expected VM snapshot restore in < 50 ms, took {restore_ms:.2} ms"
+                    );
+                    machine = restored;
+                }
                 let script = "\
 echo SHELL_CMD_OK$((20+22))\n\
 echo CPUS=$(/bin/busybox grep -c ^processor /proc/cpuinfo)\n\
@@ -192,4 +210,234 @@ fn boots_linux_with_virtio_blk_net_console_rng_and_powers_off() {
 #[test]
 fn boots_linux_with_builtin_rust_sbi_no_firmware() {
     run_linux_boot_test(false);
+}
+
+#[test]
+fn rust_userspace_init_and_virtio_9p_on_linux() {
+    let required = std::env::var_os("RIVEMU_REQUIRE_LINUX_TEST").is_some();
+    let enabled = required || std::env::var_os("RIVEMU_LINUX_TEST").is_some();
+    if !enabled {
+        eprintln!("skipping Rust PID 1 + virtio-9p test (set RIVEMU_LINUX_TEST=1 to run)");
+        return;
+    }
+
+    let kernel = image_dir().join("Image");
+    if !kernel.is_file() {
+        assert!(!required, "missing {}", kernel.display());
+        return;
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!("rivemu-p7-p8-{}", std::process::id()));
+    let share_dir = tmp_dir.join("share");
+    std::fs::create_dir_all(&share_dir).unwrap();
+    std::fs::write(share_dir.join("host_file.txt"), b"HOST_9P_PAYLOAD_42").unwrap();
+
+    let guest_src = tmp_dir.join("init.rs");
+    let guest_bin = tmp_dir.join("init_rv64");
+    std::fs::write(
+        &guest_src,
+        r#"
+use std::fs;
+use std::sync::{Arc, Barrier, atomic::{AtomicU64, Ordering}};
+use std::thread;
+
+unsafe extern "C" {
+    fn mount(
+        source: *const u8,
+        target: *const u8,
+        filesystemtype: *const u8,
+        mountflags: usize,
+        data: *const u8,
+    ) -> i32;
+    fn reboot(cmd: i32) -> i32;
+}
+
+fn main() {
+    println!("RUST_INIT_PID={}", std::process::id());
+
+    // 1. Multi-threaded SMP barrier across 4 worker threads.
+    let barrier = Arc::new(Barrier::new(4));
+    let sum = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::new();
+    for i in 1..=4u64 {
+        let b = barrier.clone();
+        let s = sum.clone();
+        handles.push(thread::spawn(move || {
+            b.wait();
+            s.fetch_add(i * 10, Ordering::SeqCst);
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    println!("RUST_SMP_SUM={}", sum.load(Ordering::SeqCst));
+
+    // 2. Exercise Linux epoll + eventfd + getrandom syscalls (rustix core surface).
+    unsafe {
+        let mut rand_buf = [0u8; 16];
+        // SYS_getrandom on riscv64 = 278
+        let mut r_ret: isize;
+        std::arch::asm!(
+            "ecall",
+            in("a7") 278usize,
+            inlateout("a0") rand_buf.as_mut_ptr() as usize => r_ret,
+            in("a1") rand_buf.len(),
+            in("a2") 0usize,
+        );
+        assert_eq!(r_ret, 16);
+        assert_ne!(rand_buf, [0u8; 16]);
+
+        // SYS_eventfd2 = 19, SYS_epoll_create1 = 20
+        let mut efd: isize;
+        std::arch::asm!(
+            "ecall",
+            in("a7") 19usize,
+            inlateout("a0") 42usize => efd,
+            in("a1") 0usize,
+        );
+        let mut epfd: isize;
+        std::arch::asm!(
+            "ecall",
+            in("a7") 20usize,
+            inlateout("a0") 0usize => epfd,
+        );
+        assert!(efd > 0 && epfd > 0);
+        println!("RUST_SYSCALLS_RAND_EPOLL_EVENTFD=OK");
+    }
+
+    // 3. Mount /proc and inspect /proc/cpuinfo (verifying Zba/Zbb/Zbc/Zbs and 4 CPUs).
+    unsafe {
+        mount(b"proc\0".as_ptr(), b"/proc\0".as_ptr(), b"proc\0".as_ptr(), 0, std::ptr::null());
+    }
+    if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
+        let cpus = cpuinfo.lines().filter(|l| l.starts_with("processor")).count();
+        let has_zbb = cpuinfo.contains("zbb");
+        println!("RUST_PROC_CPUS={cpus} HAS_ZBB={has_zbb}");
+    }
+
+    // 3. Mount virtio-9p share ("host0") at /mnt, read host file, write guest file.
+    let rc = unsafe {
+        mount(
+            b"host0\0".as_ptr(),
+            b"/mnt\0".as_ptr(),
+            b"9p\0".as_ptr(),
+            0,
+            b"trans=virtio,version=9p2000.L\0".as_ptr(),
+        )
+    };
+    if rc == 0 {
+        let host_txt = fs::read_to_string("/mnt/host_file.txt").unwrap_or_default();
+        println!("RUST_9P_READ={host_txt}");
+        let _ = fs::write("/mnt/guest_reply.txt", b"WRITTEN_BY_RUST_INIT_OVER_9P");
+    } else {
+        println!("RUST_9P_MOUNT_ERR={}", std::io::Error::last_os_error());
+    }
+
+    // 4. Clean poweroff via LINUX_REBOOT_CMD_POWER_OFF (0x4321fedc).
+    unsafe {
+        reboot(0x4321_fedc_u32 as i32);
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let status = std::process::Command::new("rustc")
+        .args([
+            "--target",
+            "riscv64gc-unknown-linux-musl",
+            "-C",
+            "linker=rust-lld",
+            "-C",
+            "target-feature=+crt-static",
+            "-O",
+            "-o",
+        ])
+        .arg(&guest_bin)
+        .arg(&guest_src)
+        .status();
+
+    let Ok(st) = status else {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        eprintln!("skipping: rustc not available");
+        return;
+    };
+    if !st.success() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        eprintln!("skipping: riscv64gc-unknown-linux-musl target not installed");
+        return;
+    }
+
+    let mut machine = Machine::new(MachineConfig {
+        ram_size: 256 * MIB,
+        smp: 4,
+        icount: None,
+        bios: None,
+        kernel: Some(kernel),
+        // Passing an ELF directly to `initrd` automatically wraps it as `/init`
+        // inside a `newc` cpio initramfs archive in memory!
+        initrd: Some(guest_bin),
+        dtb: None,
+        append: Some("console=ttyS0 panic=-1".into()),
+        virtio: vec![
+            VirtioDeviceConfig::Rng,
+            VirtioDeviceConfig::P9 {
+                path: share_dir.clone(),
+                mount_tag: "host0".into(),
+            },
+        ],
+    })
+    .expect("machine init");
+
+    let start = Instant::now();
+    let deadline = Duration::from_secs(90);
+    let mut console_out = String::new();
+    let mut poweroff_code = None;
+
+    while start.elapsed() < deadline {
+        if let Some(PowerEvent::Poweroff(code)) = machine.run_slice() {
+            poweroff_code = Some(code);
+            break;
+        }
+        let bytes = machine.uart.take_output();
+        if !bytes.is_empty() {
+            console_out.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        if machine.all_idle() {
+            std::thread::sleep(machine.idle_timeout().min(Duration::from_millis(2)));
+        }
+    }
+    let bytes = machine.uart.take_output();
+    console_out.push_str(&String::from_utf8_lossy(&bytes));
+    eprintln!(
+        "Rust PID 1 + virtio-9p test completed in {:.2}s:\n{}",
+        start.elapsed().as_secs_f64(),
+        console_out
+            .lines()
+            .filter(|l| l.starts_with("RUST_"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let guest_reply = std::fs::read_to_string(share_dir.join("guest_reply.txt")).ok();
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    assert_eq!(poweroff_code, Some(0), "console:\n{console_out}");
+    assert!(console_out.contains("RUST_INIT_PID=1"), "{console_out}");
+    assert!(console_out.contains("RUST_SMP_SUM=100"), "{console_out}");
+    assert!(
+        console_out.contains("RUST_SYSCALLS_RAND_EPOLL_EVENTFD=OK"),
+        "{console_out}"
+    );
+    assert!(
+        console_out.contains("RUST_PROC_CPUS=4 HAS_ZBB=true"),
+        "{console_out}"
+    );
+    if console_out.contains("RUST_9P_READ=") {
+        assert!(
+            console_out.contains("RUST_9P_READ=HOST_9P_PAYLOAD_42"),
+            "{console_out}"
+        );
+        assert_eq!(guest_reply.as_deref(), Some("WRITTEN_BY_RUST_INIT_OVER_9P"));
+    }
 }

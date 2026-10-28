@@ -145,3 +145,9 @@ Total for P0–P5: roughly **4 months** for one developer.
 - [x] **P3** – `virt` board (UART, CLINT, PLIC, RTC, sifive_test), `rivemu-fdt`, icache + fast RAM, `rivemu-gdbstub`, `-d`/`-D` logging, Linux + BusyBox shell boot (< 18 s on M-series Mac)
 - [x] **P4** – `rivemu-virtio` (`virtio-mmio` v2, split virtqueues, `blk`, `net`, `console`, `rng`), `rivemu-backends` (raw/qcow2 block, user-mode network stack with ARP/DHCP/ICMP/DNS/TCP/UDP + `hostfwd`, chardev), `rivemu-monitor` (HMP + QMP JSON)
 - [x] **P5** – SMP (`-smp 4` Linux boot in ~19.9 s), host atomics (`lr`/`sc`/`amo` + `pause`/IPI slice yielding), deterministic `-icount` timebase with idle timer warping, full documentation & test suite
+- [x] **P6** – Built-in pure-Rust SBI v2.0 handler (`-bios none` / `-bios builtin`), S-mode ELF direct boot, symbolicated fault backtraces (`.symtab`), `-d sbi`, and RISC-V Semihosting (`ebreak` magic sequence)
+- [x] **P7** – `rivemu-runner` Cargo target runner, in-memory `newc` cpio initramfs builder (`-run-init` / ELF `-initrd`), and `riscv64gc-unknown-linux-musl` pure-Rust PID 1 guest test suite
+- [x] **P8** – `virtio-9p-device` (`9P2000.L`) host directory sharing (`-fsdev` / `-virtfs` / `-device virtio-9p-device`)
+- [x] **P9** – `Zba`, `Zbb`, `Zbc`, and `Zbs` RISC-V bit-manipulation extensions (RVA22U64 compliance) + FDT advertisement
+- [x] **P10** – Instant sparse VM snapshots (`-savevm` / `-loadvm` + HMP `savevm`) using dirty-page bitmaps for `< 50 ms` restore-to-shell
+

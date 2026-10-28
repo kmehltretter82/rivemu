@@ -103,6 +103,49 @@ impl Plic {
             lines.set(irq::SEI, self.best(s, 2 * h + 1).is_some());
         }
     }
+
+    /// Exports internal PLIC tables for VM snapshotting.
+    #[allow(clippy::type_complexity)]
+    pub fn snapshot(
+        &self,
+    ) -> (
+        Vec<u32>,
+        Vec<bool>,
+        Vec<bool>,
+        Vec<bool>,
+        Vec<Vec<u32>>,
+        Vec<u32>,
+    ) {
+        let s = self.state.lock().unwrap();
+        (
+            s.priority.clone(),
+            s.level.clone(),
+            s.pending.clone(),
+            s.claimed.clone(),
+            s.enable.clone(),
+            s.threshold.clone(),
+        )
+    }
+
+    /// Restores internal PLIC tables from a VM snapshot.
+    pub fn restore(
+        &self,
+        priority: Vec<u32>,
+        level: Vec<bool>,
+        pending: Vec<bool>,
+        claimed: Vec<bool>,
+        enable: Vec<Vec<u32>>,
+        threshold: Vec<u32>,
+    ) {
+        let mut s = self.state.lock().unwrap();
+        s.priority = priority;
+        s.level = level;
+        s.pending = pending;
+        s.claimed = claimed;
+        s.enable = enable;
+        s.threshold = threshold;
+        self.update(&s);
+    }
 }
 
 impl MmioDevice for Plic {

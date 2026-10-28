@@ -3,6 +3,7 @@
 //! Memory map and image placement follow QEMU's `hw/riscv/virt.c` so that
 //! firmware, kernels and device trees built for QEMU work unchanged.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +17,7 @@ use rivemu_cpu_riscv::{Hart, HartIrqs, Logger};
 use rivemu_devices::{Clint, GoldfishRtc, Plic, PowerControl, PowerEvent, SifiveTest, Uart16550};
 use rivemu_mem::{AddressSpace, MapError, Ram};
 use rivemu_virtio::{
-    DmaRam, VirtioBlk, VirtioConsole, VirtioDevice, VirtioMmio, VirtioNet, VirtioRng,
+    DmaRam, Virtio9p, VirtioBlk, VirtioConsole, VirtioDevice, VirtioMmio, VirtioNet, VirtioRng,
 };
 use thiserror::Error;
 
@@ -89,6 +90,13 @@ pub enum VirtioDeviceConfig {
     },
     /// `virtio-rng-device`.
     Rng,
+    /// `virtio-9p-device` (`9P2000.L` host directory share).
+    P9 {
+        /// Host root directory path.
+        path: PathBuf,
+        /// Guest mount tag.
+        mount_tag: String,
+    },
 }
 
 /// Board configuration (already resolved from the command line).
@@ -182,6 +190,8 @@ pub struct ImageInfo {
     pub elf: bool,
     /// Whether the image carries a RISC-V Linux `Image` header (`RSC\x05`).
     pub linux_image: bool,
+    /// ELF symbol table (`name -> address`), empty for stripped or raw images.
+    pub symbols: HashMap<String, u64>,
 }
 
 /// Result of image placement; consumed by the reset vector / FDT code.
@@ -258,6 +268,7 @@ fn load_image(
             end: img.high,
             elf: true,
             linux_image: false,
+            symbols: img.symbols,
         })
     } else {
         let linux_image =
@@ -276,6 +287,7 @@ fn load_image(
             end,
             elf: false,
             linux_image,
+            symbols: HashMap::new(),
         })
     }
 }
@@ -374,6 +386,9 @@ impl Machine {
                     Box::new(VirtioConsole::new(chardev.clone()))
                 }
                 VirtioDeviceConfig::Rng => Box::new(VirtioRng::default()),
+                VirtioDeviceConfig::P9 { path, mount_tag } => {
+                    Box::new(Virtio9p::new(path, mount_tag))
+                }
             };
             let mmio = VirtioMmio::new(dev, dma.clone(), plic.line(irq));
             bus.add_mmio(
@@ -402,7 +417,12 @@ impl Machine {
             let kernel = load_image(&bus, "kernel", path, raw_addr)?;
 
             if let Some(initrd_path) = &config.initrd {
-                let data = read_file("initrd", initrd_path)?;
+                let raw_data = read_file("initrd", initrd_path)?;
+                let data = if loader::is_elf(&raw_data) {
+                    crate::cpio::build_initramfs(&raw_data)
+                } else {
+                    raw_data
+                };
                 // QEMU: halfway into RAM for small boards, 128 MiB past the
                 // kernel otherwise.
                 let start = kernel.start + (config.ram_size / 2).min(128 * MIB);
@@ -475,10 +495,15 @@ impl Machine {
             h.reset(memmap::MROM.0);
         }
 
-        // If booting a RISC-V Linux `Image` without external firmware
-        // (`-bios none` / `-bios builtin`), boot directly into S-mode using
-        // rivemu's built-in pure-Rust SBI v2.0 handler.
-        if boot.firmware.is_none() && boot.kernel.as_ref().is_some_and(|k| k.linux_image) {
+        // If booting a RISC-V Linux `Image` or an S-mode kernel ELF linked at
+        // `>= DRAM_BASE + 2 MiB` without external firmware (`-bios none` /
+        // `-bios builtin`), boot directly into S-mode using rivemu's built-in
+        // pure-Rust SBI v2.0 handler.
+        let smode_direct = boot.firmware.is_none()
+            && boot.kernel.as_ref().is_some_and(|k| {
+                k.linux_image || (k.elf && k.start >= memmap::DRAM_BASE + 2 * MIB)
+            });
+        if smode_direct {
             harts[0].init_smode_boot(boot.entry, fdt_addr);
             for h in &mut harts[1..] {
                 h.handle_sbi = true;
@@ -522,6 +547,11 @@ impl Machine {
                 if self.harts[i].pending_sbi {
                     self.harts[i].pending_sbi = false;
                     if self.handle_sbi_call(i) {
+                        break;
+                    }
+                } else if self.harts[i].pending_semihost {
+                    self.harts[i].pending_semihost = false;
+                    if self.handle_semihost_call(i) {
                         break;
                     }
                 } else {
@@ -712,7 +742,97 @@ impl Machine {
         };
         self.harts[hart_idx].x[10] = err;
         self.harts[hart_idx].x[11] = val;
+        self.harts[hart_idx].log_sbi(eid, fid, a0, a1, err, val);
         yield_slice
+    }
+
+    /// Services a RISC-V Semihosting call (`slli x0, x0, 0x1f; ebreak; srai x0, x0, 7`)
+    /// from `hart_idx`. Returns `true` if the hart should yield its slice.
+    fn handle_semihost_call(&mut self, hart_idx: usize) -> bool {
+        let op = self.harts[hart_idx].x[10];
+        let param = self.harts[hart_idx].x[11];
+        let read_u8 = |va: u64| -> Option<u8> {
+            let pa = self.harts[hart_idx].debug_translate(&self.bus, va)?;
+            self.bus.read(pa, AccessSize::Byte).ok().map(|v| v as u8)
+        };
+        let read_u64 = |va: u64| -> Option<u64> {
+            let pa = self.harts[hart_idx].debug_translate(&self.bus, va)?;
+            self.bus.read(pa, AccessSize::Double).ok()
+        };
+
+        match op {
+            // SYS_WRITEC (0x03): param points to a single character byte.
+            0x03 => {
+                if let Some(b) = read_u8(param) {
+                    let _ = self
+                        .bus
+                        .write(memmap::UART0.0, AccessSize::Byte, u64::from(b));
+                }
+                self.harts[hart_idx].x[10] = 0;
+                false
+            }
+            // SYS_WRITE0 (0x04): param points to a null-terminated string.
+            0x04 => {
+                for off in 0..4096u64 {
+                    match read_u8(param.wrapping_add(off)) {
+                        Some(0) | None => break,
+                        Some(b) => {
+                            let _ = self
+                                .bus
+                                .write(memmap::UART0.0, AccessSize::Byte, u64::from(b));
+                        }
+                    }
+                }
+                self.harts[hart_idx].x[10] = 0;
+                false
+            }
+            // SYS_WRITE (0x05): param points to [fd, ptr, len].
+            0x05 => {
+                let ptr = read_u64(param.wrapping_add(8)).unwrap_or(0);
+                let len = read_u64(param.wrapping_add(16)).unwrap_or(0).min(65536);
+                let mut unwritten = len;
+                for off in 0..len {
+                    if let Some(b) = read_u8(ptr.wrapping_add(off)) {
+                        let _ = self
+                            .bus
+                            .write(memmap::UART0.0, AccessSize::Byte, u64::from(b));
+                        unwritten -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                self.harts[hart_idx].x[10] = unwritten;
+                false
+            }
+            // SYS_EXIT (0x18) / SYS_EXIT_EXTENDED (0x20).
+            0x18 | 0x20 => {
+                const ADP_STOPPED_APPLICATION_EXIT: u64 = 0x20026;
+                let code = if param == ADP_STOPPED_APPLICATION_EXIT {
+                    0
+                } else if let (Some(reason), Some(subcode)) =
+                    (read_u64(param), read_u64(param.wrapping_add(8)))
+                {
+                    if reason == ADP_STOPPED_APPLICATION_EXIT {
+                        subcode as i32
+                    } else {
+                        1
+                    }
+                } else {
+                    1
+                };
+                self.power.request(PowerEvent::Poweroff(code));
+                for h in &mut self.harts {
+                    h.hsm_stopped = true;
+                    h.wfi = true;
+                }
+                self.harts[hart_idx].x[10] = 0;
+                true
+            }
+            _ => {
+                self.harts[hart_idx].x[10] = u64::MAX;
+                false
+            }
+        }
     }
 
     /// Whether all harts are waiting for an interrupt.
@@ -720,7 +840,7 @@ impl Machine {
         self.harts.iter().all(|h| h.wfi || h.hsm_stopped)
     }
 
-    fn now_ticks(&self) -> u64 {
+    pub(crate) fn now_ticks(&self) -> u64 {
         match &self.icount {
             Some(ic) => ic.now(),
             None => self.timebase.now(),
@@ -756,8 +876,21 @@ impl Machine {
         self.harts.iter().map(Hart::instret).sum()
     }
 
-    /// Attaches a diagnostic logger (`-d` / `-D`) to every hart.
+    /// Attaches a diagnostic logger (`-d` / `-D`) to every hart and loads any
+    /// ELF symbols from the firmware and kernel images for symbolication.
     pub fn set_logger(&mut self, logger: Option<Arc<Logger>>) {
+        if let Some(l) = &logger {
+            let mut syms = HashMap::new();
+            if let Some(fw) = &self.boot.firmware {
+                syms.extend(fw.symbols.iter().map(|(k, v)| (k.clone(), *v)));
+            }
+            if let Some(k) = &self.boot.kernel {
+                syms.extend(k.symbols.iter().map(|(k, v)| (k.clone(), *v)));
+            }
+            if !syms.is_empty() {
+                l.set_symbols(&syms);
+            }
+        }
         for h in &mut self.harts {
             h.set_logger(logger.clone());
         }
@@ -925,6 +1058,159 @@ mod tests {
         assert!(
             !m.harts[0].wfi,
             "hart 0 should wake after icount timer warp"
+        );
+    }
+
+    #[test]
+    fn smode_elf_boot_sbi_log_and_symbolicated_trap() {
+        use rivemu_cpu_riscv::{LogFlags, Logger, Priv};
+        use std::sync::Mutex;
+
+        struct VecSink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for VecSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // S-mode ELF linked at 0x8020_0000:
+        //   li a7, 0x10; li a6, 0; ecall  (SBI get_spec_version)
+        //   unimp (0x0000_0000 -> illegal instruction trap in S-mode)
+        let code: Vec<u8> = [
+            0x0100_0893u32, // li a7, 0x10
+            0x0000_0813,    // li a6, 0
+            0x0000_0073,    // ecall
+            0x0000_0000,    // illegal instruction at _start + 12 (0xc)
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let elf = build_elf(
+            0x8020_0000,
+            0x8020_0000,
+            &code,
+            0,
+            &[("rust_os_entry", 0x8020_0000)],
+        );
+        let kernel = TempFile::new("smode_elf", &elf);
+        let mut m = Machine::new(MachineConfig {
+            kernel: Some(kernel.0.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(m.harts[0].prv, Priv::Supervisor);
+        assert_eq!(m.harts[0].pc, 0x8020_0000);
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let logger = Logger::custom(
+            LogFlags::from_items(["int", "sbi"]),
+            Box::new(VecSink(buf.clone())),
+        );
+        m.set_logger(Some(logger));
+        for _ in 0..4 {
+            m.harts[0].step(&m.bus);
+        }
+        let log = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("SBI [hart 0]: eid=0x10 fid=0x0"),
+            "expected SBI log line, got:\n{log}"
+        );
+        assert!(
+            log.contains("<rust_os_entry+0xc>"),
+            "expected symbolicated trap PC <rust_os_entry+0xc>, got:\n{log}"
+        );
+    }
+
+    #[test]
+    fn riscv_semihosting_write0_and_exit() {
+        // Semihosting sequence at 0x8000_0000:
+        //   0x00: auipc a1, 0
+        //   0x04: addi  a1, a1, 0x40    (points to "SEMI_OK\0")
+        //   0x08: addi  a0, x0, 4       (SYS_WRITE0)
+        //   0x0c: slli  x0, x0, 0x1f
+        //   0x10: ebreak
+        //   0x14: srai  x0, x0, 7
+        //   0x18: lui   a1, 0x20        (0x20000)
+        //   0x1c: addi  a1, a1, 0x26    (0x20026 = ADP_Stopped_ApplicationExit)
+        //   0x20: addi  a0, x0, 0x18    (SYS_EXIT)
+        //   0x24: slli  x0, x0, 0x1f
+        //   0x28: ebreak
+        //   0x2c: srai  x0, x0, 7
+        let words: [u32; 12] = [
+            0x0000_0597,
+            0x0405_8593,
+            0x0040_0513,
+            0x01f0_1013,
+            0x0010_0073,
+            0x4070_5013,
+            0x0002_05b7,
+            0x0265_8593,
+            0x0180_0513,
+            0x01f0_1013,
+            0x0010_0073,
+            0x4070_5013,
+        ];
+        let mut raw = vec![0u8; 0x80];
+        for (i, w) in words.iter().enumerate() {
+            raw[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
+        }
+        raw[0x40..0x48].copy_from_slice(b"SEMI_OK\0");
+        let kernel = TempFile::new("semihost", &raw);
+        let mut m = Machine::new(MachineConfig {
+            kernel: Some(kernel.0.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        let ev = m.run_slice();
+        assert_eq!(ev, Some(PowerEvent::Poweroff(0)));
+        assert_eq!(m.uart.take_output(), b"SEMI_OK");
+    }
+
+    #[test]
+    fn snapshot_save_and_restore_roundtrip() {
+        let mut m1 = Machine::new(MachineConfig {
+            smp: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        m1.harts[0].pc = 0x8020_1234;
+        m1.harts[0].x[10] = 0xdead_beef_cafe_babe;
+        m1.harts[1].hsm_stopped = true;
+        m1.bus
+            .write(
+                memmap::DRAM_BASE + 0x4000,
+                AccessSize::Double,
+                0x1122_3344_5566_7788,
+            )
+            .unwrap();
+
+        let snap = TempFile::new("snap", &[]);
+        m1.save_snapshot(&snap.0).unwrap();
+
+        let mut m2 = Machine::new(MachineConfig {
+            smp: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let t0 = std::time::Instant::now();
+        m2.load_snapshot(&snap.0).unwrap();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "expected snapshot restore in < 50 ms, took {elapsed:?}"
+        );
+        assert_eq!(m2.harts[0].pc, 0x8020_1234);
+        assert_eq!(m2.harts[0].x[10], 0xdead_beef_cafe_babe);
+        assert!(m2.harts[1].hsm_stopped);
+        assert_eq!(
+            m2.bus
+                .read(memmap::DRAM_BASE + 0x4000, AccessSize::Double)
+                .unwrap(),
+            0x1122_3344_5566_7788
         );
     }
 }

@@ -110,7 +110,8 @@ pub fn load_elf(bus: &AddressSpace, data: &[u8]) -> Result<ElfImage, LoadError> 
         return Err(LoadError::Unsupported("not an executable"));
     }
 
-    let entry = r.u64(24)?;
+    let raw_entry = r.u64(24)?;
+    let mut entry = raw_entry;
     let phoff = r.u64(32)?;
     let phentsize = u64::from(r.u16(54)?);
     let phnum = u64::from(r.u16(56)?);
@@ -128,6 +129,7 @@ pub fn load_elf(bus: &AddressSpace, data: &[u8]) -> Result<ElfImage, LoadError> 
             continue;
         }
         let offset = r.u64(ph + 8)?;
+        let vaddr = r.u64(ph + 16)?;
         let paddr = r.u64(ph + 24)?;
         let filesz = r.u64(ph + 32)?;
         let memsz = r.u64(ph + 40)?;
@@ -145,6 +147,9 @@ pub fn load_elf(bus: &AddressSpace, data: &[u8]) -> Result<ElfImage, LoadError> 
         bus.load_bytes(paddr, r.bytes(offset, filesz)?)?;
         if memsz > filesz {
             bus.fill_bytes(paddr + filesz, memsz - filesz, 0)?;
+        }
+        if raw_entry >= vaddr && raw_entry < vaddr.saturating_add(memsz) && paddr != vaddr {
+            entry = paddr.wrapping_add(raw_entry.wrapping_sub(vaddr));
         }
         low = low.min(paddr);
         high = high.max(end);

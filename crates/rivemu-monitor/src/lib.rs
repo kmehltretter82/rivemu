@@ -51,6 +51,7 @@ Supported HMP commands:
   cont | c                 resume emulation
   system_reset             reset the machine
   system_powerdown         power off the machine
+  savevm FILE              save VM snapshot to FILE
   xp [/N] ADDR             examine physical memory words at ADDR
   quit | q                 exit rivemu
 "
@@ -98,6 +99,10 @@ Supported HMP commands:
         ("system_reset", _) => (String::new(), Some(MonitorAction::Reset)),
         ("system_powerdown", _) => (String::new(), Some(MonitorAction::Powerdown)),
         ("quit" | "q", _) => (String::new(), Some(MonitorAction::Quit)),
+        ("savevm", Some(path)) => match machine.save_snapshot(std::path::Path::new(path)) {
+            Ok(()) => (format!("saved snapshot to '{path}'\n"), None),
+            Err(e) => (format!("savevm failed: {e}\n"), None),
+        },
         ("xp" | "x", _) => (exec_xp(&parts[1..], machine), None),
         _ => (format!("unknown command: '{line}' (try 'help')\n"), None),
     }

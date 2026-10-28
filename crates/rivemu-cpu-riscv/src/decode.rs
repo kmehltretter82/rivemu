@@ -123,6 +123,53 @@ pub enum Op {
     Flt,
     Fle,
     Fclass,
+    // Zba (address generation)
+    AddUw,
+    Sh1add,
+    Sh2add,
+    Sh3add,
+    Sh1addUw,
+    Sh2addUw,
+    Sh3addUw,
+    SlliUw,
+    // Zbb (basic bit-manipulation)
+    Andn,
+    Orn,
+    Xnor,
+    Clz,
+    Ctz,
+    Cpop,
+    Clzw,
+    Ctzw,
+    Cpopw,
+    SextB,
+    SextH,
+    ZextH,
+    Min,
+    Minu,
+    Max,
+    Maxu,
+    Rol,
+    Ror,
+    Rolw,
+    Rorw,
+    Rori,
+    Roriw,
+    OrcB,
+    Rev8,
+    // Zbc (carry-less multiply)
+    Clmul,
+    Clmulh,
+    Clmulr,
+    // Zbs (single-bit operations)
+    Bclr,
+    Bext,
+    Binv,
+    Bset,
+    Bclri,
+    Bexti,
+    Binvi,
+    Bseti,
 }
 
 /// AMO operation codes (instruction bits 31:27).
@@ -278,6 +325,8 @@ pub fn decode(raw: u32) -> Insn {
         }
         0x13 => {
             let shamt = ((raw >> 20) & 0x3f) as i32;
+            let top6 = raw >> 26;
+            let imm12 = raw >> 20;
             match f3 {
                 0 => (Op::Addi, imm_i(raw)),
                 2 => (Op::Slti, imm_i(raw)),
@@ -285,19 +334,49 @@ pub fn decode(raw: u32) -> Insn {
                 4 => (Op::Xori, imm_i(raw)),
                 6 => (Op::Ori, imm_i(raw)),
                 7 => (Op::Andi, imm_i(raw)),
-                1 if raw >> 26 == 0 => (Op::Slli, shamt),
-                5 if raw >> 26 == 0 => (Op::Srli, shamt),
-                5 if raw >> 26 == 0x10 => (Op::Srai, shamt),
+                1 => match top6 {
+                    0x00 => (Op::Slli, shamt),
+                    0x0a => (Op::Bseti, shamt),
+                    0x12 => (Op::Bclri, shamt),
+                    0x1a => (Op::Binvi, shamt),
+                    0x18 => match rs2 {
+                        0 => (Op::Clz, 0),
+                        1 => (Op::Ctz, 0),
+                        2 => (Op::Cpop, 0),
+                        4 => (Op::SextB, 0),
+                        5 => (Op::SextH, 0),
+                        _ => (Op::Illegal, 0),
+                    },
+                    _ => (Op::Illegal, 0),
+                },
+                5 => match top6 {
+                    0x00 => (Op::Srli, shamt),
+                    0x10 => (Op::Srai, shamt),
+                    0x12 => (Op::Bexti, shamt),
+                    0x18 => (Op::Rori, shamt),
+                    _ if imm12 == 0x287 => (Op::OrcB, 0),
+                    _ if imm12 == 0x6b8 => (Op::Rev8, 0),
+                    _ => (Op::Illegal, 0),
+                },
                 _ => (Op::Illegal, 0),
             }
         }
         0x1b => {
             let shamt = ((raw >> 20) & 0x1f) as i32;
+            let shamt6 = ((raw >> 20) & 0x3f) as i32;
             match (f3, f7) {
                 (0, _) => (Op::Addiw, imm_i(raw)),
                 (1, 0) => (Op::Slliw, shamt),
+                (1, 0x04 | 0x05) => (Op::SlliUw, shamt6),
+                (1, 0x30) => match rs2 {
+                    0 => (Op::Clzw, 0),
+                    1 => (Op::Ctzw, 0),
+                    2 => (Op::Cpopw, 0),
+                    _ => (Op::Illegal, 0),
+                },
                 (5, 0) => (Op::Srliw, shamt),
                 (5, 0x20) => (Op::Sraiw, shamt),
+                (5, 0x30) => (Op::Roriw, shamt),
                 _ => (Op::Illegal, 0),
             }
         }
@@ -321,6 +400,29 @@ pub fn decode(raw: u32) -> Insn {
                 (1, 5) => Op::Divu,
                 (1, 6) => Op::Rem,
                 (1, 7) => Op::Remu,
+                // Zba
+                (0x10, 2) => Op::Sh1add,
+                (0x10, 4) => Op::Sh2add,
+                (0x10, 6) => Op::Sh3add,
+                // Zbb / Zbc (f7 == 0x05)
+                (0x05, 1) => Op::Clmul,
+                (0x05, 2) => Op::Clmulr,
+                (0x05, 3) => Op::Clmulh,
+                (0x05, 4) => Op::Min,
+                (0x05, 5) => Op::Minu,
+                (0x05, 6) => Op::Max,
+                (0x05, 7) => Op::Maxu,
+                // Zbb logical-with-negate & rotates
+                (0x20, 4) => Op::Xnor,
+                (0x20, 6) => Op::Orn,
+                (0x20, 7) => Op::Andn,
+                (0x30, 1) => Op::Rol,
+                (0x30, 5) => Op::Ror,
+                // Zbs
+                (0x14, 1) => Op::Bset,
+                (0x24, 1) => Op::Bclr,
+                (0x24, 5) => Op::Bext,
+                (0x34, 1) => Op::Binv,
                 _ => Op::Illegal,
             };
             (op, 0)
@@ -337,6 +439,14 @@ pub fn decode(raw: u32) -> Insn {
                 (1, 5) => Op::Divuw,
                 (1, 6) => Op::Remw,
                 (1, 7) => Op::Remuw,
+                // Zba (.uw) & Zbb (zext.h, rolw, rorw)
+                (0x04, 0) => Op::AddUw,
+                (0x04, 4) if rs2 == 0 => Op::ZextH,
+                (0x10, 2) => Op::Sh1addUw,
+                (0x10, 4) => Op::Sh2addUw,
+                (0x10, 6) => Op::Sh3addUw,
+                (0x30, 1) => Op::Rolw,
+                (0x30, 5) => Op::Rorw,
                 _ => Op::Illegal,
             };
             (op, 0)
@@ -510,5 +620,62 @@ mod tests {
             (i.op, i.rd, i.imm, i.len, i.raw),
             (Op::Addi, 10, 1, 2, 0x4505)
         );
+    }
+
+    #[test]
+    fn bitmanip_zba_zbb_zbc_zbs() {
+        use crate::hart::Hart;
+        use rivemu_core::HostTimebase;
+        use rivemu_mem::{AddressSpace, Ram};
+        use std::sync::Arc;
+
+        // Decode checks for Zba, Zbb, Zbc, Zbs.
+        assert_eq!(decode(0x20b5_2533).op, Op::Sh1add); // sh1add a0, a0, a1
+        assert_eq!(decode(0x20b5_4533).op, Op::Sh2add); // sh2add a0, a0, a1
+        assert_eq!(decode(0x20b5_6533).op, Op::Sh3add); // sh3add a0, a0, a1
+        assert_eq!(decode(0x08b5_053b).op, Op::AddUw); // add.uw a0, a0, a1
+        assert_eq!(decode(0x0845_151b).op, Op::SlliUw); // slli.uw a0, a0, 4
+        assert_eq!(decode(0x6005_1513).op, Op::Clz); // clz a0, a0
+        assert_eq!(decode(0x6015_1513).op, Op::Ctz); // ctz a0, a0
+        assert_eq!(decode(0x6025_1513).op, Op::Cpop); // cpop a0, a0
+        assert_eq!(decode(0x6045_1513).op, Op::SextB); // sext.b a0, a0
+        assert_eq!(decode(0x6055_1513).op, Op::SextH); // sext.h a0, a0
+        assert_eq!(decode(0x0805_453b).op, Op::ZextH); // zext.h a0, a0
+        assert_eq!(decode(0x2875_5513).op, Op::OrcB); // orc.b a0, a0
+        assert_eq!(decode(0x6b85_5513).op, Op::Rev8); // rev8 a0, a0
+        assert_eq!(decode(0x0ab5_1533).op, Op::Clmul); // clmul a0, a0, a1
+        assert_eq!(decode(0x0ab5_3533).op, Op::Clmulh); // clmulh a0, a0, a1
+        assert_eq!(decode(0x28b5_1533).op, Op::Bset); // bset a0, a0, a1
+        assert_eq!(decode(0x48b5_1533).op, Op::Bclr); // bclr a0, a0, a1
+        assert_eq!(decode(0x48b5_5533).op, Op::Bext); // bext a0, a0, a1
+        assert_eq!(decode(0x68b5_1533).op, Op::Binv); // binv a0, a0, a1
+
+        // Execute a block exercising Zba + Zbb + Zbc + Zbs.
+        let mut bus = AddressSpace::new();
+        bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(4096).unwrap()))
+            .unwrap();
+        let prog: &[u32] = &[
+            0x20b5_2633, // sh1add a2, a0, a1      (a2 = a1 + (a0 << 1))
+            0x6015_1693, // ctz    a3, a0          (a3 = trailing_zeros(a0))
+            0x6b85_5713, // rev8   a4, a0          (a4 = swap_bytes(a0))
+            0x2875_5793, // orc.b  a5, a0          (a5 = orc_b(a0))
+            0x28b5_1833, // bset   a6, a0, a1      (a6 = a0 | (1 << a1))
+        ];
+        for (idx, w) in prog.iter().enumerate() {
+            bus.load_bytes(0x8000_0000 + idx as u64 * 4, &w.to_le_bytes())
+                .unwrap();
+        }
+        let mut h = Hart::new(0, Arc::new(HostTimebase::new(10_000_000)));
+        h.reset(0x8000_0000);
+        h.x[10] = 0x0100_0000_0000_0008; // a0
+        h.x[11] = 5; // a1
+        for _ in 0..prog.len() {
+            h.step(&bus);
+        }
+        assert_eq!(h.x[12], 5 + (0x0100_0000_0000_0008 << 1)); // sh1add
+        assert_eq!(h.x[13], 3); // ctz(8) == 3
+        assert_eq!(h.x[14], 0x0800_0000_0000_0001); // rev8
+        assert_eq!(h.x[15], 0xff00_0000_0000_00ff); // orc.b
+        assert_eq!(h.x[16], 0x0100_0000_0000_0028); // bset bit 5
     }
 }

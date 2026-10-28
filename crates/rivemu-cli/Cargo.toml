@@ -13,8 +13,13 @@ publish.workspace = true
 name = "rivemu-system-riscv64"
 path = "src/main.rs"
 
+[[bin]]
+name = "rivemu-runner"
+path = "src/bin/rivemu-runner.rs"
+
 [dependencies]
 rivemu-backends.workspace = true
+rivemu-core.workspace = true
 rivemu-cpu-riscv.workspace = true
 rivemu-devices.workspace = true
 rivemu-gdbstub.workspace = true

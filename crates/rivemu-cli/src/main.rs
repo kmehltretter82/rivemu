@@ -99,6 +99,11 @@ fn run() -> Result<ExitCode> {
     let config = rivemu_cli::machine_config(&opts).map_err(|e| anyhow!(e))?;
     let mut machine = Machine::new(config.clone()).context("failed to initialise machine")?;
     machine.set_logger(logger.clone());
+    if let Some(snap) = &opts.loadvm {
+        machine
+            .load_snapshot(snap)
+            .with_context(|| format!("failed to load VM snapshot {}", snap.display()))?;
+    }
 
     let mut paused = opts.start_paused;
     if paused && gdb.is_none() && qmp_servers.is_empty() && serial != SerialBackend::MonStdio {
@@ -216,6 +221,11 @@ fn run() -> Result<ExitCode> {
     };
     sink.flush()?;
     drop(_raw);
+    if let Some(snap) = &opts.savevm {
+        machine
+            .save_snapshot(snap)
+            .with_context(|| format!("failed to save VM snapshot {}", snap.display()))?;
+    }
     if std::env::var_os("RIVEMU_STATS").is_some() {
         let secs = started.elapsed().as_secs_f64();
         let n = machine.instret();

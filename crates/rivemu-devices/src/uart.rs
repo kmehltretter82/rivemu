@@ -81,6 +81,35 @@ impl Uart16550 {
     pub fn take_output(&self) -> Vec<u8> {
         std::mem::take(&mut self.state.lock().unwrap().tx)
     }
+
+    /// Exports `(ier, lcr, mcr, scr, fcr, dll, dlm, thre_pending)` for VM snapshotting.
+    pub fn snapshot(&self) -> [u8; 8] {
+        let s = self.state.lock().unwrap();
+        [
+            s.ier,
+            s.lcr,
+            s.mcr,
+            s.scr,
+            s.fcr,
+            s.dll,
+            s.dlm,
+            u8::from(s.thre_pending),
+        ]
+    }
+
+    /// Restores UART register state from a VM snapshot.
+    pub fn restore(&self, regs: [u8; 8]) {
+        let mut s = self.state.lock().unwrap();
+        s.ier = regs[0];
+        s.lcr = regs[1];
+        s.mcr = regs[2];
+        s.scr = regs[3];
+        s.fcr = regs[4];
+        s.dll = regs[5];
+        s.dlm = regs[6];
+        s.thre_pending = regs[7] != 0;
+        self.update(&s);
+    }
 }
 
 impl MmioDevice for Uart16550 {

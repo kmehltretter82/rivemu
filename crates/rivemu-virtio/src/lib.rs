@@ -5,6 +5,7 @@
 pub mod blk;
 pub mod console;
 pub mod net;
+pub mod p9;
 pub mod queue;
 pub mod rng;
 
@@ -17,6 +18,7 @@ use rivemu_mem::MmioDevice;
 pub use blk::VirtioBlk;
 pub use console::VirtioConsole;
 pub use net::VirtioNet;
+pub use p9::Virtio9p;
 pub use queue::{DmaRam, QUEUE_MAX_SIZE, VirtQueue};
 pub use rng::VirtioRng;
 
@@ -136,6 +138,40 @@ impl VirtioMmio {
             drop(st);
             self.irq.set_level(level);
         }
+    }
+
+    /// Exports transport and virtqueue state for VM snapshotting.
+    #[allow(clippy::type_complexity)]
+    pub fn snapshot(&self) -> ([u32; 6], u64, Vec<VirtQueue>) {
+        let st = self.state.lock().unwrap();
+        (
+            [
+                st.status,
+                st.device_features_sel,
+                st.driver_features_sel,
+                st.queue_sel,
+                st.interrupt_status,
+                st.config_generation,
+            ],
+            st.driver_features,
+            st.queues.clone(),
+        )
+    }
+
+    /// Restores transport and virtqueue state from a VM snapshot.
+    pub fn restore(&self, regs: [u32; 6], driver_features: u64, queues: Vec<VirtQueue>) {
+        let mut st = self.state.lock().unwrap();
+        st.status = regs[0];
+        st.device_features_sel = regs[1];
+        st.driver_features_sel = regs[2];
+        st.queue_sel = regs[3];
+        st.interrupt_status = regs[4];
+        st.config_generation = regs[5];
+        st.driver_features = driver_features;
+        st.queues = queues;
+        let level = st.interrupt_status != 0;
+        drop(st);
+        self.irq.set_level(level);
     }
 }
 
@@ -411,5 +447,130 @@ mod tests {
         let mut got = [0u8; 11];
         dma.read_bytes(rx_buf, &mut got).unwrap();
         assert_eq!(&got, b"hello guest");
+    }
+
+    #[test]
+    fn virtio_9p_version_attach_walk_and_read() {
+        let dir = std::env::temp_dir().join(format!("rivemu-9p-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("hello.txt"), b"9P_HOST_FILE_OK").unwrap();
+
+        let ram = Arc::new(Ram::new(0x10000).unwrap());
+        let dma = DmaRam::new(0x8000_0000, ram);
+        let irq = Arc::new(TestIrq::default());
+        let mmio = VirtioMmio::new(
+            Box::new(Virtio9p::new(&dir, "host0")),
+            dma.clone(),
+            irq.clone(),
+        );
+
+        assert_eq!(mmio.read(0x008, AccessSize::Word), 9); // VIRTIO_ID_9P
+        assert_eq!(mmio.read(0x100, AccessSize::Half), 5); // tag_len = 5 ("host0")
+
+        let (desc, avail, used, req_buf, resp_buf) = (
+            0x8000_1000,
+            0x8000_2000,
+            0x8000_3000,
+            0x8000_4000,
+            0x8000_5000,
+        );
+        setup_queue(&mmio, desc, avail, used);
+
+        let mut avail_idx = 0u16;
+        let mut rpc = |req: &[u8]| -> Vec<u8> {
+            dma.write_bytes(req_buf, req).unwrap();
+            write_desc(
+                &dma,
+                desc,
+                0,
+                req_buf,
+                req.len() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            );
+            write_desc(&dma, desc, 1, resp_buf, 4096, VIRTQ_DESC_F_WRITE, 0);
+            avail_idx += 1;
+            dma.write_u16(avail + 2, avail_idx).unwrap();
+            dma.write_u16(avail + 4 + u64::from(avail_idx - 1) * 2, 0)
+                .unwrap();
+            mmio.write(0x050, AccessSize::Word, 0);
+            let len = dma.read_u32(resp_buf).unwrap() as usize;
+            let mut out = vec![0u8; len];
+            dma.read_bytes(resp_buf, &mut out).unwrap();
+            out
+        };
+
+        // 1. Tversion (type = 100)
+        let mut tver = vec![0, 0, 0, 0, 100, 0xff, 0xff];
+        tver.extend_from_slice(&8192u32.to_le_bytes());
+        tver.extend_from_slice(&8u16.to_le_bytes());
+        tver.extend_from_slice(b"9P2000.L");
+        let l = tver.len() as u32;
+        tver[0..4].copy_from_slice(&l.to_le_bytes());
+        let rver = rpc(&tver);
+        assert_eq!(rver[4], 101); // Rversion
+
+        // 2. Tattach (type = 104, fid = 1)
+        let mut tatt = vec![0, 0, 0, 0, 104, 1, 0];
+        tatt.extend_from_slice(&1u32.to_le_bytes()); // fid = 1
+        tatt.extend_from_slice(&u32::MAX.to_le_bytes()); // afid = NOFID
+        tatt.extend_from_slice(&0u16.to_le_bytes()); // uname = ""
+        tatt.extend_from_slice(&0u16.to_le_bytes()); // aname = ""
+        tatt.extend_from_slice(&0u32.to_le_bytes()); // n_uname = 0
+        let l = tatt.len() as u32;
+        tatt[0..4].copy_from_slice(&l.to_le_bytes());
+        let ratt = rpc(&tatt);
+        assert_eq!(ratt[4], 105); // Rattach
+
+        // 3. Twalk (type = 110, fid = 1 -> newfid = 2, ["hello.txt"])
+        let mut twalk = vec![0, 0, 0, 0, 110, 2, 0];
+        twalk.extend_from_slice(&1u32.to_le_bytes());
+        twalk.extend_from_slice(&2u32.to_le_bytes());
+        twalk.extend_from_slice(&1u16.to_le_bytes());
+        twalk.extend_from_slice(&9u16.to_le_bytes());
+        twalk.extend_from_slice(b"hello.txt");
+        let l = twalk.len() as u32;
+        twalk[0..4].copy_from_slice(&l.to_le_bytes());
+        let rwalk = rpc(&twalk);
+        assert_eq!(rwalk[4], 111); // Rwalk
+
+        // 4. Tread (type = 116, fid = 2, offset = 0, count = 64)
+        let mut tread = vec![0, 0, 0, 0, 116, 3, 0];
+        tread.extend_from_slice(&2u32.to_le_bytes());
+        tread.extend_from_slice(&0u64.to_le_bytes());
+        tread.extend_from_slice(&64u32.to_le_bytes());
+        let l = tread.len() as u32;
+        tread[0..4].copy_from_slice(&l.to_le_bytes());
+        let rread = rpc(&tread);
+        assert_eq!(rread[4], 117); // Rread
+        let data_len = u32::from_le_bytes(rread[7..11].try_into().unwrap()) as usize;
+        assert_eq!(&rread[11..11 + data_len], b"9P_HOST_FILE_OK");
+
+        // 5. Tlcreate (type = 14, fid = 1, name = "guest.txt") + Twrite (type = 118)
+        let mut tcreate = vec![0, 0, 0, 0, 14, 4, 0];
+        tcreate.extend_from_slice(&1u32.to_le_bytes());
+        tcreate.extend_from_slice(&9u16.to_le_bytes());
+        tcreate.extend_from_slice(b"guest.txt");
+        tcreate.extend_from_slice(&0u32.to_le_bytes()); // flags
+        tcreate.extend_from_slice(&0o644u32.to_le_bytes()); // mode
+        tcreate.extend_from_slice(&0u32.to_le_bytes()); // gid
+        let l = tcreate.len() as u32;
+        tcreate[0..4].copy_from_slice(&l.to_le_bytes());
+        let rcreate = rpc(&tcreate);
+        assert_eq!(rcreate[4], 15); // Rlcreate
+
+        let msg = b"WRITTEN_OVER_VIRTIO_9P";
+        let mut twrite = vec![0, 0, 0, 0, 118, 5, 0];
+        twrite.extend_from_slice(&1u32.to_le_bytes()); // fid = 1 (now points to guest.txt)
+        twrite.extend_from_slice(&0u64.to_le_bytes()); // offset = 0
+        twrite.extend_from_slice(&(msg.len() as u32).to_le_bytes());
+        twrite.extend_from_slice(msg);
+        let l = twrite.len() as u32;
+        twrite[0..4].copy_from_slice(&l.to_le_bytes());
+        let rwrite = rpc(&twrite);
+        assert_eq!(rwrite[4], 119); // Rwrite
+        assert_eq!(std::fs::read(dir.join("guest.txt")).unwrap(), msg);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -81,6 +81,21 @@ impl Clint {
             .min()
             .map(|t| t.wrapping_sub(s.offset))
     }
+
+    /// Exports `(msip, mtimecmp, offset)` for VM snapshotting.
+    pub fn snapshot(&self) -> (Vec<bool>, Vec<u64>, u64) {
+        let s = self.state.lock().unwrap();
+        (s.msip.clone(), s.mtimecmp.clone(), s.offset)
+    }
+
+    /// Restores `(msip, mtimecmp, offset)` from a VM snapshot.
+    pub fn restore(&self, msip: Vec<bool>, mtimecmp: Vec<u64>, offset: u64) {
+        let mut s = self.state.lock().unwrap();
+        s.msip = msip;
+        s.mtimecmp = mtimecmp;
+        s.offset = offset;
+        self.update_locked(&s);
+    }
 }
 
 impl MmioDevice for Clint {

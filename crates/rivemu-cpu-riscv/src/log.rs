@@ -1,5 +1,6 @@
 //! Diagnostic logging (`-d` / `-D`).
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::Path;
@@ -27,6 +28,8 @@ impl LogFlags {
     pub const GUEST_ERRORS: u32 = 1 << 5;
     /// `unimp`: log unimplemented functionality.
     pub const UNIMP: u32 = 1 << 6;
+    /// `sbi`: log Supervisor Binary Interface (SBI) calls.
+    pub const SBI: u32 = 1 << 7;
 
     /// Parses a list of `-d` item names into flags.
     pub fn from_items<I, S>(items: I) -> Self
@@ -44,6 +47,7 @@ impl LogFlags {
                 "mmu" => Self::MMU,
                 "guest_errors" => Self::GUEST_ERRORS,
                 "unimp" => Self::UNIMP,
+                "sbi" => Self::SBI,
                 _ => 0,
             };
         }
@@ -67,6 +71,7 @@ impl LogFlags {
 pub struct Logger {
     flags: LogFlags,
     sink: Mutex<Box<dyn Write + Send>>,
+    symbols: Mutex<Vec<(u64, String)>>,
 }
 
 impl fmt::Debug for Logger {
@@ -83,6 +88,7 @@ impl Logger {
         Arc::new(Self {
             flags,
             sink: Mutex::new(Box::new(io::stderr())),
+            symbols: Mutex::new(Vec::new()),
         })
     }
 
@@ -92,6 +98,7 @@ impl Logger {
         Ok(Arc::new(Self {
             flags,
             sink: Mutex::new(Box::new(io::BufWriter::new(f))),
+            symbols: Mutex::new(Vec::new()),
         }))
     }
 
@@ -100,7 +107,44 @@ impl Logger {
         Arc::new(Self {
             flags,
             sink: Mutex::new(writer),
+            symbols: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Loads an ELF symbol table (`name -> address`) for symbolicated trap and
+    /// trace output.
+    pub fn set_symbols(&self, map: &HashMap<String, u64>) {
+        if let Ok(mut syms) = self.symbols.lock() {
+            syms.clear();
+            syms.extend(
+                map.iter()
+                    .filter(|&(_, &addr)| addr != 0)
+                    .map(|(name, &addr)| (addr, name.clone())),
+            );
+            syms.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        }
+    }
+
+    /// Resolves `addr` to the nearest preceding symbol `(name, offset)` within
+    /// 1 MiB.
+    pub fn resolve_symbol(&self, addr: u64) -> Option<(String, u64)> {
+        let syms = self.symbols.lock().ok()?;
+        if syms.is_empty() {
+            return None;
+        }
+        let idx = syms.partition_point(|(a, _)| *a <= addr);
+        let (sym_addr, name) = syms.get(idx.checked_sub(1)?)?;
+        let offset = addr - *sym_addr;
+        (offset < 0x10_0000).then(|| (name.clone(), offset))
+    }
+
+    /// Formats an address with optional `<symbol+offset>` annotation.
+    pub fn fmt_addr(&self, addr: u64) -> String {
+        match self.resolve_symbol(addr) {
+            Some((name, 0)) => format!("{addr:#018x} <{name}>"),
+            Some((name, off)) => format!("{addr:#018x} <{name}+{off:#x}>"),
+            None => format!("{addr:#018x}"),
+        }
     }
 
     /// Enabled log categories.
@@ -186,9 +230,25 @@ impl Hart {
     ) {
         if let Some(l) = &self.logger {
             let kind = if interrupt { "irq" } else { "exc" };
+            let epc = l.fmt_addr(old_pc);
+            let ra = l.fmt_addr(self.x[1]);
             l.log(format_args!(
-                "INT [hart {}]: {kind} code={code:#x} epc={old_pc:#018x} ({old_prv:?}) tval={tval:#018x} -> pc={:#018x} ({:?})\n",
+                "INT [hart {}]: {kind} code={code:#x} epc={epc} ({old_prv:?}) tval={tval:#018x} ra={ra} -> pc={:#018x} ({:?})\n",
                 self.id, self.pc, self.prv
+            ));
+        }
+    }
+
+    /// Logs a serviced SBI call when `-d sbi` is enabled.
+    #[cold]
+    pub fn log_sbi(&self, eid: u64, fid: u64, a0: u64, a1: u64, err: u64, val: u64) {
+        if !self.log_flags.has(LogFlags::SBI) {
+            return;
+        }
+        if let Some(l) = &self.logger {
+            l.log(format_args!(
+                "SBI [hart {}]: eid={eid:#x} fid={fid:#x} a0={a0:#x} a1={a1:#x} -> err={err:#x} val={val:#x}\n",
+                self.id
             ));
         }
     }

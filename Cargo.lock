@@ -76,6 +76,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rivemu-backends",
+ "rivemu-core",
  "rivemu-cpu-riscv",
  "rivemu-devices",
  "rivemu-gdbstub",

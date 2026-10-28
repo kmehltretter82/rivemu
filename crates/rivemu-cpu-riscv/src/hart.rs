@@ -162,6 +162,8 @@ pub struct Hart {
     pub handle_sbi: bool,
     /// Set when an S-mode `ecall` needs machine-level SBI servicing (`IPI`, `RFENCE`, `HSM`, `SRST`, `DBCN`).
     pub pending_sbi: bool,
+    /// Set when an `ebreak` matches the RISC-V Semihosting magic sequence.
+    pub pending_semihost: bool,
     /// Whether the hart is parked in the SBI HSM `STOPPED` state.
     pub hsm_stopped: bool,
 }
@@ -209,6 +211,7 @@ impl Hart {
             hit_breakpoint: false,
             handle_sbi: false,
             pending_sbi: false,
+            pending_semihost: false,
             hsm_stopped: false,
         }
     }
@@ -228,6 +231,7 @@ impl Hart {
         self.yield_slice = false;
         self.hit_breakpoint = false;
         self.pending_sbi = false;
+        self.pending_semihost = false;
         self.hsm_stopped = false;
     }
 
@@ -715,7 +719,106 @@ impl Hart {
                     return Err(Exception::new(c, 0));
                 }
             }
-            Op::Ebreak => return Err(Exception::new(cause::BREAKPOINT, pc)),
+            Op::Ebreak => {
+                if insn.len == 4 && self.is_semihost_sequence(bus, pc) {
+                    self.pending_semihost = true;
+                    self.yield_slice = true;
+                } else {
+                    return Err(Exception::new(cause::BREAKPOINT, pc));
+                }
+            }
+
+            // Zba (address generation).
+            Op::AddUw => self.set_x(rd, rs2.wrapping_add(u64::from(rs1 as u32))),
+            Op::Sh1add => self.set_x(rd, rs2.wrapping_add(rs1 << 1)),
+            Op::Sh2add => self.set_x(rd, rs2.wrapping_add(rs1 << 2)),
+            Op::Sh3add => self.set_x(rd, rs2.wrapping_add(rs1 << 3)),
+            Op::Sh1addUw => self.set_x(rd, rs2.wrapping_add(u64::from(rs1 as u32) << 1)),
+            Op::Sh2addUw => self.set_x(rd, rs2.wrapping_add(u64::from(rs1 as u32) << 2)),
+            Op::Sh3addUw => self.set_x(rd, rs2.wrapping_add(u64::from(rs1 as u32) << 3)),
+            Op::SlliUw => self.set_x(rd, u64::from(rs1 as u32) << (imm & 63)),
+
+            // Zbb (basic bit-manipulation).
+            Op::Andn => self.set_x(rd, rs1 & !rs2),
+            Op::Orn => self.set_x(rd, rs1 | !rs2),
+            Op::Xnor => self.set_x(rd, !(rs1 ^ rs2)),
+            Op::Clz => self.set_x(rd, u64::from(rs1.leading_zeros())),
+            Op::Ctz => self.set_x(rd, u64::from(rs1.trailing_zeros())),
+            Op::Cpop => self.set_x(rd, u64::from(rs1.count_ones())),
+            Op::Clzw => self.set_x(rd, u64::from((rs1 as u32).leading_zeros())),
+            Op::Ctzw => self.set_x(rd, u64::from((rs1 as u32).trailing_zeros())),
+            Op::Cpopw => self.set_x(rd, u64::from((rs1 as u32).count_ones())),
+            Op::SextB => self.set_x(rd, rs1 as i8 as i64 as u64),
+            Op::SextH => self.set_x(rd, rs1 as i16 as i64 as u64),
+            Op::ZextH => self.set_x(rd, u64::from(rs1 as u16)),
+            Op::Min => self.set_x(rd, (rs1 as i64).min(rs2 as i64) as u64),
+            Op::Minu => self.set_x(rd, rs1.min(rs2)),
+            Op::Max => self.set_x(rd, (rs1 as i64).max(rs2 as i64) as u64),
+            Op::Maxu => self.set_x(rd, rs1.max(rs2)),
+            Op::Rol => self.set_x(rd, rs1.rotate_left((rs2 & 63) as u32)),
+            Op::Ror => self.set_x(rd, rs1.rotate_right((rs2 & 63) as u32)),
+            Op::Rolw => self.set_x(
+                rd,
+                sext32(u64::from((rs1 as u32).rotate_left((rs2 & 31) as u32))),
+            ),
+            Op::Rorw => self.set_x(
+                rd,
+                sext32(u64::from((rs1 as u32).rotate_right((rs2 & 31) as u32))),
+            ),
+            Op::Rori => self.set_x(rd, rs1.rotate_right((imm & 63) as u32)),
+            Op::Roriw => self.set_x(
+                rd,
+                sext32(u64::from((rs1 as u32).rotate_right((imm & 31) as u32))),
+            ),
+            Op::OrcB => {
+                let mut out = 0u64;
+                for i in 0..8 {
+                    if (rs1 >> (i * 8)) & 0xff != 0 {
+                        out |= 0xff << (i * 8);
+                    }
+                }
+                self.set_x(rd, out);
+            }
+            Op::Rev8 => self.set_x(rd, rs1.swap_bytes()),
+
+            // Zbc (carry-less multiply).
+            Op::Clmul => {
+                let mut out = 0u64;
+                for i in 0..64 {
+                    if (rs2 >> i) & 1 != 0 {
+                        out ^= rs1 << i;
+                    }
+                }
+                self.set_x(rd, out);
+            }
+            Op::Clmulh => {
+                let mut out = 0u64;
+                for i in 1..64 {
+                    if (rs2 >> i) & 1 != 0 {
+                        out ^= rs1 >> (64 - i);
+                    }
+                }
+                self.set_x(rd, out);
+            }
+            Op::Clmulr => {
+                let mut out = 0u64;
+                for i in 0..64 {
+                    if (rs2 >> i) & 1 != 0 {
+                        out ^= rs1 >> (63 - i);
+                    }
+                }
+                self.set_x(rd, out);
+            }
+
+            // Zbs (single-bit operations).
+            Op::Bclr => self.set_x(rd, rs1 & !(1u64 << (rs2 & 63))),
+            Op::Bext => self.set_x(rd, (rs1 >> (rs2 & 63)) & 1),
+            Op::Binv => self.set_x(rd, rs1 ^ (1u64 << (rs2 & 63))),
+            Op::Bset => self.set_x(rd, rs1 | (1u64 << (rs2 & 63))),
+            Op::Bclri => self.set_x(rd, rs1 & !(1u64 << (imm & 63))),
+            Op::Bexti => self.set_x(rd, (rs1 >> (imm & 63)) & 1),
+            Op::Binvi => self.set_x(rd, rs1 ^ (1u64 << (imm & 63))),
+            Op::Bseti => self.set_x(rd, rs1 | (1u64 << (imm & 63))),
 
             // M extension.
             Op::Mul => self.set_x(rd, rs1.wrapping_mul(rs2)),
@@ -1231,7 +1334,32 @@ impl Hart {
         };
         self.x[10] = err as u64;
         self.x[11] = val;
+        if self.log_flags.has(LogFlags::SBI) {
+            self.log_sbi(eid, fid, a0, self.x[11], err as u64, val);
+        }
         true
+    }
+
+    /// Checks whether the `ebreak` at `pc` is bracketed by the RISC-V
+    /// Semihosting magic sequence (`slli x0, x0, 0x1f` before and
+    /// `srai x0, x0, 7` after).
+    fn is_semihost_sequence(&self, bus: &AddressSpace, pc: u64) -> bool {
+        if pc & 3 != 0 {
+            return false;
+        }
+        let Some(pa_prev) = self.debug_translate(bus, pc.wrapping_sub(4)) else {
+            return false;
+        };
+        let Some(pa_next) = self.debug_translate(bus, pc.wrapping_add(4)) else {
+            return false;
+        };
+        let Ok(prev) = bus.read(pa_prev, AccessSize::Word) else {
+            return false;
+        };
+        let Ok(next) = bus.read(pa_next, AccessSize::Word) else {
+            return false;
+        };
+        prev == 0x01f0_1013 && next == 0x4070_5013
     }
 }
 
