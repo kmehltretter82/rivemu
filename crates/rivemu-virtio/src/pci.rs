@@ -56,10 +56,14 @@ impl fmt::Debug for VirtioPciFunction {
 impl VirtioPciFunction {
     fn new(slot: u8, dev: Box<dyn VirtioDevice>, irq: Arc<dyn IrqLine>) -> Self {
         let num_q = dev.num_queues();
+        let mut queues = vec![VirtQueue::default(); num_q];
+        for q in &mut queues {
+            q.num = QUEUE_MAX_SIZE;
+        }
         Self {
             slot,
             dev,
-            queues: vec![VirtQueue::default(); num_q],
+            queues,
             irq,
             command: 0,
             bar0: (PCIE_MMIO_BASE as u32) + u32::from(slot) * 0x1_0000,
@@ -84,6 +88,7 @@ impl VirtioPciFunction {
         self.interrupt_status = 0;
         for q in &mut self.queues {
             q.reset();
+            q.num = QUEUE_MAX_SIZE;
         }
         self.irq.set_level(false);
     }
@@ -524,5 +529,46 @@ impl MmioDevice for PciMmioWindow {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::VirtioRng;
+    use rivemu_mem::Ram;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Default)]
+    struct DummyLine(AtomicBool);
+    impl IrqLine for DummyLine {
+        fn set_level(&self, level: bool) {
+            self.0.store(level, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn virtio_pci_reset_preserves_default_queue_size() {
+        let ram = Arc::new(Ram::new(64 * 1024).unwrap());
+        let dma = DmaRam::new(0x8000_0000, ram);
+        let irqs: [Arc<dyn IrqLine>; 4] = [
+            Arc::new(DummyLine::default()),
+            Arc::new(DummyLine::default()),
+            Arc::new(DummyLine::default()),
+            Arc::new(DummyLine::default()),
+        ];
+        let pci = PciBus::new(dma, irqs);
+        pci.add_virtio_device(Box::new(VirtioRng::default()));
+        let mmio = pci.mmio_window();
+        // Slot 1 BAR0 is at `0x4001_0000` (offset `0x1_0000` in PCI MMIO window).
+        let bar0_off = 0x1_0000u64;
+        assert_eq!(
+            mmio.read(bar0_off + 0x18, AccessSize::Half),
+            u64::from(QUEUE_MAX_SIZE)
+        );
+        // Writing 0 to device_status (`0x14`) resets the device; `q.num` must remain `QUEUE_MAX_SIZE`.
+        mmio.write(bar0_off + 0x14, AccessSize::Byte, 0);
+        let funcs = pci.funcs.lock().unwrap();
+        assert_eq!(funcs[0].queues[0].num, QUEUE_MAX_SIZE);
     }
 }
