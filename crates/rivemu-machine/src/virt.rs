@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use rivemu_core::{GuestAddr, HostTimebase, Timebase, align_down, align_up, size::MIB};
 use rivemu_cpu_riscv::csr::envcfg;
-use rivemu_cpu_riscv::{Hart, HartIrqs};
+use rivemu_cpu_riscv::{Hart, HartIrqs, Logger};
 use rivemu_devices::{Clint, GoldfishRtc, Plic, PowerControl, PowerEvent, SifiveTest, Uart16550};
 use rivemu_mem::{AddressSpace, MapError, Ram};
 use thiserror::Error;
@@ -431,6 +431,13 @@ impl Machine {
     /// Total instructions retired by all harts.
     pub fn instret(&self) -> u64 {
         self.harts.iter().map(Hart::instret).sum()
+    }
+
+    /// Attaches a diagnostic logger (`-d` / `-D`) to every hart.
+    pub fn set_logger(&mut self, logger: Option<Arc<Logger>>) {
+        for h in &mut self.harts {
+            h.set_logger(logger.clone());
+        }
     }
 }
 

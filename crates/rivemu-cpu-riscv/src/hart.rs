@@ -8,6 +8,7 @@ use rivemu_mem::AddressSpace;
 
 use crate::csr::{self, Csrs, envcfg, irq, status};
 use crate::decode::{Insn, Op, amo, decode, decode_compressed};
+use crate::log::{LogFlags, Logger};
 use crate::mmu::{Access, Tlb};
 
 /// Exception cause codes.
@@ -98,6 +99,24 @@ impl HartIrqs {
     }
 }
 
+const ICACHE_SIZE: usize = 8192;
+
+#[derive(Clone, Copy, Debug)]
+struct IcacheEntry {
+    /// `(pa << 16) | icache_gen` (0 means invalid).
+    tag: u64,
+    insn: Insn,
+}
+
+impl Default for IcacheEntry {
+    fn default() -> Self {
+        Self {
+            tag: 0,
+            insn: Insn::ILLEGAL,
+        }
+    }
+}
+
 /// One RISC-V hart.
 pub struct Hart {
     /// Hart ID (`mhartid`).
@@ -120,10 +139,23 @@ pub struct Hart {
     /// LR reservation: (physical address, loaded value).
     reservation: Option<(u64, u64)>,
     pub(crate) tlb: Tlb,
+    icache: Box<[IcacheEntry; ICACHE_SIZE]>,
+    icache_gen: u16,
+    /// Cached instruction-fetch page: `(pc >> 12) + 1` (0 = invalid).
+    fetch_vpn: u64,
+    /// Physical base (`pa & !0xfff`) of [`Self::fetch_vpn`].
+    fetch_pa_page: u64,
     /// Re-check interrupts before the next instruction.
     check_irq: bool,
     /// The current instruction wrote `minstret` (suppresses its increment).
     instret_written: bool,
+    /// Active `-d` flags (`0` when logging is disabled).
+    pub(crate) log_flags: LogFlags,
+    pub(crate) logger: Option<Arc<Logger>>,
+    /// Active debugger PC breakpoints.
+    pub breakpoints: Vec<u64>,
+    /// Set by [`Self::run`] when execution stops on a breakpoint.
+    pub hit_breakpoint: bool,
 }
 
 impl std::fmt::Debug for Hart {
@@ -156,8 +188,16 @@ impl Hart {
             timebase,
             reservation: None,
             tlb: Tlb::default(),
+            icache: Box::new([IcacheEntry::default(); ICACHE_SIZE]),
+            icache_gen: 1,
+            fetch_vpn: 0,
+            fetch_pa_page: 0,
             check_irq: true,
             instret_written: false,
+            log_flags: LogFlags::default(),
+            logger: None,
+            breakpoints: Vec::new(),
+            hit_breakpoint: false,
         }
     }
 
@@ -170,8 +210,31 @@ impl Hart {
         self.csr = Csrs::default();
         self.wfi = false;
         self.reservation = None;
-        self.tlb.flush();
+        self.flush_tlb();
+        self.flush_icache();
         self.check_irq = true;
+        self.hit_breakpoint = false;
+    }
+
+    /// Flushes the decoded-instruction cache (e.g. after debugger memory writes).
+    #[inline]
+    pub fn invalidate_icache(&mut self) {
+        self.flush_icache();
+    }
+
+    #[inline]
+    fn flush_tlb(&mut self) {
+        self.tlb.flush();
+        self.fetch_vpn = 0;
+    }
+
+    #[inline]
+    fn flush_icache(&mut self) {
+        self.icache_gen = self.icache_gen.wrapping_add(1);
+        if self.icache_gen == 0 {
+            self.icache.fill(IcacheEntry::default());
+            self.icache_gen = 1;
+        }
     }
 
     /// Number of retired instructions.
@@ -192,14 +255,21 @@ impl Hart {
 
     /// Executes up to `budget` instructions. Returns the number of
     /// instructions attempted (including those that trapped). Returns early
-    /// (possibly with 0) when the hart is waiting for an interrupt.
+    /// (possibly with 0) when the hart is waiting for an interrupt or hits a
+    /// debugger breakpoint.
     pub fn run(&mut self, bus: &AddressSpace, budget: u64) -> u64 {
+        self.hit_breakpoint = false;
         self.take_pending_interrupt();
         if self.wfi {
             return 0;
         }
+        let has_bp = !self.breakpoints.is_empty();
         let mut n = 0;
         while n < budget {
+            if has_bp && self.breakpoints.contains(&self.pc) {
+                self.hit_breakpoint = true;
+                break;
+            }
             self.step(bus);
             n += 1;
             if self.check_irq {
@@ -214,6 +284,9 @@ impl Hart {
 
     /// Executes a single instruction (or takes the resulting trap).
     pub fn step(&mut self, bus: &AddressSpace) {
+        if self.log_flags.has(LogFlags::EXEC | LogFlags::CPU) {
+            self.log_exec_cpu();
+        }
         let result = self.fetch(bus).and_then(|insn| self.execute(bus, &insn));
         match result {
             Ok(()) => {
@@ -270,6 +343,8 @@ impl Hart {
 
     /// Enters a trap handler.
     pub fn trap(&mut self, code: u64, interrupt: bool, tval: u64) {
+        let old_pc = self.pc;
+        let old_prv = self.prv;
         self.reservation = None;
         self.wfi = false;
         let deleg = if interrupt {
@@ -306,15 +381,73 @@ impl Hart {
             self.prv = Priv::Machine;
             self.pc = trap_vector(self.csr.mtvec, code, interrupt);
         }
+        self.fetch_vpn = 0;
         self.check_irq = true;
+        if self.log_flags.has(LogFlags::INT) {
+            self.log_trap(code, interrupt, tval, old_pc, old_prv);
+        }
     }
 
     // ---------------------------------------------------------------------
     // Fetch / memory
     // ---------------------------------------------------------------------
 
+    #[inline]
     fn fetch(&mut self, bus: &AddressSpace) -> Result<Insn, Exception> {
         let pc = self.pc;
+        if pc & 0xfff <= 0xffc {
+            let vpn_tag = (pc >> 12) + 1;
+            let pa = if self.fetch_vpn == vpn_tag {
+                self.fetch_pa_page | (pc & 0xfff)
+            } else {
+                let pa = self.translate(bus, pc, Access::Fetch)?;
+                self.fetch_vpn = vpn_tag;
+                self.fetch_pa_page = pa & !0xfff;
+                pa
+            };
+            if pa >> 48 == 0 {
+                let idx = ((pa >> 1) as usize) & (ICACHE_SIZE - 1);
+                let tag = (pa << 16) | u64::from(self.icache_gen);
+                let entry = &self.icache[idx];
+                if entry.tag == tag {
+                    return Ok(entry.insn);
+                }
+                let insn = self.fetch_decode_same_page(bus, pc, pa)?;
+                if self.log_flags.has(LogFlags::IN_ASM) {
+                    self.log_in_asm(pc, pa, &insn);
+                }
+                self.icache[idx] = IcacheEntry { tag, insn };
+                return Ok(insn);
+            }
+        }
+        let insn = self.fetch_slow(bus, pc)?;
+        if self.log_flags.has(LogFlags::IN_ASM) {
+            self.log_in_asm(pc, pc, &insn);
+        }
+        Ok(insn)
+    }
+
+    #[cold]
+    fn fetch_decode_same_page(
+        &self,
+        bus: &AddressSpace,
+        pc: u64,
+        pa: u64,
+    ) -> Result<Insn, Exception> {
+        let lo = bus
+            .read(pa, AccessSize::Half)
+            .map_err(|_| Exception::new(cause::INSN_ACCESS, pc))? as u16;
+        if lo & 3 != 3 {
+            return Ok(decode_compressed(lo));
+        }
+        let hi = bus
+            .read(pa + 2, AccessSize::Half)
+            .map_err(|_| Exception::new(cause::INSN_ACCESS, pc + 2))?;
+        Ok(decode(u32::from(lo) | (hi as u32) << 16))
+    }
+
+    #[cold]
+    fn fetch_slow(&mut self, bus: &AddressSpace, pc: u64) -> Result<Insn, Exception> {
         let pa = self.translate(bus, pc, Access::Fetch)?;
         let lo = bus
             .read(pa, AccessSize::Half)
@@ -334,6 +467,7 @@ impl Hart {
     }
 
     /// Virtual-memory load (handles page-crossing misaligned accesses).
+    #[inline]
     pub(crate) fn load(
         &mut self,
         bus: &AddressSpace,
@@ -342,18 +476,28 @@ impl Hart {
     ) -> Result<u64, Exception> {
         let n = size.bytes();
         if (va & 0xfff) + n > 0x1000 {
-            let mut v = 0;
-            for i in 0..n {
-                v |= self.load(bus, va.wrapping_add(i), AccessSize::Byte)? << (8 * i);
-            }
-            return Ok(v);
+            return self.load_page_cross(bus, va, n);
         }
         let pa = self.translate(bus, va, Access::Load)?;
-        bus.read(pa, size)
-            .map_err(|_| Exception::new(cause::LOAD_ACCESS, va))
+        bus.read(pa, size).map_err(|e| {
+            if self.log_flags.has(LogFlags::GUEST_ERRORS) {
+                self.log_guest_error(format_args!("load fault at va={va:#x} pa={pa:#x}: {e}"));
+            }
+            Exception::new(cause::LOAD_ACCESS, va)
+        })
+    }
+
+    #[cold]
+    fn load_page_cross(&mut self, bus: &AddressSpace, va: u64, n: u64) -> Result<u64, Exception> {
+        let mut v = 0;
+        for i in 0..n {
+            v |= self.load(bus, va.wrapping_add(i), AccessSize::Byte)? << (8 * i);
+        }
+        Ok(v)
     }
 
     /// Virtual-memory store (handles page-crossing misaligned accesses).
+    #[inline]
     pub(crate) fn store(
         &mut self,
         bus: &AddressSpace,
@@ -363,18 +507,33 @@ impl Hart {
     ) -> Result<(), Exception> {
         let n = size.bytes();
         if (va & 0xfff) + n > 0x1000 {
-            // Translate both pages first so a fault leaves memory untouched.
-            self.translate(bus, va, Access::Store)?;
-            self.translate(bus, (va | 0xfff).wrapping_add(1), Access::Store)?;
-            for i in 0..n {
-                self.store(bus, va.wrapping_add(i), AccessSize::Byte, value >> (8 * i))?;
-            }
-            return Ok(());
+            return self.store_page_cross(bus, va, n, value);
         }
         let pa = self.translate(bus, va, Access::Store)?;
         self.invalidate_reservation(pa);
-        bus.write(pa, size, value)
-            .map_err(|_| Exception::new(cause::STORE_ACCESS, va))
+        bus.write(pa, size, value).map_err(|e| {
+            if self.log_flags.has(LogFlags::GUEST_ERRORS) {
+                self.log_guest_error(format_args!("store fault at va={va:#x} pa={pa:#x}: {e}"));
+            }
+            Exception::new(cause::STORE_ACCESS, va)
+        })
+    }
+
+    #[cold]
+    fn store_page_cross(
+        &mut self,
+        bus: &AddressSpace,
+        va: u64,
+        n: u64,
+        value: u64,
+    ) -> Result<(), Exception> {
+        // Translate both pages first so a fault leaves memory untouched.
+        self.translate(bus, va, Access::Store)?;
+        self.translate(bus, (va | 0xfff).wrapping_add(1), Access::Store)?;
+        for i in 0..n {
+            self.store(bus, va.wrapping_add(i), AccessSize::Byte, value >> (8 * i))?;
+        }
+        Ok(())
     }
 
     #[inline]
@@ -448,7 +607,7 @@ impl Hart {
             Op::Sw => self.store(bus, rs1.wrapping_add(imm), AccessSize::Word, rs2)?,
             Op::Sd => self.store(bus, rs1.wrapping_add(imm), AccessSize::Double, rs2)?,
             Op::Addi => self.set_x(rd, rs1.wrapping_add(imm)),
-            Op::Slti => self.set_x(rd, u64::from((rs1 as i64) < insn.imm)),
+            Op::Slti => self.set_x(rd, u64::from((rs1 as i64) < i64::from(insn.imm))),
             Op::Sltiu => self.set_x(rd, u64::from(rs1 < imm)),
             Op::Xori => self.set_x(rd, rs1 ^ imm),
             Op::Ori => self.set_x(rd, rs1 | imm),
@@ -476,7 +635,7 @@ impl Hart {
             Op::Srlw => self.set_x(rd, sext32(u64::from((rs1 as u32) >> (rs2 & 31)))),
             Op::Sraw => self.set_x(rd, ((rs1 as i32) >> (rs2 & 31)) as i64 as u64),
             Op::Fence => {}
-            Op::FenceI => {}
+            Op::FenceI => self.flush_icache(),
             Op::Ecall => {
                 let c = match self.prv {
                     Priv::User => cause::ECALL_U,
@@ -558,6 +717,7 @@ impl Hart {
                 self.csr.mstatus = n;
                 self.prv = mpp;
                 self.reservation = None;
+                self.fetch_vpn = 0;
                 self.check_irq = true;
                 new_pc = self.csr.mepc;
             }
@@ -581,6 +741,7 @@ impl Hart {
                 self.csr.mstatus = n;
                 self.prv = spp;
                 self.reservation = None;
+                self.fetch_vpn = 0;
                 self.check_irq = true;
                 new_pc = self.csr.sepc;
             }
@@ -599,7 +760,7 @@ impl Hart {
                 {
                     return Err(Self::illegal(insn));
                 }
-                self.tlb.flush();
+                self.flush_tlb();
             }
 
             // F/D extensions.
@@ -889,7 +1050,7 @@ impl Hart {
                 if matches!(mode, 0 | 8 | 9) {
                     // MODE, ASID (ASIDLEN = 16) and PPN cover all 64 bits.
                     self.csr.satp = v;
-                    self.tlb.flush();
+                    self.flush_tlb();
                 }
             }
             csr::MVENDORID | csr::MARCHID | csr::MIMPID | csr::MHARTID | csr::MCONFIGPTR => {

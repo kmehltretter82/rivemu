@@ -68,7 +68,9 @@ name = "rivemu-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "rivemu-cpu-riscv",
  "rivemu-devices",
+ "rivemu-gdbstub",
  "rivemu-machine",
  "rustix",
  "thiserror",
@@ -100,6 +102,17 @@ dependencies = [
 [[package]]
 name = "rivemu-fdt"
 version = "0.1.0"
+
+[[package]]
+name = "rivemu-gdbstub"
+version = "0.1.0"
+dependencies = [
+ "rivemu-core",
+ "rivemu-cpu-riscv",
+ "rivemu-machine",
+ "rivemu-mem",
+ "thiserror",
+]
 
 [[package]]
 name = "rivemu-machine"

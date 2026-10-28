@@ -44,6 +44,21 @@ jobs:
         env:
           RIVEMU_REQUIRE_RISCV_TESTS: 1
 
+  linux-boot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: images/linux-test
+          key: linux-test-${{ hashFiles('scripts/fetch-linux-test.sh') }}
+      - run: scripts/fetch-linux-test.sh
+      - run: cargo test --release -p rivemu-machine --test linux_boot -- --nocapture
+        env:
+          RIVEMU_REQUIRE_LINUX_TEST: 1
+
   msrv:
     name: msrv (1.85)
     runs-on: ubuntu-latest

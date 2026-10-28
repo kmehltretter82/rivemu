@@ -14,7 +14,9 @@ name = "rivemu-system-riscv64"
 path = "src/main.rs"
 
 [dependencies]
+rivemu-cpu-riscv.workspace = true
 rivemu-devices.workspace = true
+rivemu-gdbstub.workspace = true
 rivemu-machine.workspace = true
 rustix = { workspace = true, features = ["termios"] }
 anyhow.workspace = true

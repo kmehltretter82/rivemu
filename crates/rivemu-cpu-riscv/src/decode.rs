@@ -159,13 +159,13 @@ pub struct Insn {
     /// Encoded length in bytes (2 or 4).
     pub len: u8,
     /// Sign-extended immediate (or CSR number).
-    pub imm: i64,
+    pub imm: i32,
     /// Raw encoding (16-bit for compressed instructions), used for `mtval`.
     pub raw: u32,
 }
 
 impl Insn {
-    const ILLEGAL: Self = Self {
+    pub(crate) const ILLEGAL: Self = Self {
         op: Op::Illegal,
         rd: 0,
         rs1: 0,
@@ -180,38 +180,34 @@ impl Insn {
 }
 
 #[inline]
-fn imm_i(raw: u32) -> i64 {
-    i64::from(raw as i32 >> 20)
+fn imm_i(raw: u32) -> i32 {
+    raw as i32 >> 20
 }
 
 #[inline]
-fn imm_s(raw: u32) -> i64 {
-    i64::from(((raw as i32 >> 25) << 5) | ((raw >> 7) & 0x1f) as i32)
+fn imm_s(raw: u32) -> i32 {
+    ((raw as i32 >> 25) << 5) | ((raw >> 7) & 0x1f) as i32
 }
 
 #[inline]
-fn imm_b(raw: u32) -> i64 {
-    i64::from(
-        ((raw as i32 >> 31) << 12)
-            | (((raw >> 7) & 1) << 11) as i32
-            | (((raw >> 25) & 0x3f) << 5) as i32
-            | (((raw >> 8) & 0xf) << 1) as i32,
-    )
+fn imm_b(raw: u32) -> i32 {
+    ((raw as i32 >> 31) << 12)
+        | (((raw >> 7) & 1) << 11) as i32
+        | (((raw >> 25) & 0x3f) << 5) as i32
+        | (((raw >> 8) & 0xf) << 1) as i32
 }
 
 #[inline]
-fn imm_u(raw: u32) -> i64 {
-    i64::from((raw & 0xffff_f000) as i32)
+fn imm_u(raw: u32) -> i32 {
+    (raw & 0xffff_f000) as i32
 }
 
 #[inline]
-fn imm_j(raw: u32) -> i64 {
-    i64::from(
-        ((raw as i32 >> 31) << 20)
-            | (raw & 0x000f_f000) as i32
-            | (((raw >> 20) & 1) << 11) as i32
-            | (((raw >> 21) & 0x3ff) << 1) as i32,
-    )
+fn imm_j(raw: u32) -> i32 {
+    ((raw as i32 >> 31) << 20)
+        | (raw & 0x000f_f000) as i32
+        | (((raw >> 20) & 1) << 11) as i32
+        | (((raw >> 21) & 0x3ff) << 1) as i32
 }
 
 /// Decodes a 16-bit compressed instruction.
@@ -281,7 +277,7 @@ pub fn decode(raw: u32) -> Insn {
             (op, imm_s(raw))
         }
         0x13 => {
-            let shamt = i64::from((raw >> 20) & 0x3f);
+            let shamt = ((raw >> 20) & 0x3f) as i32;
             match f3 {
                 0 => (Op::Addi, imm_i(raw)),
                 2 => (Op::Slti, imm_i(raw)),
@@ -296,7 +292,7 @@ pub fn decode(raw: u32) -> Insn {
             }
         }
         0x1b => {
-            let shamt = i64::from((raw >> 20) & 0x1f);
+            let shamt = ((raw >> 20) & 0x1f) as i32;
             match (f3, f7) {
                 (0, _) => (Op::Addiw, imm_i(raw)),
                 (1, 0) => (Op::Slliw, shamt),
@@ -373,7 +369,7 @@ pub fn decode(raw: u32) -> Insn {
                     6 => Op::Csrrsi,
                     _ => Op::Csrrci,
                 };
-                (op, i64::from(raw >> 20))
+                (op, (raw >> 20) as i32)
             }
         },
         0x2f if f3 == 2 || f3 == 3 => {

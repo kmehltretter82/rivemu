@@ -9,7 +9,9 @@ pub mod csr;
 pub mod decode;
 mod fp;
 mod hart;
+pub mod log;
 mod mmu;
 mod rvc;
 
 pub use hart::{Exception, Hart, HartIrqs, Priv, cause};
+pub use log::{LogFlags, Logger};

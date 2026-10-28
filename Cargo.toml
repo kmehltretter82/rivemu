@@ -16,6 +16,7 @@ rivemu-core = { path = "crates/rivemu-core" }
 rivemu-cpu-riscv = { path = "crates/rivemu-cpu-riscv" }
 rivemu-devices = { path = "crates/rivemu-devices" }
 rivemu-fdt = { path = "crates/rivemu-fdt" }
+rivemu-gdbstub = { path = "crates/rivemu-gdbstub" }
 rivemu-mem = { path = "crates/rivemu-mem" }
 rivemu-machine = { path = "crates/rivemu-machine" }
 rivemu-softfloat = { path = "crates/rivemu-softfloat" }

@@ -5,6 +5,7 @@ use rivemu_mem::AddressSpace;
 
 use crate::csr::status;
 use crate::hart::{Exception, Hart, Priv, cause};
+use crate::log::LogFlags;
 
 /// Kind of memory access being translated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,16 +47,18 @@ mod pte {
     pub(super) const PPN_MASK: u64 = (1 << 44) - 1;
 }
 
-const TLB_SIZE: usize = 256;
+const TLB_SIZE: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct TlbEntry {
-    /// `va >> 12` (+1 so that 0 means invalid).
+    /// `(va >> 12) + 1` (0 means invalid).
     tag: u64,
     /// Physical address of the 4 KiB page.
     pa_page: u64,
+    /// Flush epoch matching [`Tlb::epoch`].
+    epoch: u32,
     /// Leaf PTE flags (low 8 bits).
-    flags: u64,
+    flags: u8,
 }
 
 /// Direct-mapped TLB caching leaf translations. Permissions are re-checked
@@ -63,19 +66,26 @@ struct TlbEntry {
 #[derive(Clone, Debug)]
 pub(crate) struct Tlb {
     entries: Box<[TlbEntry; TLB_SIZE]>,
+    epoch: u32,
 }
 
 impl Default for Tlb {
     fn default() -> Self {
         Self {
             entries: Box::new([TlbEntry::default(); TLB_SIZE]),
+            epoch: 1,
         }
     }
 }
 
 impl Tlb {
+    #[inline]
     pub(crate) fn flush(&mut self) {
-        self.entries.fill(TlbEntry::default());
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.entries.fill(TlbEntry::default());
+            self.epoch = 1;
+        }
     }
 }
 
@@ -125,17 +135,82 @@ impl Hart {
             return Ok(va);
         }
         let tag = (va >> 12) + 1;
-        let e = self.tlb.entries[(va >> 12) as usize % TLB_SIZE];
+        let e = self.tlb.entries[((va >> 12) as usize) & (TLB_SIZE - 1)];
+        let flags = u64::from(e.flags);
         if e.tag == tag
-            && self.pte_permits(e.flags, prv, acc)
-            && (acc != Access::Store || e.flags & pte::D != 0)
+            && e.epoch == self.tlb.epoch
+            && self.pte_permits(flags, prv, acc)
+            && (acc != Access::Store || flags & pte::D != 0)
         {
             return Ok(e.pa_page | (va & 0xfff));
         }
         self.walk(bus, va, acc, prv, mode)
     }
 
+    /// Side-effect-free virtual-to-physical translation for debuggers (GDB).
+    pub fn debug_translate(&self, bus: &AddressSpace, va: u64) -> Option<u64> {
+        let mode = self.csr.satp >> 60;
+        if self.prv == Priv::Machine || mode == 0 {
+            return Some(va);
+        }
+        let levels: u32 = match mode {
+            8 => 3,
+            9 => 4,
+            _ => return None,
+        };
+        let va_bits = 12 + 9 * levels;
+        let shift = 64 - va_bits;
+        if ((va << shift) as i64 >> shift) as u64 != va {
+            return None;
+        }
+        let mut table = (self.csr.satp & pte::PPN_MASK) << 12;
+        for level in (0..levels).rev() {
+            let idx = (va >> (12 + 9 * level)) & 0x1ff;
+            let pte = bus.read(table + idx * 8, AccessSize::Double).ok()?;
+            if pte & pte::V == 0 || (pte & pte::R == 0 && pte & pte::W != 0) || pte >> 54 != 0 {
+                return None;
+            }
+            let ppn = (pte >> 10) & pte::PPN_MASK;
+            if pte & (pte::R | pte::X) == 0 {
+                if level == 0 || pte & (pte::D | pte::A | pte::U) != 0 {
+                    return None;
+                }
+                table = ppn << 12;
+                continue;
+            }
+            let low_mask = (1u64 << (9 * level)) - 1;
+            if ppn & low_mask != 0 {
+                return None;
+            }
+            let pa_page = (ppn | ((va >> 12) & low_mask)) << 12;
+            return Some(pa_page | (va & 0xfff));
+        }
+        None
+    }
+
+    #[cold]
     fn walk(
+        &mut self,
+        bus: &AddressSpace,
+        va: u64,
+        acc: Access,
+        prv: Priv,
+        mode: u64,
+    ) -> Result<u64, Exception> {
+        let res = self.walk_inner(bus, va, acc, prv, mode);
+        if self.log_flags.has(LogFlags::MMU) {
+            match &res {
+                Ok(pa) => self.log_mmu(format_args!("walk va={va:#x} ({acc:?}) -> pa={pa:#x}")),
+                Err(e) => self.log_mmu(format_args!(
+                    "walk fault va={va:#x} ({acc:?}) cause={:#x}",
+                    e.cause
+                )),
+            }
+        }
+        res
+    }
+
+    fn walk_inner(
         &mut self,
         bus: &AddressSpace,
         va: u64,
@@ -186,10 +261,11 @@ impl Hart {
                     .map_err(|_| acc.access_fault(va))?;
             }
             let pa_page = (ppn | ((va >> 12) & low_mask)) << 12;
-            self.tlb.entries[(va >> 12) as usize % TLB_SIZE] = TlbEntry {
+            self.tlb.entries[((va >> 12) as usize) & (TLB_SIZE - 1)] = TlbEntry {
                 tag: (va >> 12) + 1,
                 pa_page,
-                flags: new & 0xff,
+                epoch: self.tlb.epoch,
+                flags: new as u8,
             };
             return Ok(pa_page | (va & 0xfff));
         }

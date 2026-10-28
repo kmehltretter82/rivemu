@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use rivemu_cli::console::{Console, ConsoleEvent, RawModeGuard};
 use rivemu_cli::{Action, CliError, DEVICE_DRIVERS, LOG_ITEMS, PROG};
+use rivemu_cpu_riscv::{LogFlags, Logger};
 use rivemu_devices::PowerEvent;
+use rivemu_gdbstub::{GdbAction, GdbServer};
 use rivemu_machine::Machine;
 
 fn main() -> ExitCode {
@@ -71,8 +73,6 @@ fn run() -> Result<ExitCode> {
         (!opts.devices.is_empty(), "-device"),
         (!opts.netdevs.is_empty(), "-netdev"),
         (!opts.chardevs.is_empty(), "-chardev"),
-        (opts.gdb.is_some(), "-gdb/-s"),
-        (opts.start_paused, "-S"),
         (opts.monitor.is_some(), "-monitor"),
         (!opts.qmp.is_empty(), "-qmp"),
         (opts.icount.is_some(), "-icount"),
@@ -82,9 +82,32 @@ fn run() -> Result<ExitCode> {
         }
     }
 
+    let logger = if !opts.log_items.is_empty() {
+        let flags = LogFlags::from_items(&opts.log_items);
+        Some(match &opts.log_file {
+            Some(path) => Logger::file(flags, path)
+                .with_context(|| format!("cannot open log file {}", path.display()))?,
+            None => Logger::stderr(flags),
+        })
+    } else {
+        None
+    };
+
+    let mut gdb = match &opts.gdb {
+        Some(spec) => Some(GdbServer::bind(spec)?),
+        None => None,
+    };
+
     let serial = SerialBackend::parse(opts.serials.first().map(String::as_str))?;
     let config = rivemu_cli::machine_config(&opts).map_err(|e| anyhow!(e))?;
     let mut machine = Machine::new(config.clone()).context("failed to initialise machine")?;
+    machine.set_logger(logger.clone());
+
+    let mut paused = opts.start_paused;
+    if paused && gdb.is_none() {
+        eprintln!("{PROG}: warning: -S specified without -s/-gdb; starting guest");
+        paused = false;
+    }
 
     let _raw = match serial {
         SerialBackend::MonStdio => Some(RawModeGuard::enable(true)),
@@ -103,6 +126,18 @@ fn run() -> Result<ExitCode> {
 
     let started = Instant::now();
     let exit = loop {
+        if let Some(server) = &mut gdb {
+            if paused {
+                match server.handle_paused(&mut machine)? {
+                    GdbAction::Kill => break 0,
+                    GdbAction::Continue | GdbAction::Detach => paused = false,
+                    GdbAction::Paused => continue,
+                }
+            } else if server.check_interrupt()? {
+                paused = true;
+                continue;
+            }
+        }
         match machine.run_slice() {
             Some(PowerEvent::Poweroff(code)) => break code,
             Some(PowerEvent::Reset) if opts.no_reboot => break 0,
@@ -110,8 +145,15 @@ fn run() -> Result<ExitCode> {
                 let out = machine.uart.take_output();
                 sink.write_all(&out)?;
                 machine = Machine::new(config.clone()).context("failed to reset machine")?;
+                machine.set_logger(logger.clone());
             }
             None => {}
+        }
+        if machine.harts.iter().any(|h| h.hit_breakpoint) {
+            if let Some(server) = &mut gdb {
+                server.notify_stop()?;
+                paused = true;
+            }
         }
         let out = machine.uart.take_output();
         if !out.is_empty() {

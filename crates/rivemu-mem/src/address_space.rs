@@ -129,6 +129,8 @@ impl Region {
 pub struct AddressSpace {
     /// Sorted by `base`, non-overlapping.
     regions: Vec<Region>,
+    /// Largest mapped RAM region `(base, size, ram)` for O(1) main-memory access.
+    fast_ram: Option<(GuestAddr, u64, Arc<Ram>)>,
 }
 
 impl AddressSpace {
@@ -145,7 +147,11 @@ impl AddressSpace {
     /// Maps RAM at `base`.
     pub fn add_ram(&mut self, name: &str, base: GuestAddr, ram: Arc<Ram>) -> Result<(), MapError> {
         let size = ram.len();
-        self.insert(name, base, size, RegionKind::Ram(ram))
+        self.insert(name, base, size, RegionKind::Ram(ram.clone()))?;
+        if self.fast_ram.as_ref().is_none_or(|(_, s, _)| size > *s) {
+            self.fast_ram = Some((base, size, ram));
+        }
+        Ok(())
     }
 
     /// Maps ROM at `base`.
@@ -228,7 +234,22 @@ impl AddressSpace {
     }
 
     /// Guest-visible read.
+    #[inline]
     pub fn read(&self, addr: GuestAddr, size: AccessSize) -> Result<u64, BusError> {
+        if let Some((base, len, ref ram)) = self.fast_ram {
+            let off = addr.wrapping_sub(base);
+            if off < len {
+                return ram.read(off, size).ok_or(BusError::CrossesBoundary {
+                    addr,
+                    size: size.bytes(),
+                });
+            }
+        }
+        self.read_slow(addr, size)
+    }
+
+    #[cold]
+    fn read_slow(&self, addr: GuestAddr, size: AccessSize) -> Result<u64, BusError> {
         let r = self.find_access(addr, size)?;
         let off = addr - r.base;
         Ok(match &r.kind {
@@ -240,7 +261,24 @@ impl AddressSpace {
     }
 
     /// Guest-visible write.
+    #[inline]
     pub fn write(&self, addr: GuestAddr, size: AccessSize, value: u64) -> Result<(), BusError> {
+        if let Some((base, len, ref ram)) = self.fast_ram {
+            let off = addr.wrapping_sub(base);
+            if off < len {
+                return ram
+                    .write(off, size, value)
+                    .ok_or(BusError::CrossesBoundary {
+                        addr,
+                        size: size.bytes(),
+                    });
+            }
+        }
+        self.write_slow(addr, size, value)
+    }
+
+    #[cold]
+    fn write_slow(&self, addr: GuestAddr, size: AccessSize, value: u64) -> Result<(), BusError> {
         let r = self.find_access(addr, size)?;
         let off = addr - r.base;
         match &r.kind {
