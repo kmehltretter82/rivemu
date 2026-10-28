@@ -19,7 +19,8 @@ use rivemu_devices::{
 };
 use rivemu_mem::{AddressSpace, MapError, Ram};
 use rivemu_virtio::{
-    DmaRam, PciBus, Virtio9p, VirtioBlk, VirtioConsole, VirtioDevice, VirtioMmio, VirtioNet,
+    DEFAULT_GPU_HEIGHT, DEFAULT_GPU_WIDTH, DmaRam, Framebuffer, InputHub, PciBus, Virtio9p,
+    VirtioBlk, VirtioConsole, VirtioDevice, VirtioGpu, VirtioInput, VirtioMmio, VirtioNet,
     VirtioRng,
 };
 use thiserror::Error;
@@ -112,6 +113,15 @@ pub enum VirtioDeviceConfig {
         /// Guest mount tag.
         mount_tag: String,
     },
+    /// `virtio-gpu-device` / `virtio-gpu-pci` (2D framebuffer scanout).
+    Gpu {
+        /// Scanout width in pixels.
+        width: u32,
+        /// Scanout height in pixels.
+        height: u32,
+    },
+    /// `virtio-keyboard-device` / `virtio-input-pci` (`evdev` keyboard & tablet).
+    Input,
 }
 
 /// Board configuration (already resolved from the command line).
@@ -133,6 +143,12 @@ pub struct MachineConfig {
     pub append: Option<String>,
     /// Attached `virtio-mmio` devices (up to [`memmap::VIRTIO_COUNT`]).
     pub virtio: Vec<VirtioDeviceConfig>,
+    /// Attached `virtio-pci` devices on the PCIe host bridge (`00:01.0..`).
+    pub virtio_pci: Vec<VirtioDeviceConfig>,
+    /// CFI01 NOR flash image files (`pflash0` at `0x2000_0000`, `pflash1` at `0x2200_0000`).
+    pub pflash: Vec<PathBuf>,
+    /// Named blobs exposed in the `fw_cfg` file directory (`-fw_cfg name=...,file=...`).
+    pub fw_cfg_files: Vec<(String, Vec<u8>)>,
     /// Deterministic instruction-count timing shift (`-icount [shift=]N`).
     pub icount: Option<u8>,
     /// Trap on any unaligned scalar load or store (`LOAD_MISALIGNED` / `STORE_MISALIGNED`).
@@ -154,6 +170,9 @@ impl Default for MachineConfig {
             dtb: None,
             append: None,
             virtio: Vec::new(),
+            virtio_pci: Vec::new(),
+            pflash: Vec::new(),
+            fw_cfg_files: Vec::new(),
             icount: None,
             strict_align: false,
             svade: false,
@@ -264,6 +283,10 @@ pub struct Machine {
     pub fw_cfg: Arc<FwCfg>,
     /// Dual 32 MiB CFI01 NOR flash banks (`0x2000_0000` and `0x2200_0000`).
     pub pflash: [Arc<PflashCfi01>; 2],
+    /// Shared host 2D scanout framebuffer (used by `virtio-gpu` and screendump/VNC).
+    pub framebuffer: Arc<Framebuffer>,
+    /// Shared host `evdev` input event hub (used by `virtio-input`, HMP `sendkey`, and VNC).
+    pub input: Arc<InputHub>,
     /// Host monotonic timebase.
     pub timebase: Arc<HostTimebase>,
     /// Instruction-counted timebase when `-icount` is enabled.
@@ -407,12 +430,33 @@ impl Machine {
             memmap::DRAM_BASE,
             Some(ram.clone()),
         ));
+        for (name, data) in &config.fw_cfg_files {
+            fw_cfg.add_file(name, data.clone());
+        }
         let (b, s) = memmap::FW_CFG;
         bus.add_mmio("fw_cfg", b, s, fw_cfg.clone())?;
 
+        if config.pflash.len() > 2 {
+            return Err(MachineError::Config(format!(
+                "too many -pflash images ({}; maximum is 2)",
+                config.pflash.len()
+            )));
+        }
         let bank_size = memmap::FLASH.1 / 2;
         let pflash0 = Arc::new(PflashCfi01::new(bank_size));
         let pflash1 = Arc::new(PflashCfi01::new(bank_size));
+        let pflash_banks = [&pflash0, &pflash1];
+        for (idx, path) in config.pflash.iter().enumerate() {
+            let data = read_file("pflash", path)?;
+            if data.len() as u64 > bank_size {
+                return Err(MachineError::Config(format!(
+                    "pflash{idx} image '{}' ({} bytes) exceeds 32 MiB bank size",
+                    path.display(),
+                    data.len()
+                )));
+            }
+            pflash_banks[idx].load_bytes(0, &data);
+        }
         bus.add_mmio("virt.flash0", memmap::FLASH.0, bank_size, pflash0.clone())?;
         bus.add_mmio(
             "virt.flash1",
@@ -428,6 +472,44 @@ impl Machine {
                 memmap::VIRTIO_COUNT
             )));
         }
+        if config.virtio_pci.len() > 15 {
+            return Err(MachineError::Config(format!(
+                "too many virtio-pci devices ({}; maximum is 15)",
+                config.virtio_pci.len()
+            )));
+        }
+
+        let gpu_dims = config
+            .virtio
+            .iter()
+            .chain(config.virtio_pci.iter())
+            .find_map(|v| match v {
+                VirtioDeviceConfig::Gpu { width, height } => Some((*width, *height)),
+                _ => None,
+            })
+            .unwrap_or((DEFAULT_GPU_WIDTH, DEFAULT_GPU_HEIGHT));
+        let framebuffer = Arc::new(Framebuffer::new(gpu_dims.0, gpu_dims.1));
+        let input = InputHub::new();
+        let build_virtio = |vcfg: &VirtioDeviceConfig| -> Box<dyn VirtioDevice> {
+            match vcfg {
+                VirtioDeviceConfig::Blk { backend, serial } => {
+                    Box::new(VirtioBlk::new(backend.clone(), serial))
+                }
+                VirtioDeviceConfig::Net { backend } => Box::new(VirtioNet::new(backend.clone())),
+                VirtioDeviceConfig::Console { chardev } => {
+                    Box::new(VirtioConsole::new(chardev.clone()))
+                }
+                VirtioDeviceConfig::Rng => Box::new(VirtioRng::default()),
+                VirtioDeviceConfig::P9 { path, mount_tag } => {
+                    Box::new(Virtio9p::new(path, mount_tag))
+                }
+                VirtioDeviceConfig::Gpu { width, height } => {
+                    Box::new(VirtioGpu::new(*width, *height, framebuffer.clone()))
+                }
+                VirtioDeviceConfig::Input => Box::new(VirtioInput::new(input.clone())),
+            }
+        };
+
         let dma = DmaRam::new(memmap::DRAM_BASE, ram.clone());
         let pci = PciBus::new(
             dma.clone(),
@@ -438,7 +520,13 @@ impl Machine {
                 plic.line(PCIE_IRQ + 3),
             ],
         );
-        pci.add_virtio_device(Box::new(VirtioRng::default()));
+        if config.virtio_pci.is_empty() {
+            pci.add_virtio_device(Box::new(VirtioRng::default()));
+        } else {
+            for vcfg in &config.virtio_pci {
+                pci.add_virtio_device(build_virtio(vcfg));
+            }
+        }
         bus.add_mmio(
             "pcie-ecam",
             memmap::PCIE_ECAM.0,
@@ -456,19 +544,7 @@ impl Machine {
         for (idx, vcfg) in config.virtio.iter().enumerate() {
             let base = memmap::VIRTIO.0 + idx as u64 * memmap::VIRTIO.1;
             let irq = VIRTIO_IRQ + idx as u32;
-            let dev: Box<dyn VirtioDevice> = match vcfg {
-                VirtioDeviceConfig::Blk { backend, serial } => {
-                    Box::new(VirtioBlk::new(backend.clone(), serial))
-                }
-                VirtioDeviceConfig::Net { backend } => Box::new(VirtioNet::new(backend.clone())),
-                VirtioDeviceConfig::Console { chardev } => {
-                    Box::new(VirtioConsole::new(chardev.clone()))
-                }
-                VirtioDeviceConfig::Rng => Box::new(VirtioRng::default()),
-                VirtioDeviceConfig::P9 { path, mount_tag } => {
-                    Box::new(Virtio9p::new(path, mount_tag))
-                }
-            };
+            let dev = build_virtio(vcfg);
             let mmio = VirtioMmio::new(dev, dma.clone(), plic.line(irq));
             bus.add_mmio(
                 &format!("virtio-mmio.{idx}"),
@@ -527,11 +603,16 @@ impl Machine {
             boot.dtb = Some(read_file("device tree", path)?);
         }
 
+        let default_entry = if !config.pflash.is_empty() {
+            memmap::FLASH.0
+        } else {
+            memmap::DRAM_BASE
+        };
         boot.entry = boot
             .firmware
             .as_ref()
             .or(boot.kernel.as_ref())
-            .map_or(memmap::DRAM_BASE, |img| img.entry);
+            .map_or(default_entry, |img| img.entry);
 
         // Device tree: user supplied or generated, placed at the end of
         // (low) DRAM like QEMU does.
@@ -606,9 +687,16 @@ impl Machine {
             pci,
             fw_cfg,
             pflash: [pflash0, pflash1],
+            framebuffer,
+            input,
             timebase,
             icount,
         })
+    }
+
+    /// Saves the current 2D GPU framebuffer to `path` (`.png` or `.ppm`).
+    pub fn screendump(&self, path: &Path) -> std::io::Result<()> {
+        self.framebuffer.save_screendump(path)
     }
 
     /// Runs every hart for one scheduling slice. Returns a pending power

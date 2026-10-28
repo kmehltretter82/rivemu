@@ -45,6 +45,9 @@ mod pte {
     pub(super) const A: u64 = 1 << 6;
     pub(super) const D: u64 = 1 << 7;
     pub(super) const PPN_MASK: u64 = (1 << 44) - 1;
+    pub(super) const PBMT_SHIFT: u32 = 61;
+    pub(super) const PBMT_MASK: u64 = 3 << PBMT_SHIFT;
+    pub(super) const RESERVED_HIGH_MASK: u64 = !((1u64 << 54) - 1) & !PBMT_MASK;
 }
 
 const TLB_SIZE: usize = 1024;
@@ -121,15 +124,36 @@ impl Hart {
         }
     }
 
-    /// Recomputes whether PMP permission checks need to run on memory accesses.
+    /// Recomputes predecoded PMP ranges and fast-path flags.
     pub fn update_pmp_state(&mut self) {
-        let any_active = self.csr.pmpcfg.iter().any(|&c| c & 0x18 != 0);
+        let mut count = 0usize;
+        let mut subpage = false;
+        let mut any_locked = false;
+        let mut any_active = false;
+        for i in 0..PMP_ENTRIES {
+            let cfg = self.csr.pmpcfg[i];
+            if cfg & 0x18 != 0 {
+                any_active = true;
+            }
+            if let Some((lo, hi)) = self.pmp_entry_range(i) {
+                if (lo & 0xfff) != 0 || (hi & 0xfff) != 0xfff {
+                    subpage = true;
+                }
+                if cfg & 0x80 != 0 {
+                    any_locked = true;
+                }
+                self.pmp_ranges[count] = (lo, hi, cfg);
+                count += 1;
+            }
+        }
+        self.pmp_count = count as u8;
+        self.pmp_any_locked = any_locked;
         // Entry 0 as an unlocked NAPOT catch-all (`R|W|X`) covering >= 56 bits
-        // grants unconditional access to all privileges, so fast paths can skip
-        // per-access PMP table scans.
+        // grants unconditional access to all privileges.
         let full_open_entry0 =
             (self.csr.pmpcfg[0] & 0x9f) == 0x1f && (!self.csr.pmpaddr[0]).trailing_zeros() >= 53;
         self.pmp_enforced = !full_open_entry0 && (any_active || self.strict_pmp);
+        self.pmp_subpage = self.pmp_enforced && subpage;
     }
 
     /// Returns the inclusive physical address range `(lo, hi_inclusive)` matched
@@ -165,20 +189,15 @@ impl Hart {
         }
     }
 
-    /// Checks `[pa, pa + size - 1]` against the 16 PMP entries per RISC-V
+    /// Checks `[pa, pa + size - 1]` against the active PMP entries per RISC-V
     /// Privileged Spec Section 3.7.
     #[cold]
     pub(crate) fn pmp_check(&self, pa: u64, size: u64, prv: Priv, acc: Access) -> bool {
+        if prv == Priv::Machine && !self.pmp_any_locked {
+            return true;
+        }
         let last = pa.saturating_add(size.saturating_sub(1));
-        let mut any_active = false;
-        for i in 0..PMP_ENTRIES {
-            let cfg = self.csr.pmpcfg[i];
-            if cfg & 0x18 != 0 {
-                any_active = true;
-            }
-            let Some((lo, hi)) = self.pmp_entry_range(i) else {
-                continue;
-            };
+        for &(lo, hi, cfg) in &self.pmp_ranges[..self.pmp_count as usize] {
             if pa <= hi && last >= lo {
                 // Accesses straddling a PMP boundary must fault.
                 if pa < lo || last > hi {
@@ -200,7 +219,7 @@ impl Hart {
         if prv == Priv::Machine {
             true
         } else {
-            !self.strict_pmp && !any_active
+            !self.strict_pmp && self.pmp_count == 0
         }
     }
 
@@ -212,7 +231,7 @@ impl Hart {
         size: u64,
         acc: Access,
     ) -> Result<(), Exception> {
-        if self.pmp_enforced && !self.pmp_check(pa, size, self.effective_priv(acc), acc) {
+        if self.pmp_subpage && !self.pmp_check(pa, size, self.effective_priv(acc), acc) {
             return Err(acc.access_fault(va));
         }
         Ok(())
@@ -229,7 +248,10 @@ impl Hart {
         let prv = self.effective_priv(acc);
         let mode = self.csr.satp >> 60;
         if prv == Priv::Machine || mode == 0 {
-            if self.pmp_enforced && !self.pmp_check(va, 1, prv, acc) {
+            if self.pmp_enforced
+                && (prv != Priv::Machine || self.pmp_any_locked)
+                && !self.pmp_check(va, 1, prv, acc)
+            {
                 return Err(acc.access_fault(va));
             }
             return Ok(va);
@@ -243,7 +265,7 @@ impl Hart {
             && (acc != Access::Store || flags & pte::D != 0)
         {
             let pa = e.pa_page | (va & 0xfff);
-            if self.pmp_enforced && !self.pmp_check(pa, 1, prv, acc) {
+            if self.pmp_subpage && !self.pmp_check(pa, 1, prv, acc) {
                 return Err(acc.access_fault(va));
             }
             return Ok(pa);
@@ -275,16 +297,23 @@ impl Hart {
         for level in (0..levels).rev() {
             let idx = (va >> (12 + 9 * level)) & 0x1ff;
             let pte = bus.read(table + idx * 8, AccessSize::Double).ok()?;
-            if pte & pte::V == 0 || (pte & pte::R == 0 && pte & pte::W != 0) || pte >> 54 != 0 {
+            if pte & pte::V == 0
+                || (pte & pte::R == 0 && pte & pte::W != 0)
+                || pte & pte::RESERVED_HIGH_MASK != 0
+            {
                 return None;
             }
+            let pbmt = (pte & pte::PBMT_MASK) >> pte::PBMT_SHIFT;
             let ppn = (pte >> 10) & pte::PPN_MASK;
             if pte & (pte::R | pte::X) == 0 {
-                if level == 0 || pte & (pte::D | pte::A | pte::U) != 0 {
+                if level == 0 || pte & (pte::D | pte::A | pte::U) != 0 || pbmt != 0 {
                     return None;
                 }
                 table = ppn << 12;
                 continue;
+            }
+            if pbmt != 0 && (self.csr.menvcfg & envcfg::PBMTE == 0 || pbmt == 3) {
+                return None;
             }
             let low_mask = (1u64 << (9 * level)) - 1;
             if ppn & low_mask != 0 {
@@ -342,19 +371,26 @@ impl Hart {
             let pte = bus
                 .read(pte_addr, AccessSize::Double)
                 .map_err(|_| acc.access_fault(va))?;
-            if pte & pte::V == 0 || (pte & pte::R == 0 && pte & pte::W != 0) || pte >> 54 != 0 {
+            if pte & pte::V == 0
+                || (pte & pte::R == 0 && pte & pte::W != 0)
+                || pte & pte::RESERVED_HIGH_MASK != 0
+            {
                 return Err(acc.page_fault(va));
             }
+            let pbmt = (pte & pte::PBMT_MASK) >> pte::PBMT_SHIFT;
             let ppn = (pte >> 10) & pte::PPN_MASK;
             if pte & (pte::R | pte::X) == 0 {
                 // Pointer to the next level.
-                if level == 0 || pte & (pte::D | pte::A | pte::U) != 0 {
+                if level == 0 || pte & (pte::D | pte::A | pte::U) != 0 || pbmt != 0 {
                     return Err(acc.page_fault(va));
                 }
                 table = ppn << 12;
                 continue;
             }
-            // Leaf.
+            // Leaf: validate Svpbmt attributes (PBMTE must be enabled for PBMT != 0, and 3 is reserved).
+            if pbmt != 0 && (self.csr.menvcfg & envcfg::PBMTE == 0 || pbmt == 3) {
+                return Err(acc.page_fault(va));
+            }
             if !self.pte_permits(pte, prv, acc) {
                 return Err(acc.page_fault(va));
             }
@@ -385,11 +421,23 @@ impl Hart {
                     .map_err(|_| acc.access_fault(va))?;
             }
             let pa_page = (ppn | ((va >> 12) & low_mask)) << 12;
+            let mut tlb_flags = new as u8;
+            if self.pmp_enforced && !self.pmp_subpage {
+                if !self.pmp_check(pa_page, 4096, Priv::Supervisor, Access::Load) {
+                    tlb_flags &= !(pte::R as u8);
+                }
+                if !self.pmp_check(pa_page, 4096, Priv::Supervisor, Access::Store) {
+                    tlb_flags &= !(pte::W as u8);
+                }
+                if !self.pmp_check(pa_page, 4096, Priv::Supervisor, Access::Fetch) {
+                    tlb_flags &= !(pte::X as u8);
+                }
+            }
             self.tlb.entries[((va >> 12) as usize) & (TLB_SIZE - 1)] = TlbEntry {
                 tag: (va >> 12) + 1,
                 pa_page,
                 epoch: self.tlb.epoch,
-                flags: new as u8,
+                flags: tlb_flags,
             };
             return Ok(pa_page | (va & 0xfff));
         }

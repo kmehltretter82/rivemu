@@ -4,11 +4,14 @@
 
 pub mod blk;
 pub mod console;
+pub mod gpu;
+pub mod input;
 pub mod net;
 pub mod p9;
 pub mod pci;
 pub mod queue;
 pub mod rng;
+pub mod vnc;
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -18,11 +21,14 @@ use rivemu_mem::MmioDevice;
 
 pub use blk::VirtioBlk;
 pub use console::VirtioConsole;
+pub use gpu::{DEFAULT_GPU_HEIGHT, DEFAULT_GPU_WIDTH, Framebuffer, VirtioGpu};
+pub use input::{InputHub, VirtioInput, VirtioInputEvent};
 pub use net::VirtioNet;
 pub use p9::Virtio9p;
 pub use pci::{PCIE_MMIO_BASE, PciBus, PciEcamWindow, PciMmioWindow, VIRTIO_PCI_BAR0_SIZE};
 pub use queue::{DmaRam, QUEUE_MAX_SIZE, VirtQueue};
 pub use rng::VirtioRng;
+pub use vnc::VncServer;
 
 /// VirtIO MMIO magic value (`"virt"`).
 pub const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
@@ -574,5 +580,228 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("guest.txt")).unwrap(), msg);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn virtio_gpu_2d_scanout_and_ppm_png_export() {
+        let ram = Arc::new(Ram::new(0x2_0000).unwrap());
+        let dma = DmaRam::new(0x8000_0000, ram);
+        let irq = Arc::new(TestIrq::default());
+        let fb = Arc::new(Framebuffer::new(32, 16));
+        let mmio = VirtioMmio::new(
+            Box::new(VirtioGpu::new(32, 16, fb.clone())),
+            dma.clone(),
+            irq,
+        );
+        assert_eq!(mmio.read(0x008, AccessSize::Word), 16);
+        assert_eq!(mmio.read(0x108, AccessSize::Word), 1); // num_scanouts = 1
+
+        let (desc, avail, used, req_buf, resp_buf, backing_buf) = (
+            0x8000_1000,
+            0x8000_2000,
+            0x8000_3000,
+            0x8000_4000,
+            0x8000_5000,
+            0x8000_8000,
+        );
+        setup_queue(&mmio, desc, avail, used);
+        let mut avail_idx = 0u16;
+        let mut cmd = |req: &[u8]| -> Vec<u8> {
+            dma.write_bytes(req_buf, req).unwrap();
+            dma.write_bytes(resp_buf, &[0u8; 1100]).unwrap();
+            write_desc(
+                &dma,
+                desc,
+                0,
+                req_buf,
+                req.len() as u32,
+                VIRTQ_DESC_F_NEXT,
+                1,
+            );
+            write_desc(&dma, desc, 1, resp_buf, 1100, VIRTQ_DESC_F_WRITE, 0);
+            avail_idx += 1;
+            dma.write_u16(avail + 2, avail_idx).unwrap();
+            dma.write_u16(avail + 4 + u64::from(avail_idx - 1) * 2, 0)
+                .unwrap();
+            mmio.write(0x050, AccessSize::Word, 0);
+            let mut out = vec![0u8; 64];
+            dma.read_bytes(resp_buf, &mut out).unwrap();
+            out
+        };
+
+        // 1. GET_DISPLAY_INFO (0x0101)
+        let mut get_info = [0u8; 24];
+        get_info[0..4].copy_from_slice(&0x0101u32.to_le_bytes());
+        let resp = cmd(&get_info);
+        assert_eq!(u32::from_le_bytes(resp[0..4].try_into().unwrap()), 0x1101);
+        assert_eq!(u32::from_le_bytes(resp[32..36].try_into().unwrap()), 32);
+        assert_eq!(u32::from_le_bytes(resp[36..40].try_into().unwrap()), 16);
+
+        // 2. RESOURCE_CREATE_2D (0x0102): res_id=1, format=1 (B8G8R8A8_UNORM), 32x16
+        let mut create = [0u8; 40];
+        create[0..4].copy_from_slice(&0x0102u32.to_le_bytes());
+        create[24..28].copy_from_slice(&1u32.to_le_bytes());
+        create[28..32].copy_from_slice(&1u32.to_le_bytes());
+        create[32..36].copy_from_slice(&32u32.to_le_bytes());
+        create[36..40].copy_from_slice(&16u32.to_le_bytes());
+        assert_eq!(
+            u32::from_le_bytes(cmd(&create)[0..4].try_into().unwrap()),
+            0x1100
+        );
+
+        // 3. Populate guest backing with B8G8R8A8 pixel [B=0x33, G=0x22, R=0x11, A=0xff]
+        let mut raw_pixels = Vec::with_capacity(32 * 16 * 4);
+        for _ in 0..(32 * 16) {
+            raw_pixels.extend_from_slice(&[0x33, 0x22, 0x11, 0xff]);
+        }
+        dma.write_bytes(backing_buf, &raw_pixels).unwrap();
+
+        // 4. RESOURCE_ATTACH_BACKING (0x0107): res_id=1, nr_entries=1
+        let mut attach = [0u8; 48];
+        attach[0..4].copy_from_slice(&0x0107u32.to_le_bytes());
+        attach[24..28].copy_from_slice(&1u32.to_le_bytes());
+        attach[28..32].copy_from_slice(&1u32.to_le_bytes());
+        attach[32..40].copy_from_slice(&backing_buf.to_le_bytes());
+        attach[40..44].copy_from_slice(&(raw_pixels.len() as u32).to_le_bytes());
+        assert_eq!(
+            u32::from_le_bytes(cmd(&attach)[0..4].try_into().unwrap()),
+            0x1100
+        );
+
+        // 5. SET_SCANOUT (0x0104): scanout_id=0, res_id=1
+        let mut scanout = [0u8; 48];
+        scanout[0..4].copy_from_slice(&0x0104u32.to_le_bytes());
+        scanout[32..36].copy_from_slice(&32u32.to_le_bytes());
+        scanout[36..40].copy_from_slice(&16u32.to_le_bytes());
+        scanout[44..48].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            u32::from_le_bytes(cmd(&scanout)[0..4].try_into().unwrap()),
+            0x1100
+        );
+
+        // 6. TRANSFER_TO_HOST_2D (0x0106) + RESOURCE_FLUSH (0x0105)
+        let mut xfer = [0u8; 56];
+        xfer[0..4].copy_from_slice(&0x0106u32.to_le_bytes());
+        xfer[32..36].copy_from_slice(&32u32.to_le_bytes());
+        xfer[36..40].copy_from_slice(&16u32.to_le_bytes());
+        xfer[48..52].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            u32::from_le_bytes(cmd(&xfer)[0..4].try_into().unwrap()),
+            0x1100
+        );
+
+        let mut flush = [0u8; 48];
+        flush[0..4].copy_from_slice(&0x0105u32.to_le_bytes());
+        flush[32..36].copy_from_slice(&32u32.to_le_bytes());
+        flush[36..40].copy_from_slice(&16u32.to_le_bytes());
+        flush[40..44].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            u32::from_le_bytes(cmd(&flush)[0..4].try_into().unwrap()),
+            0x1100
+        );
+
+        let ppm = fb.to_ppm();
+        assert!(ppm.starts_with(b"P6\n32 16\n255\n"));
+        assert_eq!(&ppm[13..16], &[0x11, 0x22, 0x33]); // RGB converted from BGRA!
+
+        let png = fb.to_png();
+        assert_eq!(
+            &png[0..8],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+        );
+        assert!(png.windows(4).any(|w| w == b"IHDR"));
+        assert!(png.windows(4).any(|w| w == b"IDAT"));
+        assert!(png.windows(4).any(|w| w == b"IEND"));
+    }
+
+    #[test]
+    fn virtio_input_and_vnc_server_roundtrip() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let ram = Arc::new(Ram::new(0x1_0000).unwrap());
+        let dma = DmaRam::new(0x8000_0000, ram);
+        let irq = Arc::new(TestIrq::default());
+        let hub = InputHub::new();
+        let mmio = VirtioMmio::new(Box::new(VirtioInput::new(hub.clone())), dma.clone(), irq);
+        assert_eq!(mmio.read(0x008, AccessSize::Word), 18);
+
+        // Query VIRTIO_INPUT_CFG_ID_NAME (select = 1, subsel = 0).
+        mmio.write(0x100, AccessSize::Half, 0x0001);
+        let name_len = mmio.read(0x102, AccessSize::Byte);
+        assert!(name_len > 0);
+
+        // Populate 2 writable 8-byte event buffers on queue 0 (`eventq`).
+        let (desc, avail, used, ev0, ev1) = (
+            0x8000_1000,
+            0x8000_2000,
+            0x8000_3000,
+            0x8000_4000,
+            0x8000_4010,
+        );
+        setup_queue(&mmio, desc, avail, used);
+        write_desc(&dma, desc, 0, ev0, 8, VIRTQ_DESC_F_WRITE, 0);
+        write_desc(&dma, desc, 1, ev1, 8, VIRTQ_DESC_F_WRITE, 0);
+        dma.write_u16(avail + 2, 2).unwrap();
+        dma.write_u16(avail + 4, 0).unwrap();
+        dma.write_u16(avail + 6, 1).unwrap();
+
+        // Start a live VNC server on an ephemeral port and connect a client.
+        let fb = Arc::new(Framebuffer::new(16, 16));
+        let mut vnc = VncServer::bind("127.0.0.1:0", fb, hub).unwrap();
+        let addr = vnc.local_addr().to_owned();
+
+        let client_handle = std::thread::spawn(move || {
+            let mut client = TcpStream::connect(&addr).unwrap();
+            let mut banner = [0u8; 12];
+            client.read_exact(&mut banner).unwrap();
+            assert_eq!(&banner, b"RFB 003.008\n");
+
+            client.write_all(b"RFB 003.008\n").unwrap();
+            let mut sec = [0u8; 2];
+            client.read_exact(&mut sec).unwrap();
+            assert_eq!(sec, [1, 1]);
+
+            client.write_all(&[1]).unwrap();
+            let mut sec_res = [0u8; 4];
+            client.read_exact(&mut sec_res).unwrap();
+            assert_eq!(sec_res, [0, 0, 0, 0]);
+
+            client.write_all(&[1]).unwrap();
+            let mut srv_init = [0u8; 30];
+            client.read_exact(&mut srv_init).unwrap();
+            assert_eq!(&srv_init[24..30], b"rivemu");
+
+            // Request a FramebufferUpdate (type=3, incremental=0, x=0, y=0, w=16, h=16)
+            client.write_all(&[3, 0, 0, 0, 0, 0, 0, 16, 0, 16]).unwrap();
+            let mut fb_upd = vec![0u8; 16 + 16 * 16 * 4];
+            client.read_exact(&mut fb_upd).unwrap();
+            assert_eq!(&fb_upd[0..4], &[0, 0, 0, 1]);
+
+            // Send a VNC KeyEvent (type=4, down=1, pad=0, keysym='a'=0x61).
+            client.write_all(&[4, 1, 0, 0, 0, 0, 0, 0x61]).unwrap();
+            client.flush().unwrap();
+        });
+
+        while !client_handle.is_finished() {
+            vnc.poll();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        client_handle.join().unwrap();
+        for _ in 0..10 {
+            vnc.poll();
+            mmio.poll();
+            if dma.read_u16(used + 2) == Some(2) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // Verify the guest received EV_KEY (KEY_A = 30, down = 1) followed by EV_SYN.
+        assert_eq!(dma.read_u16(used + 2), Some(2));
+        assert_eq!(dma.read_u16(ev0), Some(1)); // EV_KEY
+        assert_eq!(dma.read_u16(ev0 + 2), Some(30)); // KEY_A
+        assert_eq!(dma.read_u32(ev0 + 4), Some(1)); // down = 1
+        assert_eq!(dma.read_u16(ev1), Some(0)); // EV_SYN
     }
 }

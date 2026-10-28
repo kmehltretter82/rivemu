@@ -90,11 +90,13 @@ impl VirtioPciFunction {
 
     fn class_code(&self) -> u32 {
         match self.dev.device_id() {
-            1 => 0x02_0000, // Network controller: Ethernet
-            2 => 0x01_0000, // Mass storage controller: SCSI
-            3 => 0x07_8000, // Communication controller
-            4 => 0x00_ff00, // Unclassified device (RNG)
-            9 => 0x00_0200, // Filesystem / 9P share
+            1 => 0x02_0000,  // Network controller: Ethernet
+            2 => 0x01_0000,  // Mass storage controller: SCSI
+            3 => 0x07_8000,  // Communication controller
+            4 => 0x00_ff00,  // Unclassified device (RNG)
+            9 => 0x00_0200,  // Filesystem / 9P share
+            16 => 0x03_8000, // Display controller: 2D GPU
+            18 => 0x09_8000, // Input device controller: Keyboard/Tablet
             _ => 0x00_ff00,
         }
     }

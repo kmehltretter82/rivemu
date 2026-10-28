@@ -180,8 +180,16 @@ pub struct Hart {
     pub svade: bool,
     /// Enforce strict PMP rules (deny S/U-mode access even when all PMP entries are `OFF`).
     pub strict_pmp: bool,
-    /// Cached flag indicating that per-access PMP permission checks are required.
+    /// Cached flag indicating that PMP permission checks are active.
     pub(crate) pmp_enforced: bool,
+    /// True when any active PMP entry has boundaries not aligned to 4 KiB (`0x1000`).
+    pub(crate) pmp_subpage: bool,
+    /// True when any active PMP entry has the lock bit (`L = 0x80`) set.
+    pub(crate) pmp_any_locked: bool,
+    /// Number of active entries in [`Self::pmp_ranges`].
+    pub(crate) pmp_count: u8,
+    /// Precomputed `(lo, hi_inclusive, cfg)` for active PMP entries in priority order.
+    pub(crate) pmp_ranges: [(u64, u64, u8); csr::PMP_ENTRIES],
 }
 
 impl std::fmt::Debug for Hart {
@@ -233,6 +241,10 @@ impl Hart {
             svade: false,
             strict_pmp: false,
             pmp_enforced: false,
+            pmp_subpage: false,
+            pmp_any_locked: false,
+            pmp_count: 0,
+            pmp_ranges: [(0, 0, 0); csr::PMP_ENTRIES],
         }
     }
 
@@ -268,7 +280,9 @@ impl Hart {
         self.csr.mideleg = irq::S_MASK;
         self.csr.mcounteren = 0xffff_ffff;
         self.csr.scounteren = 0xffff_ffff;
-        self.csr.menvcfg = envcfg::STCE;
+        self.csr.menvcfg =
+            envcfg::STCE | envcfg::PBMTE | envcfg::CBIE_MASK | envcfg::CBCFE | envcfg::CBZE;
+        self.csr.senvcfg = envcfg::CBIE_MASK | envcfg::CBCFE | envcfg::CBZE;
         self.csr.pmpaddr[0] = (1 << 54) - 1;
         self.csr.pmpcfg[0] = 0x1f;
         self.update_pmp_state();
@@ -477,7 +491,7 @@ impl Hart {
         let pc = self.pc;
         if pc & 0xfff <= 0xffc {
             let vpn_tag = (pc >> 12) + 1;
-            let pa = if !self.pmp_enforced && self.fetch_vpn == vpn_tag {
+            let pa = if !self.pmp_subpage && self.fetch_vpn == vpn_tag {
                 self.fetch_pa_page | (pc & 0xfff)
             } else {
                 let pa = self.translate(bus, pc, Access::Fetch)?;
@@ -490,7 +504,7 @@ impl Hart {
                 let tag = (pa << 16) | u64::from(self.icache_gen);
                 let entry = &self.icache[idx];
                 if entry.tag == tag {
-                    if self.pmp_enforced {
+                    if self.pmp_subpage {
                         self.check_pmp_access(pc, pa, u64::from(entry.insn.len), Access::Fetch)?;
                     }
                     return Ok(entry.insn);
@@ -968,13 +982,75 @@ impl Hart {
                     self.yield_slice = true;
                 }
             }
-            Op::SfenceVma => {
+            Op::SfenceVma | Op::SinvalVma => {
                 if self.prv == Priv::User
                     || (self.prv == Priv::Supervisor && self.csr.mstatus & status::TVM != 0)
                 {
                     return Err(Self::illegal(insn));
                 }
                 self.flush_tlb();
+            }
+            Op::SfenceWInval | Op::SfenceInvalIr => {
+                if self.prv == Priv::User {
+                    return Err(Self::illegal(insn));
+                }
+                self.flush_tlb();
+            }
+
+            // Zicbom / Zicboz (64-byte cache-block operations).
+            Op::CboInval => {
+                let ok = match self.prv {
+                    Priv::Machine => true,
+                    Priv::Supervisor => self.csr.menvcfg & envcfg::CBIE_MASK != 0,
+                    Priv::User => {
+                        (self.csr.menvcfg & envcfg::CBIE_MASK) != 0
+                            && (self.csr.senvcfg & envcfg::CBIE_MASK) != 0
+                    }
+                };
+                if !ok {
+                    return Err(Self::illegal(insn));
+                }
+                let base_va = rs1 & !63;
+                let pa = self.translate(bus, base_va, Access::Store)?;
+                self.check_pmp_access(base_va, pa, 64, Access::Store)?;
+                self.invalidate_reservation(pa);
+                bus.invalidate_cache_line(pa, AccessSize::Double);
+            }
+            Op::CboClean | Op::CboFlush => {
+                let ok = match self.prv {
+                    Priv::Machine => true,
+                    Priv::Supervisor => self.csr.menvcfg & envcfg::CBCFE != 0,
+                    Priv::User => (self.csr.menvcfg & self.csr.senvcfg & envcfg::CBCFE) != 0,
+                };
+                if !ok {
+                    return Err(Self::illegal(insn));
+                }
+                let base_va = rs1 & !63;
+                let pa = self
+                    .translate(bus, base_va, Access::Load)
+                    .or_else(|_| self.translate(bus, base_va, Access::Store))?;
+                self.check_pmp_access(base_va, pa, 64, Access::Load)
+                    .or_else(|_| self.check_pmp_access(base_va, pa, 64, Access::Store))?;
+                self.invalidate_reservation(pa);
+            }
+            Op::CboZero => {
+                let ok = match self.prv {
+                    Priv::Machine => true,
+                    Priv::Supervisor => self.csr.menvcfg & envcfg::CBZE != 0,
+                    Priv::User => (self.csr.menvcfg & self.csr.senvcfg & envcfg::CBZE) != 0,
+                };
+                if !ok {
+                    return Err(Self::illegal(insn));
+                }
+                let base_va = rs1 & !63;
+                let pa = self.translate(bus, base_va, Access::Store)?;
+                self.check_pmp_access(base_va, pa, 64, Access::Store)?;
+                self.invalidate_reservation(pa);
+                bus.invalidate_cache_line(pa, AccessSize::Double);
+                for off in (0..64u64).step_by(8) {
+                    bus.write(pa + off, AccessSize::Double, 0)
+                        .map_err(|_| Exception::new(cause::STORE_ACCESS, base_va))?;
+                }
             }
 
             // F/D extensions.
@@ -1249,7 +1325,7 @@ impl Hart {
             }
             csr::STVEC => self.csr.stvec = v & !2,
             csr::SCOUNTEREN => self.csr.scounteren = v & 0xffff_ffff,
-            csr::SENVCFG => self.csr.senvcfg = v & envcfg::FIOM,
+            csr::SENVCFG => self.csr.senvcfg = envcfg::sanitize(v, envcfg::S_MASK),
             csr::SSCRATCH => self.csr.sscratch = v,
             csr::SEPC => self.csr.sepc = v & !1,
             csr::SCAUSE => self.csr.scause = v,
@@ -1293,7 +1369,10 @@ impl Hart {
             csr::MIE => self.csr.mie = v & irq::ALL,
             csr::MTVEC => self.csr.mtvec = v & !2,
             csr::MCOUNTEREN => self.csr.mcounteren = v & 0xffff_ffff,
-            csr::MENVCFG => self.csr.menvcfg = v & (envcfg::FIOM | envcfg::ADUE | envcfg::STCE),
+            csr::MENVCFG => {
+                self.csr.menvcfg = envcfg::sanitize(v, envcfg::M_MASK);
+                self.flush_tlb();
+            }
             csr::MCOUNTINHIBIT => self.csr.mcountinhibit = v & 0xffff_fffd,
             csr::MHPMEVENT3..=csr::MHPMEVENT31 => {}
             csr::MSCRATCH => self.csr.mscratch = v,

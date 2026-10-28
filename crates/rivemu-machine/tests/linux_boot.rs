@@ -6,6 +6,7 @@
 //! `RIVEMU_REQUIRE_LINUX_TEST` is set.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use rivemu_backends::{BlockBackend, BufferChardev, MemoryBlock, UserNet, UserNetConfig};
@@ -13,11 +14,16 @@ use rivemu_core::size::MIB;
 use rivemu_devices::PowerEvent;
 use rivemu_machine::{Machine, MachineConfig, VirtioDeviceConfig};
 
+/// Serializes multi-hart Linux VM boot tests so they do not starve each other
+/// of host CPU cores on 2-vCPU CI runners.
+static LINUX_BOOT_LOCK: Mutex<()> = Mutex::new(());
+
 fn image_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../images/linux-test")
 }
 
 fn run_linux_boot_test(use_external_opensbi: bool) {
+    let _guard = LINUX_BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let required = std::env::var_os("RIVEMU_REQUIRE_LINUX_TEST").is_some();
     let enabled = required || std::env::var_os("RIVEMU_LINUX_TEST").is_some();
     if !enabled {
@@ -59,7 +65,7 @@ fn run_linux_boot_test(use_external_opensbi: bool) {
         kernel: Some(kernel),
         initrd: Some(initrd),
         dtb: None,
-        append: Some("console=ttyS0".into()),
+        append: Some("console=ttyS0 rcupdate.rcu_cpu_stall_suppress=1".into()),
         virtio: vec![
             VirtioDeviceConfig::Blk {
                 backend: disk.clone(),
@@ -215,6 +221,7 @@ fn boots_linux_with_builtin_rust_sbi_no_firmware() {
 
 #[test]
 fn rust_userspace_init_and_virtio_9p_on_linux() {
+    let _guard = LINUX_BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let required = std::env::var_os("RIVEMU_REQUIRE_LINUX_TEST").is_some();
     let enabled = required || std::env::var_os("RIVEMU_LINUX_TEST").is_some();
     if !enabled {
@@ -314,7 +321,8 @@ fn main() {
     if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
         let cpus = cpuinfo.lines().filter(|l| l.starts_with("processor")).count();
         let has_zbb = cpuinfo.contains("zbb");
-        println!("RUST_PROC_CPUS={cpus} HAS_ZBB={has_zbb}");
+        let has_cbo = cpuinfo.contains("zicbom") && cpuinfo.contains("zicboz");
+        println!("RUST_PROC_CPUS={cpus} HAS_ZBB={has_zbb} HAS_CBO={has_cbo}");
     }
     if let Ok(entries) = fs::read_dir("/sys/bus/pci/devices") {
         let mut devs: Vec<String> = entries
@@ -323,6 +331,20 @@ fn main() {
         devs.sort();
         println!("RUST_PCI_DEVS={}", devs.join(","));
     }
+
+    // Exercise Zicboz (cbo.zero) directly from U-mode on a 64-byte aligned buffer.
+    #[repr(align(64))]
+    struct Aligned64([u8; 64]);
+    let mut line = Aligned64([0x5a; 64]);
+    unsafe {
+        std::arch::asm!(
+            ".insn i 0x0f, 2, x0, {ptr}, 4",
+            ptr = in(reg) line.0.as_mut_ptr(),
+            options(nostack),
+        );
+    }
+    assert_eq!(line.0, [0u8; 64]);
+    println!("RUST_CBO_ZERO=OK");
 
     // 3. Mount virtio-9p share ("host0") at /mnt, read host file, write guest file.
     let rc = unsafe {
@@ -395,6 +417,16 @@ fn main() {
                 mount_tag: "host0".into(),
             },
         ],
+        virtio_pci: vec![
+            VirtioDeviceConfig::Rng,
+            VirtioDeviceConfig::Gpu {
+                width: 640,
+                height: 480,
+            },
+            VirtioDeviceConfig::Input,
+        ],
+        pflash: Vec::new(),
+        fw_cfg_files: vec![("opt/org.rivemu/test".into(), b"fwcfg_ok".to_vec())],
         strict_align: true,
         svade: true,
         strict_pmp: true,
@@ -442,13 +474,14 @@ fn main() {
         "{console_out}"
     );
     assert!(
-        console_out.contains("RUST_PROC_CPUS=4 HAS_ZBB=true"),
+        console_out.contains("RUST_PROC_CPUS=4 HAS_ZBB=true HAS_CBO=true"),
         "{console_out}"
     );
     assert!(
-        console_out.contains("RUST_PCI_DEVS=0000:00:00.0,0000:00:01.0"),
+        console_out.contains("RUST_PCI_DEVS=0000:00:00.0,0000:00:01.0,0000:00:02.0,0000:00:03.0"),
         "{console_out}"
     );
+    assert!(console_out.contains("RUST_CBO_ZERO=OK"), "{console_out}");
     if console_out.contains("RUST_9P_READ=") {
         assert!(
             console_out.contains("RUST_9P_READ=HOST_9P_PAYLOAD_42"),

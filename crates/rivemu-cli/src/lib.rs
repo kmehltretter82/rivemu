@@ -18,7 +18,7 @@ use rivemu_backends::{
     UserNet, UserNetConfig, block::open_block_image,
 };
 use rivemu_machine::virt::DEFAULT_RAM_SIZE;
-use rivemu_machine::{MachineConfig, VirtioDeviceConfig};
+use rivemu_machine::{DEFAULT_GPU_HEIGHT, DEFAULT_GPU_WIDTH, MachineConfig, VirtioDeviceConfig};
 use thiserror::Error;
 
 pub use opts::{OptsError, QemuOpts};
@@ -47,15 +47,49 @@ pub const LOG_ITEMS: &[(&str, &str)] = &[
     ("sbi", "log Supervisor Binary Interface (SBI) calls"),
 ];
 
-/// Supported `-device` drivers (implemented in milestone P4).
+/// Supported `-device` drivers (MMIO and PCIe).
 pub const DEVICE_DRIVERS: &[(&str, &str)] = &[
     ("virtio-blk-device", "virtio block device (virtio-mmio)"),
+    ("virtio-blk-pci", "virtio block device (virtio-pci)"),
     ("virtio-net-device", "virtio network device (virtio-mmio)"),
+    ("virtio-net-pci", "virtio network device (virtio-pci)"),
     ("virtio-serial-device", "virtio console (virtio-mmio)"),
+    ("virtio-serial-pci", "virtio console (virtio-pci)"),
     ("virtio-rng-device", "virtio entropy source (virtio-mmio)"),
+    ("virtio-rng-pci", "virtio entropy source (virtio-pci)"),
     (
         "virtio-9p-device",
         "virtio 9P host directory share (virtio-mmio)",
+    ),
+    (
+        "virtio-9p-pci",
+        "virtio 9P host directory share (virtio-pci)",
+    ),
+    ("virtio-gpu-device", "virtio 2D GPU (virtio-mmio)"),
+    ("virtio-gpu-pci", "virtio 2D GPU (virtio-pci)"),
+    (
+        "virtio-keyboard-device",
+        "virtio evdev keyboard/tablet (virtio-mmio)",
+    ),
+    (
+        "virtio-keyboard-pci",
+        "virtio evdev keyboard/tablet (virtio-pci)",
+    ),
+    (
+        "virtio-input-device",
+        "virtio evdev keyboard/tablet (virtio-mmio)",
+    ),
+    (
+        "virtio-input-pci",
+        "virtio evdev keyboard/tablet (virtio-pci)",
+    ),
+    (
+        "virtio-tablet-device",
+        "virtio evdev keyboard/tablet (virtio-mmio)",
+    ),
+    (
+        "virtio-tablet-pci",
+        "virtio evdev keyboard/tablet (virtio-pci)",
     ),
 ];
 
@@ -184,6 +218,16 @@ pub struct Options {
     pub savevm: Option<PathBuf>,
     /// `-run-init` guest ELF binary packaged on the fly as `/init` inside an ephemeral cpio initramfs.
     pub run_init: Option<PathBuf>,
+    /// `-pflash` CFI01 NOR flash image files (`pflash0`, `pflash1`).
+    pub pflash: Vec<PathBuf>,
+    /// `-fw_cfg` named firmware config blobs (`name=...,file=...` or `string=...`).
+    pub fw_cfg: Vec<QemuOpts>,
+    /// `-pci`: attach shorthand VirtIO devices (`-drive if=virtio`, `-virtfs`) to PCIe instead of MMIO.
+    pub pci: bool,
+    /// `-vnc` display specification (e.g. `:0` or `127.0.0.1:5900`).
+    pub vnc: Option<String>,
+    /// `-screendump` path to write the 2D GPU framebuffer (`.ppm` or `.png`) on exit.
+    pub screendump: Option<PathBuf>,
     /// Trap on any unaligned scalar load or store (`LOAD_MISALIGNED` / `STORE_MISALIGNED`).
     pub strict_align: bool,
     /// Enforce `Svade` page-table rules (page fault when `pte.A == 0` or `pte.D == 0` on store).
@@ -225,6 +269,11 @@ impl Default for Options {
             loadvm: None,
             savevm: None,
             run_init: None,
+            pflash: Vec::new(),
+            fw_cfg: Vec::new(),
+            pci: false,
+            vnc: None,
+            screendump: None,
             strict_align: false,
             svade: false,
             strict_pmp: false,
@@ -422,10 +471,32 @@ where
             "nographic" => o.nographic = true,
             "display" => {
                 let v = value()?;
-                if opts(&name, &v, Some("type"))?.get("type") != Some("none") {
-                    return Err(invalid(&name, &v, "only '-display none' is supported"));
+                let d = opts(&name, &v, Some("type"))?;
+                match d.get("type") {
+                    Some("none") => {}
+                    Some("vnc") => {
+                        o.vnc = Some(d.get("vnc").unwrap_or(":0").to_owned());
+                    }
+                    Some(s) if s.starts_with("vnc=") => {
+                        o.vnc = Some(s["vnc=".len()..].to_owned());
+                    }
+                    _ => {
+                        return Err(invalid(
+                            &name,
+                            &v,
+                            "only '-display none' or '-display vnc=:0' is supported",
+                        ));
+                    }
                 }
             }
+            "vnc" => o.vnc = Some(value()?),
+            "screendump" => o.screendump = Some(value()?.into()),
+            "pflash" => o.pflash.push(value()?.into()),
+            "fw_cfg" => {
+                let v = value()?;
+                o.fw_cfg.push(opts(&name, &v, Some("name"))?);
+            }
+            "pci" => o.pci = true,
             "s" => o.gdb = Some("tcp::1234".into()),
             "gdb" => o.gdb = Some(value()?),
             "S" => o.start_paused = true,
@@ -501,12 +572,12 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
                 .into_iter()
                 .map(|d| d.join(DEFAULT_FIRMWARE))
                 .find(|p| p.is_file());
-            match (found, &o.kernel) {
-                (Some(p), _) => Some(p),
-                // When booting a kernel and no external OpenSBI binary is
-                // installed on disk, fall back to rivemu's built-in Rust SBI.
-                (None, Some(_)) => None,
-                (None, None) => {
+            match (found, &o.kernel, o.pflash.is_empty()) {
+                (Some(p), _, _) => Some(p),
+                // When booting a kernel or pflash image and no external OpenSBI
+                // binary is installed on disk, fall back to built-in Rust SBI / flash.
+                (None, Some(_), _) | (None, None, false) => None,
+                (None, None, true) => {
                     return Err(format!(
                         "unable to find default firmware '{DEFAULT_FIRMWARE}' \
                          (set RIVEMU_FIRMWARE_DIR, or use -bios <file> / -bios builtin / -bios none)"
@@ -518,11 +589,17 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
 
     let mut drives: HashMap<String, Arc<dyn BlockBackend>> = HashMap::new();
     let mut virtio = Vec::new();
+    let mut virtio_pci = Vec::new();
+    let mut pflash = o.pflash.clone();
 
     for (idx, d) in o.drives.iter().enumerate() {
         let file = d
             .get("file")
             .ok_or_else(|| "-drive: missing 'file=' parameter".to_string())?;
+        if d.get("if") == Some("pflash") {
+            pflash.push(PathBuf::from(file));
+            continue;
+        }
         let ro = matches!(d.get("readonly"), Some("on" | "true" | "1"));
         let fmt = d.get("format");
         let backend = open_block_image(Path::new(file), fmt, ro)
@@ -532,12 +609,35 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("drive{idx}"));
         if d.get("if") == Some("virtio") {
-            virtio.push(VirtioDeviceConfig::Blk {
+            let vcfg = VirtioDeviceConfig::Blk {
                 backend: backend.clone(),
                 serial: id.clone(),
-            });
+            };
+            if o.pci {
+                virtio_pci.push(vcfg);
+            } else {
+                virtio.push(vcfg);
+            }
         }
         drives.insert(id, backend);
+    }
+
+    let mut fw_cfg_files = Vec::new();
+    for f in &o.fw_cfg {
+        let name = f
+            .get("name")
+            .ok_or_else(|| "-fw_cfg: missing 'name=' parameter".to_string())?
+            .to_owned();
+        let data = if let Some(path) = f.get("file") {
+            std::fs::read(path).map_err(|e| format!("-fw_cfg file={path}: {e}"))?
+        } else if let Some(s) = f.get("string") {
+            s.as_bytes().to_vec()
+        } else {
+            return Err(format!(
+                "-fw_cfg name={name}: requires either 'file=' or 'string='"
+            ));
+        };
+        fw_cfg_files.push((name, data));
     }
 
     let mut netdevs: HashMap<String, Arc<dyn NetBackend>> = HashMap::new();
@@ -581,10 +681,15 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("fs{idx}"));
         if let Some(tag) = f.get("mount_tag") {
-            virtio.push(VirtioDeviceConfig::P9 {
+            let vcfg = VirtioDeviceConfig::P9 {
                 path: PathBuf::from(path),
                 mount_tag: tag.to_owned(),
-            });
+            };
+            if o.pci {
+                virtio_pci.push(vcfg);
+            } else {
+                virtio.push(vcfg);
+            }
         }
         fsdevs.insert(id, PathBuf::from(path));
     }
@@ -634,33 +739,42 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
         let driver = dev
             .get("driver")
             .ok_or_else(|| "-device: missing driver name".to_string())?;
+        let is_pci = driver.ends_with("-pci") || o.pci;
+        let mut push_dev = |vcfg: VirtioDeviceConfig| {
+            if is_pci {
+                virtio_pci.push(vcfg);
+            } else {
+                virtio.push(vcfg);
+            }
+        };
         match driver {
-            "virtio-blk-device" => {
+            "virtio-blk-device" | "virtio-blk-pci" => {
                 let drive_id = dev
                     .get("drive")
-                    .ok_or_else(|| "-device virtio-blk-device: missing 'drive='".to_string())?;
-                let backend = drives.get(drive_id).ok_or_else(|| {
-                    format!("-device virtio-blk-device: unknown drive '{drive_id}'")
-                })?;
+                    .ok_or_else(|| format!("-device {driver}: missing 'drive='"))?;
+                let backend = drives
+                    .get(drive_id)
+                    .ok_or_else(|| format!("-device {driver}: unknown drive '{drive_id}'"))?;
                 let serial = dev.get("serial").unwrap_or(drive_id).to_owned();
-                virtio.push(VirtioDeviceConfig::Blk {
+                push_dev(VirtioDeviceConfig::Blk {
                     backend: backend.clone(),
                     serial,
                 });
             }
-            "virtio-net-device" => {
+            "virtio-net-device" | "virtio-net-pci" => {
                 let backend = match dev.get("netdev") {
                     Some(net_id) => netdevs
                         .get(net_id)
-                        .ok_or_else(|| {
-                            format!("-device virtio-net-device: unknown netdev '{net_id}'")
-                        })?
+                        .ok_or_else(|| format!("-device {driver}: unknown netdev '{net_id}'"))?
                         .clone(),
                     None => UserNet::new(UserNetConfig::default()),
                 };
-                virtio.push(VirtioDeviceConfig::Net { backend });
+                push_dev(VirtioDeviceConfig::Net { backend });
             }
-            "virtio-serial-device" | "virtio-console" => {
+            "virtio-serial-device"
+            | "virtio-serial-pci"
+            | "virtio-console"
+            | "virtio-console-pci" => {
                 let chardev = match dev.get("chardev") {
                     Some(ch_id) => chardevs
                         .get(ch_id)
@@ -668,25 +782,46 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
                         .clone(),
                     None => Arc::new(NullChardev),
                 };
-                virtio.push(VirtioDeviceConfig::Console { chardev });
+                push_dev(VirtioDeviceConfig::Console { chardev });
             }
-            "virtio-rng-device" => {
-                virtio.push(VirtioDeviceConfig::Rng);
+            "virtio-rng-device" | "virtio-rng-pci" => {
+                push_dev(VirtioDeviceConfig::Rng);
             }
-            "virtio-9p-device" => {
+            "virtio-9p-device" | "virtio-9p-pci" => {
                 let fsdev_id = dev
                     .get("fsdev")
-                    .ok_or_else(|| "-device virtio-9p-device: missing 'fsdev='".to_string())?;
-                let path = fsdevs.get(fsdev_id).ok_or_else(|| {
-                    format!("-device virtio-9p-device: unknown fsdev '{fsdev_id}'")
-                })?;
+                    .ok_or_else(|| format!("-device {driver}: missing 'fsdev='"))?;
+                let path = fsdevs
+                    .get(fsdev_id)
+                    .ok_or_else(|| format!("-device {driver}: unknown fsdev '{fsdev_id}'"))?;
                 let mount_tag = dev
                     .get("mount_tag")
-                    .ok_or_else(|| "-device virtio-9p-device: missing 'mount_tag='".to_string())?;
-                virtio.push(VirtioDeviceConfig::P9 {
+                    .ok_or_else(|| format!("-device {driver}: missing 'mount_tag='"))?;
+                push_dev(VirtioDeviceConfig::P9 {
                     path: path.clone(),
                     mount_tag: mount_tag.to_owned(),
                 });
+            }
+            "virtio-gpu-device" | "virtio-gpu-pci" => {
+                let width = dev
+                    .get("xres")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(DEFAULT_GPU_WIDTH);
+                let height = dev
+                    .get("yres")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(DEFAULT_GPU_HEIGHT);
+                push_dev(VirtioDeviceConfig::Gpu { width, height });
+            }
+            "virtio-keyboard-device"
+            | "virtio-keyboard-pci"
+            | "virtio-input-device"
+            | "virtio-input-pci"
+            | "virtio-tablet-device"
+            | "virtio-tablet-pci"
+            | "virtio-mouse-device"
+            | "virtio-mouse-pci" => {
+                push_dev(VirtioDeviceConfig::Input);
             }
             other => {
                 return Err(format!(
@@ -727,6 +862,9 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
         dtb: o.dtb.clone(),
         append,
         virtio,
+        virtio_pci,
+        pflash,
+        fw_cfg_files,
         icount,
         strict_align: o.strict_align,
         svade: o.svade,
@@ -750,21 +888,26 @@ Machine:
 
 Boot:
   -bios file|none|default           firmware image (default: {DEFAULT_FIRMWARE})
+  -pflash file                      CFI01 NOR flash image (pflash0 / pflash1 at 0x20000000)
+  -fw_cfg [name=]N,file=F|string=S  expose named blob in QEMU fw_cfg
   -kernel file                      kernel image (ELF or raw Image)
   -initrd file                      initial ramdisk
   -append cmdline                   kernel command line
   -dtb file                         use this device tree instead of a generated one
 
 Devices and backends:
-  -drive file=...,if=none,id=...,format=raw   block backend
-  -device driver[,prop=value...]    add device ('-device help' lists)
+  -drive file=...,if=none|virtio|pflash,id=...,format=raw  block backend
+  -device driver[,prop=value...]    add MMIO or PCIe device ('-device help' lists)
+  -pci                              attach shorthand VirtIO devices onto PCIe
   -netdev user|tap,id=...[,...]     network backend
   -chardev backend,id=...[,...]     character backend
   -serial dev                       serial port backend (e.g. stdio, mon:stdio, pty)
   -monitor dev                      HMP monitor backend
   -qmp dev                          QMP backend (e.g. unix:/tmp/qmp.sock,server,nowait)
   -nographic                        no graphics; serial + monitor on stdio
-  -display none                     no display
+  -display none|vnc=:0              select display backend
+  -vnc :0                           start built-in RFB 3.8 VNC server on TCP port 5900
+  -screendump file.png|file.ppm     write 2D GPU framebuffer on guest exit
 
 Debugging:
   -s                                shorthand for -gdb tcp::1234
@@ -900,6 +1043,46 @@ mod tests {
         assert_eq!((c.ram_size, c.smp), (1 << 30, 2));
         let o = parse(&["-bios", "none"]).unwrap();
         assert_eq!(machine_config(&o).unwrap().bios, None);
+    }
+
+    #[test]
+    fn pci_gpu_input_pflash_and_fw_cfg_options() {
+        let o = parse(&[
+            "-bios",
+            "none",
+            "-pflash",
+            "edk2-code.fd",
+            "-fw_cfg",
+            "name=opt/org.rivemu/test,string=hello-fwcfg",
+            "-device",
+            "virtio-gpu-pci,xres=800,yres=600",
+            "-device",
+            "virtio-keyboard-pci",
+            "-vnc",
+            ":0",
+            "-screendump",
+            "screen.png",
+        ])
+        .unwrap();
+        assert_eq!(o.pflash, [PathBuf::from("edk2-code.fd")]);
+        assert_eq!(o.vnc.as_deref(), Some(":0"));
+        assert_eq!(o.screendump.as_deref(), Some(Path::new("screen.png")));
+        let cfg = machine_config(&o).unwrap();
+        assert_eq!(cfg.pflash, [PathBuf::from("edk2-code.fd")]);
+        assert_eq!(
+            cfg.fw_cfg_files,
+            [("opt/org.rivemu/test".to_string(), b"hello-fwcfg".to_vec())]
+        );
+        assert_eq!(cfg.virtio.len(), 0);
+        assert_eq!(cfg.virtio_pci.len(), 2);
+        assert!(matches!(
+            cfg.virtio_pci[0],
+            VirtioDeviceConfig::Gpu {
+                width: 800,
+                height: 600
+            }
+        ));
+        assert!(matches!(cfg.virtio_pci[1], VirtioDeviceConfig::Input));
     }
 
     #[test]

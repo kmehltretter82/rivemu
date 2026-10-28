@@ -16,7 +16,7 @@ pub(crate) struct FdtParams<'a> {
     pub(crate) virtio: Vec<(u64, u32)>,
 }
 
-const ISA: &str = "rv64imafdc_zba_zbb_zbc_zbs_zicntr_zicsr_zifencei_zihintpause_sstc";
+const ISA: &str = "rv64imafdc_zba_zbb_zbc_zbs_zicbom_zicboz_zicntr_zicsr_zifencei_zihintpause_sstc_svinval_svpbmt";
 const ISA_EXTENSIONS: &[&str] = &[
     "i",
     "m",
@@ -28,11 +28,15 @@ const ISA_EXTENSIONS: &[&str] = &[
     "zbb",
     "zbc",
     "zbs",
+    "zicbom",
+    "zicboz",
     "zicntr",
     "zicsr",
     "zifencei",
     "zihintpause",
     "sstc",
+    "svinval",
+    "svpbmt",
 ];
 
 pub(crate) fn build(p: &FdtParams<'_>) -> Vec<u8> {
@@ -78,6 +82,8 @@ pub(crate) fn build(p: &FdtParams<'_>) -> Vec<u8> {
         f.prop_str("riscv,isa", ISA);
         f.prop_str("riscv,isa-base", "rv64i");
         f.prop_strs("riscv,isa-extensions", ISA_EXTENSIONS);
+        f.prop_u32("riscv,cbom-block-size", 64);
+        f.prop_u32("riscv,cboz-block-size", 64);
         f.prop_str("mmu-type", "riscv,sv39");
         f.begin_node("interrupt-controller");
         f.prop_u32("#interrupt-cells", 1);
@@ -220,9 +226,9 @@ pub(crate) fn build(p: &FdtParams<'_>) -> Vec<u8> {
             memmap::PCIE_MMIO.1 as u32,
         ],
     );
-    f.prop_cells("interrupt-map-mask", &[0x1800, 0, 0, 0x7]);
-    let mut imap = Vec::with_capacity(16 * 6);
-    for slot in 0..4u32 {
+    f.prop_cells("interrupt-map-mask", &[0x7800, 0, 0, 0x7]);
+    let mut imap = Vec::with_capacity(64 * 6);
+    for slot in 0..16u32 {
         for pin in 1..=4u32 {
             let irq = PCIE_IRQ + ((slot + pin - 1) % 4);
             imap.extend_from_slice(&[slot << 11, 0, 0, pin, plic_ph, irq]);

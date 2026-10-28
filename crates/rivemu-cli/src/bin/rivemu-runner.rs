@@ -96,6 +96,7 @@ fn run() -> Result<i32> {
         strict_align: strict,
         svade: strict,
         strict_pmp: strict,
+        ..Default::default()
     })
     .context("failed to initialise rivemu machine")?;
 

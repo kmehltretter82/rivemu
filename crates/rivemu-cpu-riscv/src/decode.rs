@@ -94,6 +94,15 @@ pub enum Op {
     Sret,
     Wfi,
     SfenceVma,
+    // Svinval (fine-grained TLB invalidation)
+    SinvalVma,
+    SfenceWInval,
+    SfenceInvalIr,
+    // Zicbom / Zicboz (cache-block operations)
+    CboInval,
+    CboClean,
+    CboFlush,
+    CboZero,
     // F/D (`dbl` selects double precision, `funct` holds the rounding mode)
     Fload,
     Fstore,
@@ -454,6 +463,15 @@ pub fn decode(raw: u32) -> Insn {
         0x0f => match f3 {
             0 => (Op::Fence, 0),
             1 => (Op::FenceI, 0),
+            2 if rd == 0 => match raw >> 20 {
+                0 => (Op::CboInval, 0),
+                1 => (Op::CboClean, 0),
+                2 => (Op::CboFlush, 0),
+                4 => (Op::CboZero, 0),
+                _ => (Op::Illegal, 0),
+            },
+            // Zicbop prefetch hints (prefetch.i, prefetch.r, prefetch.w)
+            6 if rd == 0 && matches!(rs2, 0 | 1 | 3) => (Op::Fence, 0),
             _ => (Op::Illegal, 0),
         },
         0x73 => match f3 {
@@ -464,7 +482,10 @@ pub fn decode(raw: u32) -> Insn {
                     0x3020_0073 => Op::Mret,
                     0x1020_0073 => Op::Sret,
                     0x1050_0073 => Op::Wfi,
+                    0x1800_0073 => Op::SfenceWInval,
+                    0x1810_0073 => Op::SfenceInvalIr,
                     _ if f7 == 0x09 && rd == 0 => Op::SfenceVma,
+                    _ if f7 == 0x0b && rd == 0 => Op::SinvalVma,
                     _ => Op::Illegal,
                 };
                 (op, 0)
@@ -677,5 +698,78 @@ mod tests {
         assert_eq!(h.x[14], 0x0800_0000_0000_0001); // rev8
         assert_eq!(h.x[15], 0xff00_0000_0000_00ff); // orc.b
         assert_eq!(h.x[16], 0x0100_0000_0000_0028); // bset bit 5
+    }
+
+    #[test]
+    fn zicbom_zicboz_svpbmt_and_svinval() {
+        use crate::csr::envcfg;
+        use crate::hart::{Hart, Priv, cause};
+        use rivemu_core::{AccessSize, HostTimebase};
+        use rivemu_mem::{AddressSpace, Ram};
+        use std::sync::Arc;
+
+        // Decode checks for Zicbom, Zicboz, Zicbop, Svinval.
+        assert_eq!(decode(0x0005_200f).op, Op::CboInval); // cbo.inval (a0)
+        assert_eq!(decode(0x0015_200f).op, Op::CboClean); // cbo.clean (a0)
+        assert_eq!(decode(0x0025_200f).op, Op::CboFlush); // cbo.flush (a0)
+        assert_eq!(decode(0x0045_200f).op, Op::CboZero); // cbo.zero  (a0)
+        assert_eq!(decode(0x0015_600f).op, Op::Fence); // prefetch.r 0(a0)
+        assert_eq!(decode(0x1605_0073).op, Op::SinvalVma); // sinval.vma a0, zero
+        assert_eq!(decode(0x1800_0073).op, Op::SfenceWInval);
+        assert_eq!(decode(0x1810_0073).op, Op::SfenceInvalIr);
+
+        let mut bus = AddressSpace::new();
+        bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(0x1_0000).unwrap()))
+            .unwrap();
+
+        // Fill target 64-byte line at 0x8000_2040 with non-zero bytes.
+        bus.load_bytes(0x8000_2040, &[0xaa; 64]).unwrap();
+
+        let prog: &[u32] = &[
+            0x0045_200f, // cbo.zero  (a0)
+            0x0015_200f, // cbo.clean (a0)
+            0x0025_200f, // cbo.flush (a0)
+            0x0005_200f, // cbo.inval (a0)
+            0x1800_0073, // sfence.w.inval
+            0x1605_0073, // sinval.vma a0, zero
+            0x1810_0073, // sfence.inval.ir
+        ];
+        for (idx, w) in prog.iter().enumerate() {
+            bus.load_bytes(0x8000_0000 + idx as u64 * 4, &w.to_le_bytes())
+                .unwrap();
+        }
+
+        let mut h = Hart::new(0, Arc::new(HostTimebase::new(10_000_000)));
+        h.init_smode_boot(0x8000_0000, 0);
+        // Set up an Sv39 identity 1 GiB megapage leaf PTE with Svpbmt PBMT=1 (NC: 1 << 61).
+        let pt_base = 0x8000_1000u64;
+        let leaf_nc = ((0x8000_0000u64 >> 12) << 10) | 0xcf | (1u64 << 61);
+        bus.write(pt_base + 2 * 8, AccessSize::Double, leaf_nc)
+            .unwrap();
+        h.csr.satp = (8u64 << 60) | (pt_base >> 12);
+        // Pass an unaligned address inside the 0x8000_2040..0x8000_2080 cache line.
+        h.x[10] = 0x8000_205c;
+
+        for _ in 0..prog.len() {
+            h.step(&bus);
+        }
+        assert_eq!(h.pc, 0x8000_0000 + (prog.len() as u64) * 4);
+        for off in (0..64u64).step_by(8) {
+            assert_eq!(bus.read(0x8000_2040 + off, AccessSize::Double), Ok(0));
+        }
+
+        // Clearing menvcfg.CBZE makes cbo.zero trap with ILLEGAL_INSN in S-mode.
+        h.csr.menvcfg &= !envcfg::CBZE;
+        h.csr.stvec = 0x8000_0400;
+        h.pc = 0x8000_0000;
+        h.step(&bus);
+        assert_eq!(h.pc, 0x8000_0400);
+        assert_eq!(h.csr.scause, cause::ILLEGAL_INSN);
+
+        // Reserved PBMT=3 (3 << 61) or PBMT!=0 when menvcfg.PBMTE==0 faults.
+        h.csr.menvcfg &= !envcfg::PBMTE;
+        h.invalidate_tlb();
+        h.prv = Priv::Supervisor;
+        assert_eq!(h.debug_translate(&bus, 0x8000_0000), None);
     }
 }

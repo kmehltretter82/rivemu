@@ -52,6 +52,8 @@ Supported HMP commands:
   system_reset             reset the machine
   system_powerdown         power off the machine
   savevm FILE              save VM snapshot to FILE
+  screendump FILE          save 2D GPU framebuffer to FILE (.ppm or .png)
+  sendkey KEY              inject key press/release via virtio-input
   xp [/N] ADDR             examine physical memory words at ADDR
   quit | q                 exit rivemu
 "
@@ -103,6 +105,17 @@ Supported HMP commands:
             Ok(()) => (format!("saved snapshot to '{path}'\n"), None),
             Err(e) => (format!("savevm failed: {e}\n"), None),
         },
+        ("screendump", Some(path)) => match machine.screendump(std::path::Path::new(path)) {
+            Ok(()) => (format!("saved screendump to '{path}'\n"), None),
+            Err(e) => (format!("screendump failed: {e}\n"), None),
+        },
+        ("sendkey", Some(key)) => {
+            if machine.input.send_key_name(key) {
+                (String::new(), None)
+            } else {
+                (format!("unknown key '{key}'\n"), None)
+            }
+        }
         ("xp" | "x", _) => (exec_xp(&parts[1..], machine), None),
         _ => (format!("unknown command: '{line}' (try 'help')\n"), None),
     }

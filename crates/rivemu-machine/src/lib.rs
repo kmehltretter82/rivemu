@@ -11,4 +11,5 @@ pub mod loader;
 pub mod snapshot;
 pub mod virt;
 
+pub use rivemu_virtio::{DEFAULT_GPU_HEIGHT, DEFAULT_GPU_WIDTH, Framebuffer, InputHub, VncServer};
 pub use virt::{BootInfo, ImageInfo, Machine, MachineConfig, MachineError, VirtioDeviceConfig};

@@ -116,11 +116,30 @@ pub mod irq {
     pub const PRIORITY: [u64; 6] = [MEI, MSI, MTI, SEI, SSI, STI];
 }
 
-/// `menvcfg` bits.
+/// `menvcfg` / `senvcfg` bits.
 pub mod envcfg {
     pub const FIOM: u64 = 1;
+    pub const CBIE_SHIFT: u32 = 4;
+    pub const CBIE_MASK: u64 = 3 << CBIE_SHIFT;
+    pub const CBCFE: u64 = 1 << 6;
+    pub const CBZE: u64 = 1 << 7;
     pub const ADUE: u64 = 1 << 61;
+    pub const PBMTE: u64 = 1 << 62;
     pub const STCE: u64 = 1 << 63;
+
+    pub const S_MASK: u64 = FIOM | CBIE_MASK | CBCFE | CBZE;
+    pub const M_MASK: u64 = S_MASK | ADUE | PBMTE | STCE;
+
+    /// Masks `v` to `mask` and clears the reserved `CBIE = 0b10` encoding (WARL).
+    #[inline]
+    pub const fn sanitize(v: u64, mask: u64) -> u64 {
+        let out = v & mask;
+        if (out & CBIE_MASK) == (2 << CBIE_SHIFT) {
+            out & !CBIE_MASK
+        } else {
+            out
+        }
+    }
 }
 
 /// `misa` value: RV64 IMAFDC + S + U.
@@ -184,7 +203,7 @@ impl Default for Csrs {
             mip: 0,
             mtvec: 0,
             mcounteren: 0,
-            menvcfg: 0,
+            menvcfg: envcfg::CBIE_MASK | envcfg::CBCFE | envcfg::CBZE | envcfg::PBMTE,
             mcountinhibit: 0,
             mscratch: 0,
             mepc: 0,
@@ -192,7 +211,7 @@ impl Default for Csrs {
             mtval: 0,
             stvec: 0,
             scounteren: 0,
-            senvcfg: 0,
+            senvcfg: envcfg::CBIE_MASK | envcfg::CBCFE | envcfg::CBZE,
             sscratch: 0,
             sepc: 0,
             scause: 0,

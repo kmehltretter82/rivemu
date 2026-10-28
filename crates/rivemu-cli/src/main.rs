@@ -12,7 +12,7 @@ use rivemu_cli::{Action, CliError, DEVICE_DRIVERS, LOG_ITEMS, PROG};
 use rivemu_cpu_riscv::{LogFlags, Logger};
 use rivemu_devices::PowerEvent;
 use rivemu_gdbstub::{GdbAction, GdbServer};
-use rivemu_machine::Machine;
+use rivemu_machine::{Machine, VncServer};
 use rivemu_monitor::{MonitorAction, QmpServer, exec_hmp};
 
 fn main() -> ExitCode {
@@ -105,6 +105,14 @@ fn run() -> Result<ExitCode> {
             .with_context(|| format!("failed to load VM snapshot {}", snap.display()))?;
     }
 
+    let mut vnc = match &opts.vnc {
+        Some(spec) => Some(
+            VncServer::bind(spec, machine.framebuffer.clone(), machine.input.clone())
+                .with_context(|| format!("cannot bind -vnc '{spec}'"))?,
+        ),
+        None => None,
+    };
+
     let mut paused = opts.start_paused;
     if paused && gdb.is_none() && qmp_servers.is_empty() && serial != SerialBackend::MonStdio {
         eprintln!("{PROG}: warning: -S specified without debugger or monitor; starting guest");
@@ -174,6 +182,9 @@ fn run() -> Result<ExitCode> {
                 }
             }
         }
+        if let Some(v) = &mut vnc {
+            v.poll();
+        }
         let out = machine.uart.take_output();
         if !out.is_empty() {
             sink.write_all(&out)?;
@@ -225,6 +236,11 @@ fn run() -> Result<ExitCode> {
         machine
             .save_snapshot(snap)
             .with_context(|| format!("failed to save VM snapshot {}", snap.display()))?;
+    }
+    if let Some(dump) = &opts.screendump {
+        machine
+            .screendump(dump)
+            .with_context(|| format!("failed to write screendump {}", dump.display()))?;
     }
     if std::env::var_os("RIVEMU_STATS").is_some() {
         let secs = started.elapsed().as_secs_f64();

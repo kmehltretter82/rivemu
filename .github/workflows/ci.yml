@@ -55,7 +55,7 @@ jobs:
           path: images/linux-test
           key: linux-test-${{ hashFiles('scripts/fetch-linux-test.sh') }}
       - run: scripts/fetch-linux-test.sh
-      - run: cargo test --release -p rivemu-machine --test linux_boot -- --nocapture
+      - run: cargo test --release -p rivemu-machine --test linux_boot -- --nocapture --test-threads=1
         env:
           RIVEMU_REQUIRE_LINUX_TEST: 1
 
