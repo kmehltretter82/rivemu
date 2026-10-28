@@ -2,11 +2,15 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rivemu_core::{AccessSize, GuestAddr};
 use thiserror::Error;
 
 use crate::{MmioDevice, Ram};
+
+/// Number of 64-byte cache-line buckets in the reservation directory.
+const RESERVATION_BUCKETS: usize = 4096;
 
 /// Error returned by guest-visible bus accesses. The CPU turns these into
 /// access-fault exceptions.
@@ -125,18 +129,69 @@ impl Region {
 }
 
 /// The guest physical address space.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AddressSpace {
     /// Sorted by `base`, non-overlapping.
     regions: Vec<Region>,
     /// Largest mapped RAM region `(base, size, ram)` for O(1) main-memory access.
     fast_ram: Option<(GuestAddr, u64, Arc<Ram>)>,
+    /// 64-byte cache-line reservation sequence counters `(gen << 1) | active_bit`.
+    line_seq: Box<[AtomicU64]>,
+}
+
+impl Default for AddressSpace {
+    fn default() -> Self {
+        Self {
+            regions: Vec::new(),
+            fast_ram: None,
+            line_seq: (0..RESERVATION_BUCKETS)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
 }
 
 impl AddressSpace {
     /// Creates an empty address space.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Marks the 64-byte cache line containing `addr` as having an active `LR`
+    /// reservation and returns its odd sequence token `(gen << 1) | 1`.
+    #[inline]
+    pub fn reserve_cache_line(&self, addr: GuestAddr) -> u64 {
+        let idx = ((addr >> 6) as usize) & (RESERVATION_BUCKETS - 1);
+        self.line_seq[idx].fetch_or(1, Ordering::SeqCst) | 1
+    }
+
+    /// Invalidates any active `LR` reservation on the 64-byte cache line(s)
+    /// touched by a write of `size` bytes at `addr`.
+    #[inline]
+    pub fn invalidate_cache_line(&self, addr: GuestAddr, size: AccessSize) {
+        let idx = ((addr >> 6) as usize) & (RESERVATION_BUCKETS - 1);
+        let s = self.line_seq[idx].load(Ordering::Relaxed);
+        if s & 1 != 0 {
+            self.invalidate_bucket_slow(idx, s);
+        }
+        if (addr & 63) + size.bytes() > 64 {
+            let idx2 = (idx + 1) & (RESERVATION_BUCKETS - 1);
+            let s2 = self.line_seq[idx2].load(Ordering::Relaxed);
+            if s2 & 1 != 0 {
+                self.invalidate_bucket_slow(idx2, s2);
+            }
+        }
+    }
+
+    #[cold]
+    fn invalidate_bucket_slow(&self, idx: usize, s: u64) {
+        let _ = self.line_seq[idx].compare_exchange(
+            s,
+            s.wrapping_add(1) & !1,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        );
     }
 
     /// All regions, sorted by base address.
@@ -266,12 +321,13 @@ impl AddressSpace {
         if let Some((base, len, ref ram)) = self.fast_ram {
             let off = addr.wrapping_sub(base);
             if off < len {
-                return ram
-                    .write(off, size, value)
+                ram.write(off, size, value)
                     .ok_or(BusError::CrossesBoundary {
                         addr,
                         size: size.bytes(),
-                    });
+                    })?;
+                self.invalidate_cache_line(addr, size);
+                return Ok(());
             }
         }
         self.write_slow(addr, size, value)
@@ -282,11 +338,40 @@ impl AddressSpace {
         let r = self.find_access(addr, size)?;
         let off = addr - r.base;
         match &r.kind {
-            RegionKind::Ram(m) => m.write(off, size, value).expect("region bounds checked"),
+            RegionKind::Ram(m) => {
+                m.write(off, size, value).expect("region bounds checked");
+                self.invalidate_cache_line(addr, size);
+            }
             RegionKind::Rom(_) => return Err(BusError::ReadOnly { addr }),
             RegionKind::Mmio(dev) => dev.write(off, size, value & size.mask()),
         }
         Ok(())
+    }
+
+    /// Atomic store-conditional (`sc.w` / `sc.d`) honouring 64-byte cache-line
+    /// reservation exclusivity and ABA detection.
+    #[inline]
+    pub fn store_conditional(
+        &self,
+        addr: GuestAddr,
+        size: AccessSize,
+        expected_seq: u64,
+        expected_val: u64,
+        new: u64,
+    ) -> Result<bool, BusError> {
+        let idx = ((addr >> 6) as usize) & (RESERVATION_BUCKETS - 1);
+        if self.line_seq[idx]
+            .compare_exchange(
+                expected_seq,
+                expected_seq.wrapping_add(1) & !1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return Ok(false);
+        }
+        self.compare_exchange(addr, size, expected_val, new)
     }
 
     /// Atomic compare-and-exchange on guest RAM (`sc.w` / `sc.d`).
@@ -298,26 +383,39 @@ impl AddressSpace {
         expected: u64,
         new: u64,
     ) -> Result<bool, BusError> {
-        if let Some((base, len, ref ram)) = self.fast_ram {
+        let ok = if let Some((base, len, ref ram)) = self.fast_ram {
             let off = addr.wrapping_sub(base);
             if off < len {
-                return ram.compare_exchange(off, size, expected, new).ok_or(
+                let ok = ram.compare_exchange(off, size, expected, new).ok_or(
                     BusError::CrossesBoundary {
                         addr,
                         size: size.bytes(),
                     },
-                );
+                )?;
+                if ok {
+                    self.invalidate_cache_line(addr, size);
+                }
+                return Ok(ok);
             }
-        }
+            false
+        } else {
+            false
+        };
+        let _ = ok;
         let r = self.find_access(addr, size)?;
         let off = addr - r.base;
         match &r.kind {
             RegionKind::Ram(m) => {
-                m.compare_exchange(off, size, expected, new)
-                    .ok_or(BusError::CrossesBoundary {
+                let ok = m.compare_exchange(off, size, expected, new).ok_or(
+                    BusError::CrossesBoundary {
                         addr,
                         size: size.bytes(),
-                    })
+                    },
+                )?;
+                if ok {
+                    self.invalidate_cache_line(addr, size);
+                }
+                Ok(ok)
             }
             RegionKind::Rom(_) => Err(BusError::ReadOnly { addr }),
             RegionKind::Mmio(_) => Err(BusError::NotMemory { addr }),
@@ -335,21 +433,29 @@ impl AddressSpace {
         if let Some((base, len, ref ram)) = self.fast_ram {
             let off = addr.wrapping_sub(base);
             if off < len {
-                return ram
+                let old = ram
                     .atomic_rmw(off, size, f)
                     .ok_or(BusError::CrossesBoundary {
                         addr,
                         size: size.bytes(),
-                    });
+                    })?;
+                self.invalidate_cache_line(addr, size);
+                return Ok(old);
             }
         }
         let r = self.find_access(addr, size)?;
         let off = addr - r.base;
         match &r.kind {
-            RegionKind::Ram(m) => m.atomic_rmw(off, size, f).ok_or(BusError::CrossesBoundary {
-                addr,
-                size: size.bytes(),
-            }),
+            RegionKind::Ram(m) => {
+                let old = m
+                    .atomic_rmw(off, size, f)
+                    .ok_or(BusError::CrossesBoundary {
+                        addr,
+                        size: size.bytes(),
+                    })?;
+                self.invalidate_cache_line(addr, size);
+                Ok(old)
+            }
             RegionKind::Rom(_) => Err(BusError::ReadOnly { addr }),
             RegionKind::Mmio(_) => Err(BusError::NotMemory { addr }),
         }
@@ -563,5 +669,37 @@ mod tests {
             Err(BusError::NotMemory { addr: 0x1000_0000 })
         );
         a.load_bytes(0x8000_0000, &[]).unwrap();
+    }
+
+    #[test]
+    fn cache_line_reservation_and_aba_invalidation() {
+        let (a, _) = space();
+        let line0 = 0x8000_0100;
+        a.write(line0, AccessSize::Double, 0x1111).unwrap();
+
+        // 1. Store to a different word in the same 64-byte cache line invalidates LR.
+        let seq = a.reserve_cache_line(line0);
+        a.write(line0 + 32, AccessSize::Word, 0x9999).unwrap();
+        assert!(
+            !a.store_conditional(line0, AccessSize::Double, seq, 0x1111, 0x2222)
+                .unwrap()
+        );
+
+        // 2. ABA store (writing the exact same value back to line0) invalidates LR.
+        let seq = a.reserve_cache_line(line0);
+        a.write(line0, AccessSize::Double, 0x1111).unwrap();
+        assert!(
+            !a.store_conditional(line0, AccessSize::Double, seq, 0x1111, 0x2222)
+                .unwrap()
+        );
+
+        // 3. Store to a different 64-byte cache line (line0 + 64) preserves LR.
+        let seq = a.reserve_cache_line(line0);
+        a.write(line0 + 64, AccessSize::Double, 0x5555).unwrap();
+        assert!(
+            a.store_conditional(line0, AccessSize::Double, seq, 0x1111, 0x2222)
+                .unwrap()
+        );
+        assert_eq!(a.read(line0, AccessSize::Double).unwrap(), 0x2222);
     }
 }

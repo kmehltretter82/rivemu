@@ -3,7 +3,7 @@
 use rivemu_core::AccessSize;
 use rivemu_mem::AddressSpace;
 
-use crate::csr::status;
+use crate::csr::{PMP_ENTRIES, envcfg, status};
 use crate::hart::{Exception, Hart, Priv, cause};
 use crate::log::LogFlags;
 
@@ -121,6 +121,103 @@ impl Hart {
         }
     }
 
+    /// Recomputes whether PMP permission checks need to run on memory accesses.
+    pub fn update_pmp_state(&mut self) {
+        let any_active = self.csr.pmpcfg.iter().any(|&c| c & 0x18 != 0);
+        // Entry 0 as an unlocked NAPOT catch-all (`R|W|X`) covering >= 56 bits
+        // grants unconditional access to all privileges, so fast paths can skip
+        // per-access PMP table scans.
+        let full_open_entry0 =
+            (self.csr.pmpcfg[0] & 0x9f) == 0x1f && (!self.csr.pmpaddr[0]).trailing_zeros() >= 53;
+        self.pmp_enforced = !full_open_entry0 && (any_active || self.strict_pmp);
+    }
+
+    /// Returns the inclusive physical address range `(lo, hi_inclusive)` matched
+    /// by PMP entry `i`, or `None` if the entry is `OFF` or empty (`TOR` with `lo >= hi`).
+    fn pmp_entry_range(&self, i: usize) -> Option<(u64, u64)> {
+        let cfg = self.csr.pmpcfg[i];
+        match (cfg >> 3) & 3 {
+            0 => None,
+            1 => {
+                let lo = if i == 0 {
+                    0
+                } else {
+                    self.csr.pmpaddr[i - 1] << 2
+                };
+                let hi = self.csr.pmpaddr[i] << 2;
+                if lo >= hi { None } else { Some((lo, hi - 1)) }
+            }
+            2 => {
+                let lo = self.csr.pmpaddr[i] << 2;
+                Some((lo, lo.saturating_add(3)))
+            }
+            _ => {
+                let addr = self.csr.pmpaddr[i];
+                let ones = (!addr).trailing_zeros();
+                if ones >= 61 {
+                    Some((0, u64::MAX))
+                } else {
+                    let mask = (1u64 << (ones + 3)) - 1;
+                    let lo = (addr << 2) & !mask;
+                    Some((lo, lo | mask))
+                }
+            }
+        }
+    }
+
+    /// Checks `[pa, pa + size - 1]` against the 16 PMP entries per RISC-V
+    /// Privileged Spec Section 3.7.
+    #[cold]
+    pub(crate) fn pmp_check(&self, pa: u64, size: u64, prv: Priv, acc: Access) -> bool {
+        let last = pa.saturating_add(size.saturating_sub(1));
+        let mut any_active = false;
+        for i in 0..PMP_ENTRIES {
+            let cfg = self.csr.pmpcfg[i];
+            if cfg & 0x18 != 0 {
+                any_active = true;
+            }
+            let Some((lo, hi)) = self.pmp_entry_range(i) else {
+                continue;
+            };
+            if pa <= hi && last >= lo {
+                // Accesses straddling a PMP boundary must fault.
+                if pa < lo || last > hi {
+                    return false;
+                }
+                // Unlocked M-mode accesses always succeed.
+                if prv == Priv::Machine && cfg & 0x80 == 0 {
+                    return true;
+                }
+                return match acc {
+                    Access::Fetch => cfg & 0x04 != 0,
+                    Access::Load => {
+                        cfg & 0x01 != 0 || (self.csr.mstatus & status::MXR != 0 && cfg & 0x04 != 0)
+                    }
+                    Access::Store => cfg & 0x02 != 0,
+                };
+            }
+        }
+        if prv == Priv::Machine {
+            true
+        } else {
+            !self.strict_pmp && !any_active
+        }
+    }
+
+    #[inline]
+    pub(crate) fn check_pmp_access(
+        &self,
+        va: u64,
+        pa: u64,
+        size: u64,
+        acc: Access,
+    ) -> Result<(), Exception> {
+        if self.pmp_enforced && !self.pmp_check(pa, size, self.effective_priv(acc), acc) {
+            return Err(acc.access_fault(va));
+        }
+        Ok(())
+    }
+
     /// Translates a virtual address.
     #[inline]
     pub(crate) fn translate(
@@ -132,6 +229,9 @@ impl Hart {
         let prv = self.effective_priv(acc);
         let mode = self.csr.satp >> 60;
         if prv == Priv::Machine || mode == 0 {
+            if self.pmp_enforced && !self.pmp_check(va, 1, prv, acc) {
+                return Err(acc.access_fault(va));
+            }
             return Ok(va);
         }
         let tag = (va >> 12) + 1;
@@ -142,9 +242,17 @@ impl Hart {
             && self.pte_permits(flags, prv, acc)
             && (acc != Access::Store || flags & pte::D != 0)
         {
-            return Ok(e.pa_page | (va & 0xfff));
+            let pa = e.pa_page | (va & 0xfff);
+            if self.pmp_enforced && !self.pmp_check(pa, 1, prv, acc) {
+                return Err(acc.access_fault(va));
+            }
+            return Ok(pa);
         }
-        self.walk(bus, va, acc, prv, mode)
+        let pa = self.walk(bus, va, acc, prv, mode)?;
+        if self.pmp_enforced && !self.pmp_check(pa, 1, prv, acc) {
+            return Err(acc.access_fault(va));
+        }
+        Ok(pa)
     }
 
     /// Side-effect-free virtual-to-physical translation for debuggers (GDB).
@@ -228,6 +336,9 @@ impl Hart {
         for level in (0..levels).rev() {
             let idx = (va >> (12 + 9 * level)) & 0x1ff;
             let pte_addr = table + idx * 8;
+            if self.pmp_enforced && !self.pmp_check(pte_addr, 8, Priv::Supervisor, Access::Load) {
+                return Err(acc.access_fault(va));
+            }
             let pte = bus
                 .read(pte_addr, AccessSize::Double)
                 .map_err(|_| acc.access_fault(va))?;
@@ -251,12 +362,25 @@ impl Hart {
             if ppn & low_mask != 0 {
                 return Err(acc.page_fault(va)); // misaligned superpage
             }
+            // Svade vs Svadu: when Svade is active (`self.svade` and `menvcfg.ADUE == 0`),
+            // missing A (or D on a store) raises a page fault instead of updating the PTE.
+            if self.svade
+                && self.csr.menvcfg & envcfg::ADUE == 0
+                && (pte & pte::A == 0 || (acc == Access::Store && pte & pte::D == 0))
+            {
+                return Err(acc.page_fault(va));
+            }
             // Hardware A/D update.
             let mut new = pte | pte::A;
             if acc == Access::Store {
                 new |= pte::D;
             }
             if new != pte {
+                if self.pmp_enforced
+                    && !self.pmp_check(pte_addr, 8, Priv::Supervisor, Access::Store)
+                {
+                    return Err(acc.access_fault(va));
+                }
                 bus.write(pte_addr, AccessSize::Double, new)
                     .map_err(|_| acc.access_fault(va))?;
             }

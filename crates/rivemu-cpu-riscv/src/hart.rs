@@ -117,6 +117,14 @@ impl Default for IcacheEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Reservation {
+    pa: u64,
+    size: AccessSize,
+    val: u64,
+    seq: u64,
+}
+
 /// One RISC-V hart.
 pub struct Hart {
     /// Hart ID (`mhartid`).
@@ -136,8 +144,8 @@ pub struct Hart {
     /// Waiting for an interrupt (`wfi`).
     pub wfi: bool,
     timebase: Arc<dyn Timebase>,
-    /// LR reservation: (physical address, loaded value).
-    reservation: Option<(u64, u64)>,
+    /// Active 64-byte cache-line `LR` reservation.
+    reservation: Option<Reservation>,
     pub(crate) tlb: Tlb,
     icache: Box<[IcacheEntry; ICACHE_SIZE]>,
     icache_gen: u16,
@@ -166,6 +174,14 @@ pub struct Hart {
     pub pending_semihost: bool,
     /// Whether the hart is parked in the SBI HSM `STOPPED` state.
     pub hsm_stopped: bool,
+    /// Trap on any unaligned scalar load or store (`LOAD_MISALIGNED` / `STORE_MISALIGNED`).
+    pub strict_align: bool,
+    /// Enforce `Svade` page-table rules (page fault when `pte.A == 0` or `pte.D == 0` on store).
+    pub svade: bool,
+    /// Enforce strict PMP rules (deny S/U-mode access even when all PMP entries are `OFF`).
+    pub strict_pmp: bool,
+    /// Cached flag indicating that per-access PMP permission checks are required.
+    pub(crate) pmp_enforced: bool,
 }
 
 impl std::fmt::Debug for Hart {
@@ -213,6 +229,10 @@ impl Hart {
             pending_sbi: false,
             pending_semihost: false,
             hsm_stopped: false,
+            strict_align: false,
+            svade: false,
+            strict_pmp: false,
+            pmp_enforced: false,
         }
     }
 
@@ -233,6 +253,7 @@ impl Hart {
         self.pending_sbi = false;
         self.pending_semihost = false;
         self.hsm_stopped = false;
+        self.update_pmp_state();
     }
 
     /// Resets the hart directly into S-mode for built-in Rust SBI boot or
@@ -243,11 +264,14 @@ impl Hart {
         self.x[10] = self.id;
         self.x[11] = opaque;
         self.csr.mstatus = (2 << 32) | (2 << 34);
-        self.csr.medeleg = 0xb109;
+        self.csr.medeleg = 0xb1ff;
         self.csr.mideleg = irq::S_MASK;
         self.csr.mcounteren = 0xffff_ffff;
         self.csr.scounteren = 0xffff_ffff;
         self.csr.menvcfg = envcfg::STCE;
+        self.csr.pmpaddr[0] = (1 << 54) - 1;
+        self.csr.pmpcfg[0] = 0x1f;
+        self.update_pmp_state();
         self.handle_sbi = true;
         self.hsm_stopped = false;
     }
@@ -453,7 +477,7 @@ impl Hart {
         let pc = self.pc;
         if pc & 0xfff <= 0xffc {
             let vpn_tag = (pc >> 12) + 1;
-            let pa = if self.fetch_vpn == vpn_tag {
+            let pa = if !self.pmp_enforced && self.fetch_vpn == vpn_tag {
                 self.fetch_pa_page | (pc & 0xfff)
             } else {
                 let pa = self.translate(bus, pc, Access::Fetch)?;
@@ -466,6 +490,9 @@ impl Hart {
                 let tag = (pa << 16) | u64::from(self.icache_gen);
                 let entry = &self.icache[idx];
                 if entry.tag == tag {
+                    if self.pmp_enforced {
+                        self.check_pmp_access(pc, pa, u64::from(entry.insn.len), Access::Fetch)?;
+                    }
                     return Ok(entry.insn);
                 }
                 let insn = self.fetch_decode_same_page(bus, pc, pa)?;
@@ -490,12 +517,14 @@ impl Hart {
         pc: u64,
         pa: u64,
     ) -> Result<Insn, Exception> {
+        self.check_pmp_access(pc, pa, 2, Access::Fetch)?;
         let lo = bus
             .read(pa, AccessSize::Half)
             .map_err(|_| Exception::new(cause::INSN_ACCESS, pc))? as u16;
         if lo & 3 != 3 {
             return Ok(decode_compressed(lo));
         }
+        self.check_pmp_access(pc + 2, pa + 2, 2, Access::Fetch)?;
         let hi = bus
             .read(pa + 2, AccessSize::Half)
             .map_err(|_| Exception::new(cause::INSN_ACCESS, pc + 2))?;
@@ -505,6 +534,7 @@ impl Hart {
     #[cold]
     fn fetch_slow(&mut self, bus: &AddressSpace, pc: u64) -> Result<Insn, Exception> {
         let pa = self.translate(bus, pc, Access::Fetch)?;
+        self.check_pmp_access(pc, pa, 2, Access::Fetch)?;
         let lo = bus
             .read(pa, AccessSize::Half)
             .map_err(|_| Exception::new(cause::INSN_ACCESS, pc))? as u16;
@@ -516,6 +546,7 @@ impl Hart {
         } else {
             pa + 2
         };
+        self.check_pmp_access(pc + 2, pa_hi, 2, Access::Fetch)?;
         let hi = bus
             .read(pa_hi, AccessSize::Half)
             .map_err(|_| Exception::new(cause::INSN_ACCESS, pc + 2))?;
@@ -531,10 +562,14 @@ impl Hart {
         size: AccessSize,
     ) -> Result<u64, Exception> {
         let n = size.bytes();
+        if self.strict_align && va & (n - 1) != 0 {
+            return Err(Exception::new(cause::LOAD_MISALIGNED, va));
+        }
         if (va & 0xfff) + n > 0x1000 {
             return self.load_page_cross(bus, va, n);
         }
         let pa = self.translate(bus, va, Access::Load)?;
+        self.check_pmp_access(va, pa, n, Access::Load)?;
         bus.read(pa, size).map_err(|e| {
             if self.log_flags.has(LogFlags::GUEST_ERRORS) {
                 self.log_guest_error(format_args!("load fault at va={va:#x} pa={pa:#x}: {e}"));
@@ -562,10 +597,14 @@ impl Hart {
         value: u64,
     ) -> Result<(), Exception> {
         let n = size.bytes();
+        if self.strict_align && va & (n - 1) != 0 {
+            return Err(Exception::new(cause::STORE_MISALIGNED, va));
+        }
         if (va & 0xfff) + n > 0x1000 {
             return self.store_page_cross(bus, va, n, value);
         }
         let pa = self.translate(bus, va, Access::Store)?;
+        self.check_pmp_access(va, pa, n, Access::Store)?;
         self.invalidate_reservation(pa);
         if pa < 0x8000_0000 {
             self.check_irq = true;
@@ -600,10 +639,8 @@ impl Hart {
 
     #[inline]
     fn invalidate_reservation(&mut self, pa: u64) {
-        if let Some((r, _)) = self.reservation {
-            if r & !7 == pa & !7 {
-                self.reservation = None;
-            }
+        if self.reservation.is_some_and(|r| r.pa & !63 == pa & !63) {
+            self.reservation = None;
         }
     }
 
@@ -971,17 +1008,25 @@ impl Hart {
         match insn.op {
             Op::Lr => {
                 let pa = self.translate(bus, addr, Access::Load)?;
+                self.check_pmp_access(addr, pa, size.bytes(), Access::Load)?;
+                let seq = bus.reserve_cache_line(pa);
                 let v = bus
                     .read(pa, size)
                     .map_err(|_| Exception::new(cause::LOAD_ACCESS, addr))?;
-                self.reservation = Some((pa, v));
+                self.reservation = Some(Reservation {
+                    pa,
+                    size,
+                    val: v,
+                    seq,
+                });
                 self.set_x(insn.rd, fix(v));
             }
             Op::Sc => {
                 let pa = self.translate(bus, addr, Access::Store)?;
+                self.check_pmp_access(addr, pa, size.bytes(), Access::Store)?;
                 let ok = match self.reservation.take() {
-                    Some((r, v)) if r == pa => bus
-                        .compare_exchange(pa, size, v, src)
+                    Some(r) if r.pa == pa && r.size == size => bus
+                        .store_conditional(pa, size, r.seq, r.val, src)
                         .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?,
                     _ => false,
                 };
@@ -989,6 +1034,7 @@ impl Hart {
             }
             _ => {
                 let pa = self.translate(bus, addr, Access::Store)?;
+                self.check_pmp_access(addr, pa, size.bytes(), Access::Store)?;
                 let b = fix(src);
                 let funct = insn.funct;
                 let dbl = insn.dbl;
@@ -1247,7 +1293,7 @@ impl Hart {
             csr::MIE => self.csr.mie = v & irq::ALL,
             csr::MTVEC => self.csr.mtvec = v & !2,
             csr::MCOUNTEREN => self.csr.mcounteren = v & 0xffff_ffff,
-            csr::MENVCFG => self.csr.menvcfg = v & (envcfg::FIOM | envcfg::STCE),
+            csr::MENVCFG => self.csr.menvcfg = v & (envcfg::FIOM | envcfg::ADUE | envcfg::STCE),
             csr::MCOUNTINHIBIT => self.csr.mcountinhibit = v & 0xffff_fffd,
             csr::MHPMEVENT3..=csr::MHPMEVENT31 => {}
             csr::MSCRATCH => self.csr.mscratch = v,
@@ -1278,11 +1324,17 @@ impl Hart {
                     }
                     self.csr.pmpcfg[e] = b;
                 }
+                self.update_pmp_state();
+                self.flush_tlb();
             }
             csr::PMPADDR0..=csr::PMPADDR63 => {
                 let n = (num - csr::PMPADDR0) as usize;
-                if n < csr::PMP_ENTRIES && self.csr.pmpcfg[n] & 0x80 == 0 {
+                let tor_locked =
+                    n + 1 < csr::PMP_ENTRIES && (self.csr.pmpcfg[n + 1] & 0x98) == 0x88;
+                if n < csr::PMP_ENTRIES && self.csr.pmpcfg[n] & 0x80 == 0 && !tor_locked {
                     self.csr.pmpaddr[n] = v & ((1 << 54) - 1);
+                    self.update_pmp_state();
+                    self.flush_tlb();
                 }
             }
             csr::TSELECT..=csr::TDATA3 | csr::TINFO => {}

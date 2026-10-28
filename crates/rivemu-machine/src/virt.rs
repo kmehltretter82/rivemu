@@ -120,6 +120,12 @@ pub struct MachineConfig {
     pub virtio: Vec<VirtioDeviceConfig>,
     /// Deterministic instruction-count timing shift (`-icount [shift=]N`).
     pub icount: Option<u8>,
+    /// Trap on any unaligned scalar load or store (`LOAD_MISALIGNED` / `STORE_MISALIGNED`).
+    pub strict_align: bool,
+    /// Enforce `Svade` page-table rules (page fault when `pte.A == 0` or `pte.D == 0` on store).
+    pub svade: bool,
+    /// Enforce strict PMP rules (deny S/U-mode access even when all PMP entries are `OFF`).
+    pub strict_pmp: bool,
 }
 
 impl Default for MachineConfig {
@@ -134,6 +140,9 @@ impl Default for MachineConfig {
             append: None,
             virtio: Vec::new(),
             icount: None,
+            strict_align: false,
+            svade: false,
+            strict_pmp: false,
         }
     }
 }
@@ -334,7 +343,14 @@ impl Machine {
             None => timebase.clone(),
         };
         let mut harts: Vec<Hart> = (0..config.smp)
-            .map(|i| Hart::new(u64::from(i), tb.clone()))
+            .map(|i| {
+                let mut h = Hart::new(u64::from(i), tb.clone());
+                h.strict_align = config.strict_align;
+                h.svade = config.svade;
+                h.strict_pmp = config.strict_pmp;
+                h.update_pmp_state();
+                h
+            })
             .collect();
         let lines: Vec<Arc<HartIrqs>> = harts.iter().map(|h| h.irqs.clone()).collect();
         let clint = Arc::new(Clint::new(tb, lines.clone()));

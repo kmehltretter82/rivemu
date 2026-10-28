@@ -205,6 +205,7 @@ impl Machine {
             for addr in &mut h.csr.pmpaddr {
                 *addr = read_u64(&mut r)?;
             }
+            h.update_pmp_state();
             h.pending_sbi = false;
             h.pending_semihost = false;
             h.invalidate_tlb();

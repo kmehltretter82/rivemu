@@ -119,6 +119,7 @@ pub mod irq {
 /// `menvcfg` bits.
 pub mod envcfg {
     pub const FIOM: u64 = 1;
+    pub const ADUE: u64 = 1 << 61;
     pub const STCE: u64 = 1 << 63;
 }
 

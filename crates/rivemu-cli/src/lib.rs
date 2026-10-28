@@ -184,6 +184,12 @@ pub struct Options {
     pub savevm: Option<PathBuf>,
     /// `-run-init` guest ELF binary packaged on the fly as `/init` inside an ephemeral cpio initramfs.
     pub run_init: Option<PathBuf>,
+    /// Trap on any unaligned scalar load or store (`LOAD_MISALIGNED` / `STORE_MISALIGNED`).
+    pub strict_align: bool,
+    /// Enforce `Svade` page-table rules (page fault when `pte.A == 0` or `pte.D == 0` on store).
+    pub svade: bool,
+    /// Enforce strict PMP rules (deny S/U-mode access even when all PMP entries are `OFF`).
+    pub strict_pmp: bool,
 }
 
 impl Default for Options {
@@ -219,6 +225,9 @@ impl Default for Options {
             loadvm: None,
             savevm: None,
             run_init: None,
+            strict_align: false,
+            svade: false,
+            strict_pmp: false,
         }
     }
 }
@@ -313,10 +322,29 @@ where
             }
             "cpu" => {
                 let v = value()?;
-                let model = v.split(',').next().unwrap_or_default();
+                let c = opts(&name, &v, Some("model"))?;
+                let model = c.get("model").unwrap_or_default();
                 match model {
                     "help" => o.action = Action::CpuHelp,
-                    "rv64" | "max" => o.cpu = model.into(),
+                    "rv64" | "max" => {
+                        o.cpu = model.into();
+                        let flag = |val: &str| matches!(val, "on" | "true" | "1");
+                        for (k, val) in c.params() {
+                            match k.as_str() {
+                                "model" => {}
+                                "strict-align" | "strict_align" => o.strict_align = flag(val),
+                                "svade" => o.svade = flag(val),
+                                "pmp" | "strict-pmp" => o.strict_pmp = flag(val),
+                                "strict" => {
+                                    let on = flag(val);
+                                    o.strict_align = on;
+                                    o.svade = on;
+                                    o.strict_pmp = on;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     _ => {
                         return Err(invalid(
                             &name,
@@ -428,6 +456,11 @@ where
             "loadvm" => o.loadvm = Some(value()?.into()),
             "savevm" => o.savevm = Some(value()?.into()),
             "run-init" => o.run_init = Some(value()?.into()),
+            "strict" => {
+                o.strict_align = true;
+                o.svade = true;
+                o.strict_pmp = true;
+            }
             _ => return Err(CliError::InvalidOption(name)),
         }
     }
@@ -695,6 +728,9 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
         append,
         virtio,
         icount,
+        strict_align: o.strict_align,
+        svade: o.svade,
+        strict_pmp: o.strict_pmp,
     })
 }
 
@@ -707,7 +743,8 @@ usage: {PROG} [options]
 
 Machine:
   -machine|-M virt[,prop=value...]  select machine (only 'virt'; '-M help' lists)
-  -cpu rv64|max                     select CPU model ('-cpu help' lists)
+  -cpu rv64[,strict-align=on][,svade=on][,pmp=on]  select CPU model ('-cpu help' lists)
+  -strict                           enable strict alignment, Svade page faults, and PMP
   -m [size=]N[KMG]                  guest RAM size (default 128M; unit M if omitted)
   -smp [cpus=]N                     number of harts
 

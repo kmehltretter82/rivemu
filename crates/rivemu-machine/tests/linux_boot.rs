@@ -71,6 +71,7 @@ fn run_linux_boot_test(use_external_opensbi: bool) {
             },
             VirtioDeviceConfig::Rng,
         ],
+        ..Default::default()
     };
     let mut machine = Machine::new(cfg.clone()).expect("machine init");
 
@@ -386,6 +387,9 @@ fn main() {
                 mount_tag: "host0".into(),
             },
         ],
+        strict_align: true,
+        svade: true,
+        strict_pmp: true,
     })
     .expect("machine init");
 

@@ -82,6 +82,7 @@ fn run() -> Result<i32> {
         });
     }
 
+    let strict = std::env::var_os("RIVEMU_STRICT").is_some();
     let mut machine = Machine::new(MachineConfig {
         ram_size: 256 * MIB,
         smp,
@@ -92,6 +93,9 @@ fn run() -> Result<i32> {
         append: Some(append),
         virtio,
         icount: None,
+        strict_align: strict,
+        svade: strict,
+        strict_pmp: strict,
     })
     .context("failed to initialise rivemu machine")?;
 

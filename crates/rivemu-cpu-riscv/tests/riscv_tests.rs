@@ -96,3 +96,203 @@ fn riscv_tests() {
         failures.join("\n  ")
     );
 }
+
+#[test]
+fn strict_align_traps_on_misaligned_loads_and_stores() {
+    use rivemu_cpu_riscv::cause;
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    // 0x8000_0000: lw x1, 2(x10)   (0x0025_2083)
+    // 0x8000_0004: sd x1, 4(x10)   (0x0015_3223)
+    bus.write(0x8000_0000, AccessSize::Word, 0x0025_2083)
+        .unwrap();
+    bus.write(0x8000_0004, AccessSize::Word, 0x0015_3223)
+        .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.strict_align = true;
+    h.reset(0x8000_0000);
+    h.csr.mtvec = 0x8000_0100;
+    h.x[10] = 0x8000_1000;
+
+    h.step(&bus);
+    assert_eq!(h.pc, 0x8000_0100);
+    assert_eq!(h.csr.mcause, cause::LOAD_MISALIGNED);
+    assert_eq!(h.csr.mtval, 0x8000_1002);
+
+    h.pc = 0x8000_0004;
+    h.step(&bus);
+    assert_eq!(h.pc, 0x8000_0100);
+    assert_eq!(h.csr.mcause, cause::STORE_MISALIGNED);
+    assert_eq!(h.csr.mtval, 0x8000_1004);
+}
+
+#[test]
+fn svade_faults_on_missing_a_and_d_bits() {
+    use rivemu_cpu_riscv::csr::envcfg;
+    use rivemu_cpu_riscv::{Priv, cause};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    // Sv39 1 GiB megapage leaf PTE at root index 2 (VA 0x8000_0000 -> PA 0x8000_0000):
+    // PPN = 0x80000, V|R|W|X (0x0f), but A=0, D=0 initially.
+    let root_pt = 0x8001_0000u64;
+    let pte_addr = root_pt + 2 * 8;
+    let pte_base = (0x80000u64 << 10) | 0x0f;
+    bus.write(pte_addr, AccessSize::Double, pte_base).unwrap();
+
+    // Code at 0x8000_0000:
+    //   lw x1, 0(x10)  (0x0005_2083)
+    //   sw x1, 0(x10)  (0x0015_2023)
+    bus.write(0x8000_0000, AccessSize::Word, 0x0005_2083)
+        .unwrap();
+    bus.write(0x8000_0004, AccessSize::Word, 0x0015_2023)
+        .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.svade = true;
+    h.reset(0x8000_0000);
+    h.prv = Priv::Supervisor;
+    h.csr.satp = (8u64 << 60) | (root_pt >> 12);
+    h.csr.medeleg = 0xffff;
+    h.csr.stvec = 0x8000_0200;
+    h.x[10] = 0x8000_2000;
+
+    // 1. With A=0, instruction fetch at 0x8000_0000 raises INSN_PAGE_FAULT (12).
+    h.step(&bus);
+    assert_eq!(h.csr.scause, cause::INSN_PAGE_FAULT);
+    assert_eq!(h.csr.stval, 0x8000_0000);
+    assert_eq!(bus.read(pte_addr, AccessSize::Double).unwrap(), pte_base);
+
+    // 2. OS sets A=1 (bit 6), leaving D=0 (bit 7). Fetch and load succeed, but store faults!
+    bus.write(pte_addr, AccessSize::Double, pte_base | (1 << 6))
+        .unwrap();
+    h.invalidate_tlb();
+    h.pc = 0x8000_0000;
+    h.step(&bus);
+    assert_eq!(h.pc, 0x8000_0004, "load with A=1 should succeed");
+    h.step(&bus);
+    assert_eq!(h.csr.scause, cause::STORE_PAGE_FAULT);
+    assert_eq!(h.csr.stval, 0x8000_2000);
+
+    // 3. Enabling menvcfg.ADUE allows hardware A/D updates even when h.svade is true.
+    h.csr.menvcfg |= envcfg::ADUE;
+    h.invalidate_tlb();
+    h.pc = 0x8000_0004;
+    h.step(&bus);
+    assert_eq!(h.pc, 0x8000_0008, "store with ADUE=1 should succeed");
+    assert_ne!(
+        bus.read(pte_addr, AccessSize::Double).unwrap() & (1 << 7),
+        0
+    );
+}
+
+#[test]
+fn pmp_enforces_napot_tor_na4_and_lock_bits() {
+    use rivemu_cpu_riscv::csr;
+    use rivemu_cpu_riscv::{Priv, cause};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    // 0x8000_0000: lw x1, 0(x10)  (0x0005_2083)
+    // 0x8000_0004: sw x1, 0(x10)  (0x0015_2023)
+    // 0x8000_0008: ld x1, 0(x10)  (0x0005_3083)
+    bus.write(0x8000_0000, AccessSize::Word, 0x0005_2083)
+        .unwrap();
+    bus.write(0x8000_0004, AccessSize::Word, 0x0015_2023)
+        .unwrap();
+    bus.write(0x8000_0008, AccessSize::Word, 0x0005_3083)
+        .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(0x8000_0000);
+    h.csr.mtvec = 0x8000_0100;
+    h.x[10] = 0x8000_2000;
+
+    // Entry 0: NA4 (4-byte region) at 0x8000_2000 with R=1, W=0, X=0 (cfg = 0x11).
+    // Entry 1: NAPOT catch-all covering all physical memory with R|W|X (cfg = 0x1f).
+    h.csr_write(csr::PMPADDR0, 0x8000_2000 >> 2).unwrap();
+    h.csr_write(csr::PMPADDR0 + 1, (1u64 << 54) - 1).unwrap();
+    h.csr_write(csr::PMPCFG0, 0x11 | (0x1f << 8)).unwrap();
+
+    // In S-mode: 4-byte load at 0x8000_2000 succeeds, 4-byte store faults, and
+    // 8-byte load straddling the 4-byte NA4 boundary faults!
+    h.prv = Priv::Supervisor;
+    h.step(&bus);
+    assert_eq!(h.pc, 0x8000_0004, "S-mode read of R=1 NA4 region succeeds");
+
+    h.step(&bus);
+    assert_eq!(h.csr.mcause, cause::STORE_ACCESS);
+    assert_eq!(h.csr.mtval, 0x8000_2000);
+
+    h.prv = Priv::Supervisor;
+    h.pc = 0x8000_0008;
+    h.step(&bus);
+    assert_eq!(
+        h.csr.mcause,
+        cause::LOAD_ACCESS,
+        "8-byte load straddling 4-byte NA4 PMP boundary must fault"
+    );
+
+    // Lock Entry 0 (L=1, NA4, R=1, W=0 -> 0x91): now even M-mode stores must fault,
+    // and writes to PMPADDR0 / PMPCFG0[0] are ignored!
+    h.csr_write(csr::PMPCFG0, 0x91 | (0x1f << 8)).unwrap();
+    h.csr_write(csr::PMPADDR0, 0).unwrap();
+    assert_eq!(h.csr.pmpaddr[0], 0x8000_2000 >> 2);
+
+    h.prv = Priv::Machine;
+    h.pc = 0x8000_0004;
+    h.step(&bus);
+    assert_eq!(
+        h.csr.mcause,
+        cause::STORE_ACCESS,
+        "locked PMP entry must also fault in M-mode"
+    );
+}
+
+#[test]
+fn lr_sc_64byte_cache_line_granularity_across_harts() {
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    // Code at 0x8000_0000:
+    //   0x00: lr.d x1, (x10)       (0x1005_30af)
+    //   0x04: sc.d x2, x11, (x10)  (0x18b5_312f)
+    bus.write(0x8000_0000, AccessSize::Word, 0x1005_30af)
+        .unwrap();
+    bus.write(0x8000_0004, AccessSize::Word, 0x18b5_312f)
+        .unwrap();
+
+    let mut h0 = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    let mut h1 = Hart::new(1, Arc::new(FrozenTimebase(0)));
+    h0.reset(0x8000_0000);
+    h1.reset(0x8000_0000);
+
+    // Both harts target DIFFERENT 8-byte words inside the SAME 64-byte cache line:
+    // h0 at 0x8000_1000, h1 at 0x8000_1020 (+32 bytes).
+    h0.x[10] = 0x8000_1000;
+    h0.x[11] = 0xaaaa;
+    h1.x[10] = 0x8000_1020;
+    h1.x[11] = 0xbbbb;
+
+    // Both harts execute lr.d on the same 64-byte cache line.
+    h0.step(&bus);
+    h1.step(&bus);
+
+    // h0 executes sc.d first -> succeeds (x2 == 0).
+    h0.step(&bus);
+    assert_eq!(h0.x[2], 0);
+    assert_eq!(bus.read(0x8000_1000, AccessSize::Double).unwrap(), 0xaaaa);
+
+    // h1 executes sc.d second -> fails (x2 == 1) because h0's store to the same
+    // 64-byte cache line invalidated h1's reservation!
+    h1.step(&bus);
+    assert_eq!(h1.x[2], 1);
+    assert_eq!(bus.read(0x8000_1020, AccessSize::Double).unwrap(), 0);
+}
