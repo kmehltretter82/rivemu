@@ -331,6 +331,99 @@ fn pmp_enforces_napot_tor_na4_and_lock_bits() {
 }
 
 #[test]
+fn pmp_mxr_does_not_make_execute_only_region_readable() {
+    use rivemu_cpu_riscv::csr;
+    use rivemu_cpu_riscv::csr::status;
+    use rivemu_cpu_riscv::{Priv, cause};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    const TRAP: u64 = 0x8000_0100;
+    const DATA: u64 = 0x8000_2000;
+    bus.write(CODE, AccessSize::Word, 0x0005_2083) // lw x1, 0(x10)
+        .unwrap();
+    bus.write(DATA, AccessSize::Word, 0x1234_5678).unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mtvec = TRAP;
+    h.x[10] = DATA;
+
+    // Entry 0 is an exact NA4 execute-only data region. Entry 1 is a NAPOT
+    // catch-all so S-mode instruction fetch remains permitted.
+    h.csr_write(csr::PMPADDR0, DATA >> 2).unwrap();
+    h.csr_write(csr::PMPADDR0 + 1, (1u64 << 54) - 1).unwrap();
+    h.csr_write(csr::PMPCFG0, 0x14 | (0x1f << 8)).unwrap();
+
+    h.csr.mstatus |= status::MXR;
+    h.prv = Priv::Supervisor;
+    h.step(&bus);
+
+    assert_eq!(h.pc, TRAP);
+    assert_eq!(h.csr.mcause, cause::LOAD_ACCESS);
+    assert_eq!(h.csr.mtval, DATA);
+}
+
+#[test]
+fn pmp_mxr_tlb_hit_does_not_bypass_execute_only_region() {
+    use rivemu_cpu_riscv::csr;
+    use rivemu_cpu_riscv::csr::status;
+    use rivemu_cpu_riscv::{Priv, cause};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    const TRAP: u64 = 0x8000_0100;
+    const DATA: u64 = 0x8000_2000;
+    const ROOT_PT: u64 = 0x8001_0000;
+    bus.write(CODE, AccessSize::Word, 0x0005_2083) // lw x1, 0(x10)
+        .unwrap();
+    bus.write(DATA, AccessSize::Word, 0x1234_5678).unwrap();
+
+    // Identity-map the low 1 GiB at 0x8000_0000 with an execute-only Sv39
+    // megapage. MXR permits the load through this PTE, but not through PMP.
+    let root_pte = (0x8000_0000 >> 2) | 0x49; // V|X|A
+    bus.write(ROOT_PT + 2 * 8, AccessSize::Double, root_pte)
+        .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mtvec = TRAP;
+    h.x[10] = DATA;
+    h.csr_write(csr::SATP, (8 << 60) | (ROOT_PT >> 12)).unwrap();
+
+    // Entry 0 is a page-aligned, execute-only NAPOT region covering DATA.
+    // Entry 1 permits the code and page-table memory. This page alignment
+    // reproduces the formerly vulnerable cached-translation path.
+    h.csr_write(csr::PMPADDR0, (DATA >> 2) | 0x1ff).unwrap();
+    h.csr_write(csr::PMPADDR0 + 1, (1u64 << 54) - 1).unwrap();
+    h.csr_write(csr::PMPCFG0, 0x1c | (0x1f << 8)).unwrap();
+
+    h.csr.mstatus |= status::MXR;
+    h.prv = Priv::Supervisor;
+
+    // The walk fills the TLB before the final PMP check rejects the load.
+    h.step(&bus);
+    assert_eq!(h.pc, TRAP);
+    assert_eq!(h.csr.mcause, cause::LOAD_ACCESS);
+    assert_eq!(h.csr.mtval, DATA);
+
+    // Retrying the same instruction must still enforce the independent PMP
+    // read permission when translation is served by the populated TLB entry.
+    h.pc = CODE;
+    h.prv = Priv::Supervisor;
+    h.step(&bus);
+    assert_eq!(h.pc, TRAP);
+    assert_eq!(h.csr.mcause, cause::LOAD_ACCESS);
+    assert_eq!(h.csr.mtval, DATA);
+}
+
+#[test]
 fn lr_sc_64byte_cache_line_granularity_across_harts() {
     let mut bus = AddressSpace::new();
     bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))

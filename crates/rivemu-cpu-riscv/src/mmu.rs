@@ -209,9 +209,7 @@ impl Hart {
                 }
                 return match acc {
                     Access::Fetch => cfg & 0x04 != 0,
-                    Access::Load => {
-                        cfg & 0x01 != 0 || (self.csr.mstatus & status::MXR != 0 && cfg & 0x04 != 0)
-                    }
+                    Access::Load => cfg & 0x01 != 0,
                     Access::Store => cfg & 0x02 != 0,
                 };
             }
@@ -265,7 +263,7 @@ impl Hart {
             && (acc != Access::Store || flags & pte::D != 0)
         {
             let pa = e.pa_page | (va & 0xfff);
-            if self.pmp_subpage && !self.pmp_check(pa, 1, prv, acc) {
+            if self.pmp_enforced && !self.pmp_check(pa, 1, prv, acc) {
                 return Err(acc.access_fault(va));
             }
             return Ok(pa);
@@ -421,23 +419,11 @@ impl Hart {
                     .map_err(|_| acc.access_fault(va))?;
             }
             let pa_page = (ppn | ((va >> 12) & low_mask)) << 12;
-            let mut tlb_flags = new as u8;
-            if self.pmp_enforced && !self.pmp_subpage {
-                if !self.pmp_check(pa_page, 4096, Priv::Supervisor, Access::Load) {
-                    tlb_flags &= !(pte::R as u8);
-                }
-                if !self.pmp_check(pa_page, 4096, Priv::Supervisor, Access::Store) {
-                    tlb_flags &= !(pte::W as u8);
-                }
-                if !self.pmp_check(pa_page, 4096, Priv::Supervisor, Access::Fetch) {
-                    tlb_flags &= !(pte::X as u8);
-                }
-            }
             self.tlb.entries[((va >> 12) as usize) & (TLB_SIZE - 1)] = TlbEntry {
                 tag: (va >> 12) + 1,
                 pa_page,
                 epoch: self.tlb.epoch,
-                flags: tlb_flags,
+                flags: new as u8,
             };
             return Ok(pa_page | (va & 0xfff));
         }
