@@ -1100,12 +1100,13 @@ impl Hart {
             Op::Sc => {
                 let pa = self.translate(bus, addr, Access::Store)?;
                 self.check_pmp_access(addr, pa, size.bytes(), Access::Store)?;
-                let ok = match self.reservation.take() {
-                    Some(r) if r.pa == pa && r.size == size => bus
-                        .store_conditional(pa, size, r.seq, r.val, src)
-                        .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?,
-                    _ => false,
+                let reservation = match self.reservation.take() {
+                    Some(r) if r.pa == pa && r.size == size => Some((r.seq, r.val)),
+                    _ => None,
                 };
+                let ok = bus
+                    .store_conditional(pa, size, reservation, src)
+                    .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
                 self.set_x(insn.rd, u64::from(!ok));
             }
             _ => {

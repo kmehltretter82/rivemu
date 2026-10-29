@@ -156,6 +156,55 @@ fn strict_align_traps_on_misaligned_loads_and_stores() {
 }
 
 #[test]
+fn failed_sc_checks_target_access_before_retiring() {
+    use rivemu_cpu_riscv::cause;
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    bus.add_rom("rom", 0x1000, Arc::new(Ram::new(0x100).unwrap()))
+        .unwrap();
+
+    // sc.w x5, x6, (x10), repeated for three independent target cases.
+    for pc in [0x8000_0000, 0x8000_0004, 0x8000_0008] {
+        bus.write(pc, AccessSize::Word, 0x1865_22af).unwrap();
+    }
+
+    let trap_pc = 0x8000_0100;
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(0x8000_0000);
+    h.csr.mtvec = trap_pc;
+    h.x[6] = 0xdead_beef;
+
+    h.x[5] = 0x1111;
+    h.x[10] = 0x4000_0000;
+    h.step(&bus);
+    assert_eq!(h.pc, trap_pc);
+    assert_eq!(h.csr.mcause, cause::STORE_ACCESS);
+    assert_eq!(h.csr.mtval, 0x4000_0000);
+    assert_eq!(h.x[5], 0x1111, "a trapping SC must not write rd");
+
+    h.pc = 0x8000_0004;
+    h.x[5] = 0x2222;
+    h.x[10] = 0x1000;
+    h.step(&bus);
+    assert_eq!(h.pc, trap_pc);
+    assert_eq!(h.csr.mcause, cause::STORE_ACCESS);
+    assert_eq!(h.csr.mtval, 0x1000);
+    assert_eq!(h.x[5], 0x2222, "a trapping SC must not write rd");
+
+    let target = 0x8000_1000;
+    bus.write(target, AccessSize::Word, 0x5566_7788).unwrap();
+    h.pc = 0x8000_0008;
+    h.x[5] = 0x3333;
+    h.x[10] = target;
+    h.step(&bus);
+    assert_eq!(h.pc, 0x8000_000c);
+    assert_eq!(h.x[5], 1, "SC without a reservation must fail on valid RAM");
+    assert_eq!(bus.read(target, AccessSize::Word).unwrap(), 0x5566_7788);
+}
+
+#[test]
 fn svade_faults_on_missing_a_and_d_bits() {
     use rivemu_cpu_riscv::csr::envcfg;
     use rivemu_cpu_riscv::{Priv, cause};

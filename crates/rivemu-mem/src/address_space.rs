@@ -350,15 +350,28 @@ impl AddressSpace {
 
     /// Atomic store-conditional (`sc.w` / `sc.d`) honouring 64-byte cache-line
     /// reservation exclusivity and ABA detection.
+    ///
+    /// The target is validated even when the reservation has already failed:
+    /// architecturally, an `SC` may not retire before passing memory-permission
+    /// checks.
     #[inline]
     pub fn store_conditional(
         &self,
         addr: GuestAddr,
         size: AccessSize,
-        expected_seq: u64,
-        expected_val: u64,
+        reservation: Option<(u64, u64)>,
         new: u64,
     ) -> Result<bool, BusError> {
+        let target = self.find_access(addr, size)?;
+        match &target.kind {
+            RegionKind::Ram(_) => {}
+            RegionKind::Rom(_) => return Err(BusError::ReadOnly { addr }),
+            RegionKind::Mmio(_) => return Err(BusError::NotMemory { addr }),
+        }
+
+        let Some((expected_seq, expected_val)) = reservation else {
+            return Ok(false);
+        };
         let idx = ((addr >> 6) as usize) & (RESERVATION_BUCKETS - 1);
         if self.line_seq[idx]
             .compare_exchange(
@@ -681,7 +694,7 @@ mod tests {
         let seq = a.reserve_cache_line(line0);
         a.write(line0 + 32, AccessSize::Word, 0x9999).unwrap();
         assert!(
-            !a.store_conditional(line0, AccessSize::Double, seq, 0x1111, 0x2222)
+            !a.store_conditional(line0, AccessSize::Double, Some((seq, 0x1111)), 0x2222)
                 .unwrap()
         );
 
@@ -689,7 +702,7 @@ mod tests {
         let seq = a.reserve_cache_line(line0);
         a.write(line0, AccessSize::Double, 0x1111).unwrap();
         assert!(
-            !a.store_conditional(line0, AccessSize::Double, seq, 0x1111, 0x2222)
+            !a.store_conditional(line0, AccessSize::Double, Some((seq, 0x1111)), 0x2222)
                 .unwrap()
         );
 
@@ -697,9 +710,40 @@ mod tests {
         let seq = a.reserve_cache_line(line0);
         a.write(line0 + 64, AccessSize::Double, 0x5555).unwrap();
         assert!(
-            a.store_conditional(line0, AccessSize::Double, seq, 0x1111, 0x2222)
+            a.store_conditional(line0, AccessSize::Double, Some((seq, 0x1111)), 0x2222)
                 .unwrap()
         );
         assert_eq!(a.read(line0, AccessSize::Double).unwrap(), 0x2222);
+    }
+
+    #[test]
+    fn failed_store_conditional_still_checks_target_access() {
+        let (a, _) = space();
+        // There is no active reservation for any of these addresses.  SC must
+        // nevertheless validate the target before retiring with a failure code.
+        assert_eq!(
+            a.store_conditional(0x4000_0000, AccessSize::Word, None, 0x1234),
+            Err(BusError::Unmapped {
+                addr: 0x4000_0000,
+                size: 4
+            })
+        );
+        assert_eq!(
+            a.store_conditional(0x1000, AccessSize::Word, None, 0x1234),
+            Err(BusError::ReadOnly { addr: 0x1000 })
+        );
+        assert_eq!(
+            a.store_conditional(0x1000_0000, AccessSize::Word, None, 0x1234),
+            Err(BusError::NotMemory { addr: 0x1000_0000 })
+        );
+
+        // A stale reservation on ordinary RAM remains a normal SC failure and
+        // must leave memory untouched.
+        a.write(0x8000_0200, AccessSize::Word, 0x5566_7788).unwrap();
+        assert_eq!(
+            a.store_conditional(0x8000_0200, AccessSize::Word, None, 0xdead_beef),
+            Ok(false)
+        );
+        assert_eq!(a.read(0x8000_0200, AccessSize::Word).unwrap(), 0x5566_7788);
     }
 }
