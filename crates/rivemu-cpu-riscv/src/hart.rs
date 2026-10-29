@@ -1323,7 +1323,11 @@ impl Hart {
                 let m = self.csr.mideleg & irq::S_MASK;
                 self.csr.mie = (self.csr.mie & !m) | (v & m);
             }
-            csr::STVEC => self.csr.stvec = v & !2,
+            csr::STVEC => {
+                if v & 2 == 0 {
+                    self.csr.stvec = v;
+                }
+            }
             csr::SCOUNTEREN => self.csr.scounteren = v & 0xffff_ffff,
             csr::SENVCFG => self.csr.senvcfg = envcfg::sanitize(v, envcfg::S_MASK),
             csr::SSCRATCH => self.csr.sscratch = v,
@@ -1367,7 +1371,11 @@ impl Hart {
             csr::MEDELEG => self.csr.medeleg = v & csr::MEDELEG_MASK,
             csr::MIDELEG => self.csr.mideleg = v & irq::S_MASK,
             csr::MIE => self.csr.mie = v & irq::ALL,
-            csr::MTVEC => self.csr.mtvec = v & !2,
+            csr::MTVEC => {
+                if v & 2 == 0 {
+                    self.csr.mtvec = v;
+                }
+            }
             csr::MCOUNTEREN => self.csr.mcounteren = v & 0xffff_ffff,
             csr::MENVCFG => {
                 self.csr.menvcfg = envcfg::sanitize(v, envcfg::M_MASK);

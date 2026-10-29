@@ -98,6 +98,32 @@ fn riscv_tests() {
 }
 
 #[test]
+fn trap_vector_csrs_retain_value_for_reserved_modes() {
+    use rivemu_cpu_riscv::csr;
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+
+    for csr_num in [csr::MTVEC, csr::STVEC] {
+        let direct = 0x8000_0100;
+        assert_eq!(h.csr_write(csr_num, direct), Some(()));
+        assert_eq!(h.csr_read(csr_num), Some(direct));
+
+        let vectored = 0x8000_0201;
+        assert_eq!(h.csr_write(csr_num, vectored), Some(()));
+        assert_eq!(h.csr_read(csr_num), Some(vectored));
+
+        for reserved in [0x9000_0302, 0xa000_0403] {
+            assert_eq!(h.csr_write(csr_num, reserved), Some(()));
+            assert_eq!(
+                h.csr_read(csr_num),
+                Some(vectored),
+                "reserved MODE must retain the complete prior CSR value"
+            );
+        }
+    }
+}
+
+#[test]
 fn strict_align_traps_on_misaligned_loads_and_stores() {
     use rivemu_cpu_riscv::cause;
 
