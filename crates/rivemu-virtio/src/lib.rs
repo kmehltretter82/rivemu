@@ -329,7 +329,7 @@ mod tests {
     use super::*;
     use crate::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use rivemu_backends::{BlockBackend, BufferChardev, MemoryBlock};
-    use rivemu_mem::Ram;
+    use rivemu_mem::{AddressSpace, Ram};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Debug, Default)]
@@ -339,6 +339,13 @@ mod tests {
         fn set_level(&self, high: bool) {
             self.0.store(high, Ordering::SeqCst);
         }
+    }
+
+    fn test_dma(size: u64) -> DmaRam {
+        let ram = Arc::new(Ram::new(size).unwrap());
+        let mut bus = AddressSpace::new();
+        bus.add_ram("ram", 0x8000_0000, ram.clone()).unwrap();
+        DmaRam::new(0x8000_0000, ram, bus.reservation_invalidator())
     }
 
     fn setup_queue(mmio: &VirtioMmio, desc: u64, avail: u64, used: u64) {
@@ -363,8 +370,7 @@ mod tests {
 
     #[test]
     fn virtio_rng_fills_buffer_and_raises_irq() {
-        let ram = Arc::new(Ram::new(0x10000).unwrap());
-        let dma = DmaRam::new(0x8000_0000, ram);
+        let dma = test_dma(0x10000);
         let irq = Arc::new(TestIrq::default());
         let mmio = VirtioMmio::new(Box::new(VirtioRng::new(12345)), dma.clone(), irq.clone());
 
@@ -396,8 +402,7 @@ mod tests {
 
     #[test]
     fn virtio_blk_write_and_read_sectors() {
-        let ram = Arc::new(Ram::new(0x10000).unwrap());
-        let dma = DmaRam::new(0x8000_0000, ram);
+        let dma = test_dma(0x10000);
         let irq = Arc::new(TestIrq::default());
         let disk = MemoryBlock::new(4096, false);
         let mmio = VirtioMmio::new(
@@ -437,8 +442,7 @@ mod tests {
 
     #[test]
     fn virtio_console_tx_and_rx() {
-        let ram = Arc::new(Ram::new(0x10000).unwrap());
-        let dma = DmaRam::new(0x8000_0000, ram);
+        let dma = test_dma(0x10000);
         let irq = Arc::new(TestIrq::default());
         let ch = BufferChardev::new();
         let mmio = VirtioMmio::new(Box::new(VirtioConsole::new(ch.clone())), dma.clone(), irq);
@@ -463,8 +467,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("hello.txt"), b"9P_HOST_FILE_OK").unwrap();
 
-        let ram = Arc::new(Ram::new(0x10000).unwrap());
-        let dma = DmaRam::new(0x8000_0000, ram);
+        let dma = test_dma(0x10000);
         let irq = Arc::new(TestIrq::default());
         let mmio = VirtioMmio::new(
             Box::new(Virtio9p::new(&dir, "host0")),
@@ -584,8 +587,7 @@ mod tests {
 
     #[test]
     fn virtio_gpu_2d_scanout_and_ppm_png_export() {
-        let ram = Arc::new(Ram::new(0x2_0000).unwrap());
-        let dma = DmaRam::new(0x8000_0000, ram);
+        let dma = test_dma(0x2_0000);
         let irq = Arc::new(TestIrq::default());
         let fb = Arc::new(Framebuffer::new(32, 16));
         let mmio = VirtioMmio::new(
@@ -719,8 +721,7 @@ mod tests {
         use std::io::{Read, Write};
         use std::net::TcpStream;
 
-        let ram = Arc::new(Ram::new(0x1_0000).unwrap());
-        let dma = DmaRam::new(0x8000_0000, ram);
+        let dma = test_dma(0x1_0000);
         let irq = Arc::new(TestIrq::default());
         let hub = InputHub::new();
         let mmio = VirtioMmio::new(Box::new(VirtioInput::new(hub.clone())), dma.clone(), irq);

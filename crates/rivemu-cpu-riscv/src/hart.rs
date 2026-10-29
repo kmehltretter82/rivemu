@@ -331,6 +331,12 @@ impl Hart {
         self.csr.minstret
     }
 
+    /// Clears the implementation-defined LR/SC reservation after external
+    /// machine state replacement (for example, snapshot restore).
+    pub fn clear_reservation(&mut self) {
+        self.reservation = None;
+    }
+
     #[inline]
     pub(crate) fn set_x(&mut self, rd: u8, v: u64) {
         if rd != 0 {

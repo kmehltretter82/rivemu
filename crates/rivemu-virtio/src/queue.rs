@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use rivemu_core::{AccessSize, GuestAddr};
-use rivemu_mem::Ram;
+use rivemu_mem::{Ram, ReservationInvalidator};
 
 /// Maximum descriptors per virtqueue.
 pub const QUEUE_MAX_SIZE: u32 = 256;
@@ -20,12 +20,17 @@ pub const VIRTQ_DESC_F_INDIRECT: u16 = 4;
 pub struct DmaRam {
     base: GuestAddr,
     ram: Arc<Ram>,
+    reservations: ReservationInvalidator,
 }
 
 impl DmaRam {
     /// Creates a DMA view for `ram` mapped at physical `base`.
-    pub fn new(base: GuestAddr, ram: Arc<Ram>) -> Self {
-        Self { base, ram }
+    pub fn new(base: GuestAddr, ram: Arc<Ram>, reservations: ReservationInvalidator) -> Self {
+        Self {
+            base,
+            ram,
+            reservations,
+        }
     }
 
     #[inline]
@@ -51,19 +56,28 @@ impl DmaRam {
     #[inline]
     pub fn write_u16(&self, pa: GuestAddr, v: u16) -> Option<()> {
         self.ram
-            .write(pa.checked_sub(self.base)?, AccessSize::Half, u64::from(v))
+            .write(pa.checked_sub(self.base)?, AccessSize::Half, u64::from(v))?;
+        self.reservations
+            .invalidate_range(pa, AccessSize::Half.bytes());
+        Some(())
     }
 
     #[inline]
     pub fn write_u32(&self, pa: GuestAddr, v: u32) -> Option<()> {
         self.ram
-            .write(pa.checked_sub(self.base)?, AccessSize::Word, u64::from(v))
+            .write(pa.checked_sub(self.base)?, AccessSize::Word, u64::from(v))?;
+        self.reservations
+            .invalidate_range(pa, AccessSize::Word.bytes());
+        Some(())
     }
 
     #[inline]
     pub fn write_u64(&self, pa: GuestAddr, v: u64) -> Option<()> {
         self.ram
-            .write(pa.checked_sub(self.base)?, AccessSize::Double, v)
+            .write(pa.checked_sub(self.base)?, AccessSize::Double, v)?;
+        self.reservations
+            .invalidate_range(pa, AccessSize::Double.bytes());
+        Some(())
     }
 
     pub fn read_bytes(&self, pa: GuestAddr, buf: &mut [u8]) -> Option<()> {
@@ -71,7 +85,76 @@ impl DmaRam {
     }
 
     pub fn write_bytes(&self, pa: GuestAddr, data: &[u8]) -> Option<()> {
-        self.ram.write_bytes(pa.checked_sub(self.base)?, data)
+        self.ram.write_bytes(pa.checked_sub(self.base)?, data)?;
+        self.reservations.invalidate_range(pa, data.len() as u64);
+        Some(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rivemu_mem::AddressSpace;
+
+    const BASE: GuestAddr = 0x8000_0000;
+
+    fn dma_space(len: u64) -> (AddressSpace, DmaRam) {
+        let ram = Arc::new(Ram::new(len).unwrap());
+        let mut bus = AddressSpace::new();
+        bus.add_ram("ram", BASE, ram.clone()).unwrap();
+        let dma = DmaRam::new(BASE, ram, bus.reservation_invalidator());
+        (bus, dma)
+    }
+
+    #[test]
+    fn same_value_dma_write_invalidates_reservation() {
+        let (bus, dma) = dma_space(0x1000);
+        let addr = BASE + 0x100;
+        bus.write(addr, AccessSize::Word, 0x1122_3344).unwrap();
+        let seq = bus.reserve_cache_line(addr);
+
+        dma.write_u32(addr, 0x1122_3344).unwrap();
+
+        assert!(
+            !bus.store_conditional(
+                addr,
+                AccessSize::Word,
+                Some((seq, 0x1122_3344)),
+                0x5566_7788,
+            )
+            .unwrap()
+        );
+        assert_eq!(bus.read(addr, AccessSize::Word).unwrap(), 0x1122_3344);
+    }
+
+    #[test]
+    fn dma_range_invalidates_each_cache_line_it_touches() {
+        let (bus, dma) = dma_space(0x1000);
+        let first = BASE + 0x138;
+        let second = BASE + 0x140;
+        bus.write(first, AccessSize::Double, 0x1111).unwrap();
+        bus.write(second, AccessSize::Double, 0x2222).unwrap();
+        let first_seq = bus.reserve_cache_line(first);
+        let second_seq = bus.reserve_cache_line(second);
+
+        // Rewrite the existing bytes exactly so value comparison cannot mask
+        // a missing reservation invalidation on either cache line.
+        dma.write_bytes(BASE + 0x13c, &[0, 0, 0, 0, 0x22, 0x22, 0, 0])
+            .unwrap();
+
+        assert!(
+            !bus.store_conditional(first, AccessSize::Double, Some((first_seq, 0x1111)), 0x3333,)
+                .unwrap()
+        );
+        assert!(
+            !bus.store_conditional(
+                second,
+                AccessSize::Double,
+                Some((second_seq, 0x2222)),
+                0x4444,
+            )
+            .unwrap()
+        );
     }
 }
 

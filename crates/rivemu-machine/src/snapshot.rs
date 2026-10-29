@@ -11,7 +11,7 @@ use std::path::Path;
 use rivemu_cpu_riscv::Priv;
 use rivemu_virtio::VirtQueue;
 
-use crate::virt::Machine;
+use crate::virt::{Machine, memmap};
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"RIVSNAP1";
 
@@ -208,6 +208,7 @@ impl Machine {
             h.update_pmp_state();
             h.pending_sbi = false;
             h.pending_semihost = false;
+            h.clear_reservation();
             h.invalidate_tlb();
             h.invalidate_icache();
             h.notify_irq();
@@ -282,6 +283,9 @@ impl Machine {
             r.read_exact(&mut page_buf)?;
             self.ram.write_page(p, &page_buf);
         }
+        self.bus
+            .reservation_invalidator()
+            .invalidate_range(memmap::DRAM_BASE, self.ram.len());
         Ok(())
     }
 }

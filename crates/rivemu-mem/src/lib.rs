@@ -6,7 +6,9 @@
 mod address_space;
 mod ram;
 
-pub use address_space::{AddressSpace, BusError, MapError, Region, RegionKind};
+pub use address_space::{
+    AddressSpace, BusError, MapError, Region, RegionKind, ReservationInvalidator,
+};
 pub use ram::Ram;
 
 use rivemu_core::AccessSize;

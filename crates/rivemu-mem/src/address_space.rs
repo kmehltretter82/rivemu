@@ -12,6 +12,66 @@ use crate::{MmioDevice, Ram};
 /// Number of 64-byte cache-line buckets in the reservation directory.
 const RESERVATION_BUCKETS: usize = 4096;
 
+/// Cloneable handle that lets external memory writers invalidate CPU LR/SC
+/// reservations without owning the address space itself.
+///
+/// Handles can only be obtained from [`AddressSpace::reservation_invalidator`],
+/// so every clone shares that address space's reservation directory.
+#[derive(Clone)]
+pub struct ReservationInvalidator {
+    line_seq: Arc<[AtomicU64]>,
+}
+
+impl fmt::Debug for ReservationInvalidator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReservationInvalidator")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReservationInvalidator {
+    /// Invalidates active reservations on every 64-byte cache line touched by
+    /// `[addr, addr + len)`. A zero-length range has no effect; overflowing
+    /// ranges are conservatively invalidated through the end of the address
+    /// space.
+    pub fn invalidate_range(&self, addr: GuestAddr, len: u64) {
+        invalidate_reservation_range(&self.line_seq, addr, len);
+    }
+}
+
+fn invalidate_reservation_range(line_seq: &[AtomicU64], addr: GuestAddr, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let first_line = addr >> 6;
+    let last_line = addr.saturating_add(len - 1) >> 6;
+    // The directory is hash-bucketed, so ranges spanning a full directory only
+    // need to visit each bucket once. Besides avoiding duplicate work, this
+    // keeps a malformed overflowing DMA range from causing an enormous loop.
+    let line_count = last_line
+        .saturating_sub(first_line)
+        .saturating_add(1)
+        .min(RESERVATION_BUCKETS as u64);
+    for line_offset in 0..line_count {
+        let line = first_line + line_offset;
+        let idx = (line as usize) & (RESERVATION_BUCKETS - 1);
+        let seq = line_seq[idx].load(Ordering::Relaxed);
+        if seq & 1 != 0 {
+            invalidate_bucket_slow(line_seq, idx, seq);
+        }
+    }
+}
+
+#[cold]
+fn invalidate_bucket_slow(line_seq: &[AtomicU64], idx: usize, seq: u64) {
+    let _ = line_seq[idx].compare_exchange(
+        seq,
+        seq.wrapping_add(1) & !1,
+        Ordering::SeqCst,
+        Ordering::Relaxed,
+    );
+}
+
 /// Error returned by guest-visible bus accesses. The CPU turns these into
 /// access-fault exceptions.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -136,7 +196,7 @@ pub struct AddressSpace {
     /// Largest mapped RAM region `(base, size, ram)` for O(1) main-memory access.
     fast_ram: Option<(GuestAddr, u64, Arc<Ram>)>,
     /// 64-byte cache-line reservation sequence counters `(gen << 1) | active_bit`.
-    line_seq: Box<[AtomicU64]>,
+    line_seq: Arc<[AtomicU64]>,
 }
 
 impl Default for AddressSpace {
@@ -144,10 +204,12 @@ impl Default for AddressSpace {
         Self {
             regions: Vec::new(),
             fast_ram: None,
-            line_seq: (0..RESERVATION_BUCKETS)
-                .map(|_| AtomicU64::new(0))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            line_seq: Arc::from(
+                (0..RESERVATION_BUCKETS)
+                    .map(|_| AtomicU64::new(0))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
         }
     }
 }
@@ -156,6 +218,14 @@ impl AddressSpace {
     /// Creates an empty address space.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Returns a cloneable handle for invalidating this address space's LR/SC
+    /// reservations after DMA writes or external machine-state replacement.
+    pub fn reservation_invalidator(&self) -> ReservationInvalidator {
+        ReservationInvalidator {
+            line_seq: self.line_seq.clone(),
+        }
     }
 
     /// Marks the 64-byte cache line containing `addr` as having an active `LR`
@@ -170,28 +240,7 @@ impl AddressSpace {
     /// touched by a write of `size` bytes at `addr`.
     #[inline]
     pub fn invalidate_cache_line(&self, addr: GuestAddr, size: AccessSize) {
-        let idx = ((addr >> 6) as usize) & (RESERVATION_BUCKETS - 1);
-        let s = self.line_seq[idx].load(Ordering::Relaxed);
-        if s & 1 != 0 {
-            self.invalidate_bucket_slow(idx, s);
-        }
-        if (addr & 63) + size.bytes() > 64 {
-            let idx2 = (idx + 1) & (RESERVATION_BUCKETS - 1);
-            let s2 = self.line_seq[idx2].load(Ordering::Relaxed);
-            if s2 & 1 != 0 {
-                self.invalidate_bucket_slow(idx2, s2);
-            }
-        }
-    }
-
-    #[cold]
-    fn invalidate_bucket_slow(&self, idx: usize, s: u64) {
-        let _ = self.line_seq[idx].compare_exchange(
-            s,
-            s.wrapping_add(1) & !1,
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-        );
+        invalidate_reservation_range(&self.line_seq, addr, size.bytes());
     }
 
     /// All regions, sorted by base address.
@@ -504,11 +553,12 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Writes bytes into RAM/ROM (loaders, DMA). Ignores ROM write protection.
+    /// Writes bytes into RAM/ROM (loaders and debugger). Ignores ROM write protection.
     pub fn load_bytes(&self, addr: GuestAddr, data: &[u8]) -> Result<(), BusError> {
         self.for_each_chunk(addr, data.len() as u64, |m, off, start, n| {
             m.write_bytes(off, &data[start..start + n as usize])
                 .expect("region bounds checked");
+            invalidate_reservation_range(&self.line_seq, addr + start as u64, n);
         })
     }
 
@@ -522,8 +572,9 @@ impl AddressSpace {
 
     /// Fills `[addr, addr + len)` of RAM/ROM with `byte`.
     pub fn fill_bytes(&self, addr: GuestAddr, len: u64, byte: u8) -> Result<(), BusError> {
-        self.for_each_chunk(addr, len, |m, off, _, n| {
+        self.for_each_chunk(addr, len, |m, off, start, n| {
             m.fill(off, n, byte).expect("region bounds checked");
+            invalidate_reservation_range(&self.line_seq, addr + start as u64, n);
         })
     }
 }
@@ -682,6 +733,59 @@ mod tests {
             Err(BusError::NotMemory { addr: 0x1000_0000 })
         );
         a.load_bytes(0x8000_0000, &[]).unwrap();
+    }
+
+    #[test]
+    fn bulk_writes_invalidate_same_value_reservations() {
+        let (a, _) = space();
+        let loaded = 0x8000_0100;
+        let filled = 0x8000_0180;
+        a.write(loaded, AccessSize::Word, 0x1122_3344).unwrap();
+        a.write(filled, AccessSize::Word, 0x5555_5555).unwrap();
+        let loaded_seq = a.reserve_cache_line(loaded);
+        let filled_seq = a.reserve_cache_line(filled);
+
+        a.load_bytes(loaded, &0x1122_3344u32.to_le_bytes()).unwrap();
+        a.fill_bytes(filled, 4, 0x55).unwrap();
+
+        assert!(
+            !a.store_conditional(
+                loaded,
+                AccessSize::Word,
+                Some((loaded_seq, 0x1122_3344)),
+                0xdead_beef,
+            )
+            .unwrap()
+        );
+        assert!(
+            !a.store_conditional(
+                filled,
+                AccessSize::Word,
+                Some((filled_seq, 0x5555_5555)),
+                0xdead_beef,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn huge_external_range_visits_each_reservation_bucket_once() {
+        let (a, _) = space();
+        let addr = 0x8000_0100;
+        a.write(addr, AccessSize::Word, 0x1122_3344).unwrap();
+        let seq = a.reserve_cache_line(addr);
+
+        a.reservation_invalidator().invalidate_range(0, u64::MAX);
+
+        assert!(
+            !a.store_conditional(
+                addr,
+                AccessSize::Word,
+                Some((seq, 0x1122_3344)),
+                0xdead_beef,
+            )
+            .unwrap()
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rivemu_core::AccessSize;
-use rivemu_mem::{MmioDevice, Ram};
+use rivemu_mem::{MmioDevice, Ram, ReservationInvalidator};
 
 /// Standard `fw_cfg` selector keys.
 pub(crate) mod key {
@@ -43,12 +43,17 @@ struct State {
 pub struct FwCfg {
     state: Mutex<State>,
     dram_base: u64,
-    ram: Option<Arc<Ram>>,
+    dma_ram: Option<(Arc<Ram>, ReservationInvalidator)>,
 }
 
 impl FwCfg {
     /// Creates a `fw_cfg` device populated with standard machine items.
-    pub fn new(ram_size: u64, smp: u16, dram_base: u64, ram: Option<Arc<Ram>>) -> Self {
+    pub fn new(
+        ram_size: u64,
+        smp: u16,
+        dram_base: u64,
+        dma_ram: Option<(Arc<Ram>, ReservationInvalidator)>,
+    ) -> Self {
         let mut items = HashMap::new();
         items.insert(key::SIGNATURE, b"QEMU".to_vec());
         items.insert(key::ID, 3u32.to_le_bytes().to_vec());
@@ -66,7 +71,7 @@ impl FwCfg {
                 files: Vec::new(),
             }),
             dram_base,
-            ram,
+            dma_ram,
         }
     }
 
@@ -95,7 +100,7 @@ impl FwCfg {
     }
 
     fn handle_dma(&self, s: &mut State, desc_pa: u64) {
-        let Some(ram) = &self.ram else {
+        let Some((ram, reservations)) = &self.dma_ram else {
             return;
         };
         let Some(desc_off) = desc_pa.checked_sub(self.dram_base) else {
@@ -141,7 +146,12 @@ impl FwCfg {
                         .and_then(|v| v.get(s.offset).copied())
                         .unwrap_or(0);
                     s.offset = s.offset.saturating_add(1);
-                    let _ = ram.write(dst_off + i as u64, AccessSize::Byte, u64::from(b));
+                    if ram
+                        .write(dst_off + i as u64, AccessSize::Byte, u64::from(b))
+                        .is_some()
+                    {
+                        reservations.invalidate_range(target_pa + i as u64, 1);
+                    }
                 }
             }
         } else if ctrl & (1 << 2) != 0 {
@@ -149,7 +159,9 @@ impl FwCfg {
             s.offset = s.offset.saturating_add(length);
         }
         // Clear control word to 0 (transfer complete, no error).
-        let _ = ram.write(desc_off, AccessSize::Word, 0);
+        if ram.write(desc_off, AccessSize::Word, 0).is_some() {
+            reservations.invalidate_range(desc_pa, AccessSize::Word.bytes());
+        }
     }
 }
 
@@ -218,5 +230,72 @@ impl MmioDevice for FwCfg {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rivemu_mem::AddressSpace;
+
+    #[test]
+    fn dma_invalidates_destination_and_descriptor_reservations() {
+        let dram_base = 0x8000_0000;
+        let ram = Arc::new(Ram::new(0x1000).unwrap());
+        let mut bus = AddressSpace::new();
+        bus.add_ram("ram", dram_base, ram.clone()).unwrap();
+        let fw = FwCfg::new(
+            0x1000,
+            1,
+            dram_base,
+            Some((ram.clone(), bus.reservation_invalidator())),
+        );
+        let desc_pa = dram_base + 0x100;
+        let target_pa = dram_base + 0x200;
+
+        let mut desc = [0u8; 16];
+        desc[0..4].copy_from_slice(&2u32.to_be_bytes()); // READ
+        desc[4..8].copy_from_slice(&4u32.to_be_bytes());
+        desc[8..16].copy_from_slice(&target_pa.to_be_bytes());
+        ram.write_bytes(desc_pa - dram_base, &desc).unwrap();
+        ram.write_bytes(target_pa - dram_base, b"QEMU").unwrap();
+
+        let desc_seq = bus.reserve_cache_line(desc_pa);
+        let target_seq = bus.reserve_cache_line(target_pa);
+        fw.write(
+            0x10,
+            AccessSize::Double,
+            u64::from_le_bytes(desc_pa.to_be_bytes()),
+        );
+
+        let mut target = [0u8; 4];
+        ram.read_bytes(target_pa - dram_base, &mut target).unwrap();
+        assert_eq!(&target, b"QEMU");
+        assert_eq!(ram.read(desc_pa - dram_base, AccessSize::Word), Some(0));
+
+        // Restore the descriptor through the raw RAM path to make this an ABA
+        // check: only fw_cfg's own write should have invalidated the token.
+        ram.write_bytes(desc_pa - dram_base, &desc).unwrap();
+        assert!(
+            !bus.store_conditional(
+                desc_pa,
+                AccessSize::Word,
+                Some((
+                    desc_seq,
+                    u64::from(u32::from_le_bytes(desc[0..4].try_into().unwrap()))
+                )),
+                0x1234,
+            )
+            .unwrap()
+        );
+        assert!(
+            !bus.store_conditional(
+                target_pa,
+                AccessSize::Word,
+                Some((target_seq, u64::from(u32::from_le_bytes(*b"QEMU")),)),
+                0x5678,
+            )
+            .unwrap()
+        );
     }
 }

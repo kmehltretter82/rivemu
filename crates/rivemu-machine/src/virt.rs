@@ -375,6 +375,7 @@ impl Machine {
         );
         let mut bus = AddressSpace::new();
         bus.add_ram("riscv_virt_board.ram", memmap::DRAM_BASE, ram.clone())?;
+        let reservation_invalidator = bus.reservation_invalidator();
         let ram_end = memmap::DRAM_BASE + config.ram_size;
 
         // Harts and devices.
@@ -428,7 +429,7 @@ impl Machine {
             config.ram_size,
             config.smp as u16,
             memmap::DRAM_BASE,
-            Some(ram.clone()),
+            Some((ram.clone(), reservation_invalidator.clone())),
         ));
         for (name, data) in &config.fw_cfg_files {
             fw_cfg.add_file(name, data.clone());
@@ -510,7 +511,7 @@ impl Machine {
             }
         };
 
-        let dma = DmaRam::new(memmap::DRAM_BASE, ram.clone());
+        let dma = DmaRam::new(memmap::DRAM_BASE, ram.clone(), reservation_invalidator);
         let pci = PciBus::new(
             dma.clone(),
             [
@@ -1343,20 +1344,23 @@ mod tests {
 
     #[test]
     fn snapshot_save_and_restore_roundtrip() {
+        let code = memmap::DRAM_BASE + 0x2000;
+        let data = memmap::DRAM_BASE + 0x4000;
         let mut m1 = Machine::new(MachineConfig {
             smp: 2,
             ..Default::default()
         })
         .unwrap();
-        m1.harts[0].pc = 0x8020_1234;
-        m1.harts[0].x[10] = 0xdead_beef_cafe_babe;
+        m1.harts[0].pc = code;
+        m1.harts[0].x[10] = data;
+        m1.harts[0].x[11] = 0xaabb_ccdd_eeff_0011;
+        m1.harts[0].x[12] = 0xdead_beef_cafe_babe;
         m1.harts[1].hsm_stopped = true;
+        // sc.d x2, x11, (x10): a restored VM must not retain an LR
+        // reservation from the machine state that it replaces.
+        m1.bus.write(code, AccessSize::Word, 0x18b5_312f).unwrap();
         m1.bus
-            .write(
-                memmap::DRAM_BASE + 0x4000,
-                AccessSize::Double,
-                0x1122_3344_5566_7788,
-            )
+            .write(data, AccessSize::Double, 0x1122_3344_5566_7788)
             .unwrap();
 
         let snap = TempFile::new("snap", &[]);
@@ -1367,6 +1371,19 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
+        // Establish a same-value reservation in the destination machine before
+        // replacing its state. Without explicit restore invalidation, the SC
+        // from the snapshot would incorrectly succeed.
+        m2.bus
+            .write(code, AccessSize::Word, 0x1005_30af) // lr.d x1, (x10)
+            .unwrap();
+        m2.bus
+            .write(data, AccessSize::Double, 0x1122_3344_5566_7788)
+            .unwrap();
+        m2.harts[0].pc = code;
+        m2.harts[0].x[10] = data;
+        m2.harts[0].step(&m2.bus);
+
         let t0 = std::time::Instant::now();
         m2.load_snapshot(&snap.0).unwrap();
         let elapsed = t0.elapsed();
@@ -1374,13 +1391,17 @@ mod tests {
             elapsed < Duration::from_millis(50),
             "expected snapshot restore in < 50 ms, took {elapsed:?}"
         );
-        assert_eq!(m2.harts[0].pc, 0x8020_1234);
-        assert_eq!(m2.harts[0].x[10], 0xdead_beef_cafe_babe);
+        assert_eq!(m2.harts[0].pc, code);
+        assert_eq!(m2.harts[0].x[12], 0xdead_beef_cafe_babe);
         assert!(m2.harts[1].hsm_stopped);
         assert_eq!(
-            m2.bus
-                .read(memmap::DRAM_BASE + 0x4000, AccessSize::Double)
-                .unwrap(),
+            m2.bus.read(data, AccessSize::Double).unwrap(),
+            0x1122_3344_5566_7788
+        );
+        m2.harts[0].step(&m2.bus);
+        assert_eq!(m2.harts[0].x[2], 1, "SC after snapshot restore must fail");
+        assert_eq!(
+            m2.bus.read(data, AccessSize::Double).unwrap(),
             0x1122_3344_5566_7788
         );
     }

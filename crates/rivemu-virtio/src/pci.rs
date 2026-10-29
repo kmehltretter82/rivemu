@@ -536,7 +536,7 @@ impl MmioDevice for PciMmioWindow {
 mod tests {
     use super::*;
     use crate::VirtioRng;
-    use rivemu_mem::Ram;
+    use rivemu_mem::{AddressSpace, Ram};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Default)]
@@ -550,7 +550,9 @@ mod tests {
     #[test]
     fn virtio_pci_reset_preserves_default_queue_size() {
         let ram = Arc::new(Ram::new(64 * 1024).unwrap());
-        let dma = DmaRam::new(0x8000_0000, ram);
+        let mut bus = AddressSpace::new();
+        bus.add_ram("ram", 0x8000_0000, ram.clone()).unwrap();
+        let dma = DmaRam::new(0x8000_0000, ram, bus.reservation_invalidator());
         let irqs: [Arc<dyn IrqLine>; 4] = [
             Arc::new(DummyLine::default()),
             Arc::new(DummyLine::default()),
