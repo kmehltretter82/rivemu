@@ -883,6 +883,10 @@ impl Hart {
             Op::Binvi => self.set_x(rd, rs1 ^ (1u64 << (imm & 63))),
             Op::Bseti => self.set_x(rd, rs1 | (1u64 << (imm & 63))),
 
+            // Zicond (integer conditional operations).
+            Op::CzeroEqz => self.set_x(rd, if rs2 == 0 { 0 } else { rs1 }),
+            Op::CzeroNez => self.set_x(rd, if rs2 != 0 { 0 } else { rs1 }),
+
             // M extension.
             Op::Mul => self.set_x(rd, rs1.wrapping_mul(rs2)),
             Op::Mulh => self.set_x(

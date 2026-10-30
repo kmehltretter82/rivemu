@@ -803,3 +803,55 @@ fn sfence_vma_respects_asid_global_and_superpages() {
     assert_eq!(h.x[1], 0x5555_2222);
 }
 
+#[test]
+fn mret_with_zero_pmp_rules_retires_before_fetch_access_fault() {
+    use rivemu_cpu_riscv::{Priv, csr};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    const MRET_PC: u64 = 0x8000_0000;
+    const TARGET_PC: u64 = 0x8000_1000;
+    const MTVEC_PC: u64 = 0x8000_2000;
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.strict_pmp = true;
+    h.reset(MRET_PC);
+
+    // MRET at MRET_PC, NOP at TARGET_PC
+    bus.write(MRET_PC, AccessSize::Word, 0x3020_0073).unwrap();
+    bus.write(TARGET_PC, AccessSize::Word, 0x0000_0013).unwrap();
+
+    // All pmpcfg registers are 0 (0 active PMP rules).
+    // Configure mstatus.MPP = S (1), mstatus.MPIE = 1, mstatus.MIE = 0, mepc = TARGET_PC, mtvec = MTVEC_PC.
+    h.csr_write(csr::MTVEC, MTVEC_PC).unwrap();
+    h.csr_write(csr::MEPC, TARGET_PC).unwrap();
+    let mstatus = h.csr_read(csr::MSTATUS).unwrap();
+    let mstatus = (mstatus & !((3 << 11) | (1 << 7) | (1 << 3))) | (1 << 11) | (1 << 7);
+    h.csr_write(csr::MSTATUS, mstatus).unwrap();
+
+    // Step 1: MRET retires cleanly, transitioning to S-mode at TARGET_PC with MIE=1, MPIE=1, MPP=U(0).
+    h.step(&bus);
+    assert_eq!(h.prv, Priv::Supervisor);
+    assert_eq!(h.pc, TARGET_PC);
+    let mid_mstatus = h.csr_read(csr::MSTATUS).unwrap();
+    assert_eq!((mid_mstatus >> 11) & 3, 0);
+    assert_eq!((mid_mstatus >> 7) & 1, 1);
+    assert_eq!((mid_mstatus >> 3) & 1, 1);
+
+    // Step 2: Subsequent instruction fetch at TARGET_PC in S-mode with 0 PMP rules raises
+    // Instruction Access Fault (mcause = 1) with mepc = TARGET_PC, mtval = TARGET_PC,
+    // mstatus.MPP = S (1), and mstatus.MPIE = 1.
+    h.step(&bus);
+    assert_eq!(h.prv, Priv::Machine);
+    assert_eq!(h.pc, MTVEC_PC);
+    assert_eq!(h.csr_read(csr::MCAUSE).unwrap(), 1);
+    assert_eq!(h.csr_read(csr::MEPC).unwrap(), TARGET_PC);
+    assert_eq!(h.csr_read(csr::MTVAL).unwrap(), TARGET_PC);
+    let post_mstatus = h.csr_read(csr::MSTATUS).unwrap();
+    assert_eq!((post_mstatus >> 11) & 3, 1);
+    assert_eq!((post_mstatus >> 7) & 1, 1);
+}
+
+

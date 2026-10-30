@@ -179,6 +179,9 @@ pub enum Op {
     Bexti,
     Binvi,
     Bseti,
+    // Zicond (integer conditional operations)
+    CzeroEqz,
+    CzeroNez,
 }
 
 /// AMO operation codes (instruction bits 31:27).
@@ -432,6 +435,9 @@ pub fn decode(raw: u32) -> Insn {
                 (0x24, 1) => Op::Bclr,
                 (0x24, 5) => Op::Bext,
                 (0x34, 1) => Op::Binv,
+                // Zicond
+                (0x07, 5) => Op::CzeroEqz,
+                (0x07, 7) => Op::CzeroNez,
                 _ => Op::Illegal,
             };
             (op, 0)
@@ -670,8 +676,10 @@ mod tests {
         assert_eq!(decode(0x48b5_1533).op, Op::Bclr); // bclr a0, a0, a1
         assert_eq!(decode(0x48b5_5533).op, Op::Bext); // bext a0, a0, a1
         assert_eq!(decode(0x68b5_1533).op, Op::Binv); // binv a0, a0, a1
+        assert_eq!(decode(0x0eb5_5533).op, Op::CzeroEqz); // czero.eqz a0, a0, a1
+        assert_eq!(decode(0x0eb5_7533).op, Op::CzeroNez); // czero.nez a0, a0, a1
 
-        // Execute a block exercising Zba + Zbb + Zbc + Zbs.
+        // Execute a block exercising Zba + Zbb + Zbc + Zbs + Zicond.
         let mut bus = AddressSpace::new();
         bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(4096).unwrap()))
             .unwrap();
@@ -681,6 +689,10 @@ mod tests {
             0x6b85_5713, // rev8   a4, a0          (a4 = swap_bytes(a0))
             0x2875_5793, // orc.b  a5, a0          (a5 = orc_b(a0))
             0x28b5_1833, // bset   a6, a0, a1      (a6 = a0 | (1 << a1))
+            0x0eb5_58b3, // czero.eqz a7, a0, a1   (a7 = a1 == 0 ? 0 : a0)
+            0x0eb5_7333, // czero.nez t1, a0, a1   (t1 = a1 != 0 ? 0 : a0)
+            0x0e05_53b3, // czero.eqz t2, a0, x0   (t2 = x0 == 0 ? 0 : a0)
+            0x0e05_7e33, // czero.nez t3, a0, x0   (t3 = x0 != 0 ? 0 : a0)
         ];
         for (idx, w) in prog.iter().enumerate() {
             bus.load_bytes(0x8000_0000 + idx as u64 * 4, &w.to_le_bytes())
@@ -698,6 +710,10 @@ mod tests {
         assert_eq!(h.x[14], 0x0800_0000_0000_0001); // rev8
         assert_eq!(h.x[15], 0xff00_0000_0000_00ff); // orc.b
         assert_eq!(h.x[16], 0x0100_0000_0000_0028); // bset bit 5
+        assert_eq!(h.x[17], 0x0100_0000_0000_0008); // czero.eqz with non-zero rs2
+        assert_eq!(h.x[6], 0); // czero.nez with non-zero rs2
+        assert_eq!(h.x[7], 0); // czero.eqz with zero rs2
+        assert_eq!(h.x[28], 0x0100_0000_0000_0008); // czero.nez with zero rs2
     }
 
     #[test]
