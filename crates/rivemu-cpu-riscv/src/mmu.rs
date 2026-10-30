@@ -14,6 +14,8 @@ pub(crate) enum Access {
     Load,
     /// Stores and AMOs.
     Store,
+    /// `Zicbom` cache-block management operations (`cbo.inval`, `cbo.clean`, `cbo.flush`).
+    CacheBom,
 }
 
 impl Access {
@@ -21,7 +23,7 @@ impl Access {
         let c = match self {
             Access::Fetch => cause::INSN_PAGE_FAULT,
             Access::Load => cause::LOAD_PAGE_FAULT,
-            Access::Store => cause::STORE_PAGE_FAULT,
+            Access::Store | Access::CacheBom => cause::STORE_PAGE_FAULT,
         };
         Exception::new(c, va)
     }
@@ -30,7 +32,7 @@ impl Access {
         let c = match self {
             Access::Fetch => cause::INSN_ACCESS,
             Access::Load => cause::LOAD_ACCESS,
-            Access::Store => cause::STORE_ACCESS,
+            Access::Store | Access::CacheBom => cause::STORE_ACCESS,
         };
         Exception::new(c, va)
     }
@@ -114,6 +116,9 @@ impl Hart {
             Access::Fetch => flags & pte::X != 0,
             Access::Load => flags & pte::R != 0 || (s & status::MXR != 0 && flags & pte::X != 0),
             Access::Store => flags & pte::W != 0,
+            Access::CacheBom => {
+                flags & (pte::R | pte::W) != 0 || (s & status::MXR != 0 && flags & pte::X != 0)
+            }
         };
         ok && match prv {
             Priv::User => flags & pte::U != 0,
@@ -211,6 +216,7 @@ impl Hart {
                     Access::Fetch => cfg & 0x04 != 0,
                     Access::Load => cfg & 0x01 != 0,
                     Access::Store => cfg & 0x02 != 0,
+                    Access::CacheBom => cfg & 0x03 != 0,
                 };
             }
         }

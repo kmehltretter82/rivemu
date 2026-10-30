@@ -464,3 +464,98 @@ fn lr_sc_64byte_cache_line_granularity_across_harts() {
     assert_eq!(h1.x[2], 1);
     assert_eq!(bus.read(0x8000_1020, AccessSize::Double).unwrap(), 0);
 }
+
+#[test]
+fn zicbom_permits_read_only_targets_and_reports_store_fault_causes() {
+    use rivemu_cpu_riscv::csr::{self, envcfg, status};
+    use rivemu_cpu_riscv::{Priv, cause};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    const TRAP: u64 = 0x8000_0100;
+    const DATA: u64 = 0x8000_2000;
+    const ROOT_PT: u64 = 0x8001_0000;
+    const L1_PT: u64 = 0x8001_1000;
+    const L0_PT: u64 = 0x8001_2000;
+
+    // 0x8000_0000: cbo.inval (x10)  (0x0005_200f)
+    // 0x8000_0004: cbo.clean (x10)  (0x0015_200f)
+    // 0x8000_0008: cbo.flush (x10)  (0x0025_200f)
+    bus.write(CODE, AccessSize::Word, 0x0005_200f).unwrap();
+    bus.write(CODE + 4, AccessSize::Word, 0x0015_200f).unwrap();
+    bus.write(CODE + 8, AccessSize::Word, 0x0025_200f).unwrap();
+
+    // 3-level Sv39 page table:
+    // - CODE (0x8000_0000) is V|R|X|A (0x4b).
+    // - DATA (0x8000_2000) starts as read-only V|R|A (0x43, W=0, D=0).
+    bus.write(ROOT_PT + 2 * 8, AccessSize::Double, ((L1_PT >> 12) << 10) | 1)
+        .unwrap();
+    bus.write(L1_PT, AccessSize::Double, ((L0_PT >> 12) << 10) | 1)
+        .unwrap();
+    bus.write(L0_PT, AccessSize::Double, ((CODE >> 12) << 10) | 0x4b)
+        .unwrap();
+    let data_pte_addr = L0_PT + 2 * 8;
+    let ro_data_pte = ((DATA >> 12) << 10) | 0x43;
+    let xo_data_pte = ((DATA >> 12) << 10) | 0x49;
+    bus.write(data_pte_addr, AccessSize::Double, ro_data_pte)
+        .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.svade = true;
+    h.reset(CODE);
+    h.csr.mtvec = TRAP;
+    h.csr.menvcfg = envcfg::CBIE_MASK | envcfg::CBCFE;
+    h.csr_write(csr::SATP, (8 << 60) | (ROOT_PT >> 12)).unwrap();
+    h.x[10] = DATA + 19;
+
+    // 1. Read-only Sv39 page (R=1, W=0, A=1, D=0) with read-only PMP entry
+    // permits cbo.inval, cbo.clean, and cbo.flush in S-mode.
+    h.csr_write(csr::PMPADDR0, (DATA >> 2) | 0x1ff).unwrap();
+    h.csr_write(csr::PMPADDR0 + 1, (1u64 << 54) - 1).unwrap();
+    h.csr_write(csr::PMPCFG0, 0x19 | (0x1f << 8)).unwrap(); // Entry 0: NAPOT R=1, W=0, X=0
+    h.prv = Priv::Supervisor;
+    for expected_next_pc in [CODE + 4, CODE + 8, CODE + 12] {
+        h.step(&bus);
+        assert_eq!(h.pc, expected_next_pc);
+    }
+
+    // 2. When the page is read-only (R=1, W=0) in Sv39 and PMP denies both
+    // read and write (execute-only PMP: R=0, W=0, X=1), all three instructions
+    // must report STORE_ACCESS (7), not STORE_PAGE_FAULT (15) or LOAD_ACCESS (5).
+    h.csr_write(csr::PMPCFG0, 0x1c | (0x1f << 8)).unwrap(); // Entry 0: NAPOT R=0, W=0, X=1
+    for insn_pc in [CODE, CODE + 4, CODE + 8] {
+        h.pc = insn_pc;
+        h.prv = Priv::Supervisor;
+        h.step(&bus);
+        assert_eq!(h.pc, TRAP);
+        assert_eq!(h.csr.mcause, cause::STORE_ACCESS);
+        assert_eq!(h.csr.mtval, DATA);
+    }
+
+    // 3. On an execute-only Sv39 page (R=0, W=0, X=1) with open PMP, MXR=0
+    // faults with STORE_PAGE_FAULT (15), while MXR=1 permits all three.
+    h.csr_write(csr::PMPCFG0, 0x1f | (0x1f << 8)).unwrap();
+    bus.write(data_pte_addr, AccessSize::Double, xo_data_pte)
+        .unwrap();
+    h.invalidate_tlb();
+    for insn_pc in [CODE, CODE + 4, CODE + 8] {
+        h.pc = insn_pc;
+        h.prv = Priv::Supervisor;
+        h.step(&bus);
+        assert_eq!(h.pc, TRAP);
+        assert_eq!(h.csr.mcause, cause::STORE_PAGE_FAULT);
+        assert_eq!(h.csr.mtval, DATA);
+    }
+
+    h.csr.mstatus |= status::MXR;
+    h.pc = CODE;
+    h.prv = Priv::Supervisor;
+    for expected_next_pc in [CODE + 4, CODE + 8, CODE + 12] {
+        h.step(&bus);
+        assert_eq!(h.pc, expected_next_pc);
+    }
+}
+

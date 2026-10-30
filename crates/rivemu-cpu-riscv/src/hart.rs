@@ -1017,8 +1017,8 @@ impl Hart {
                     return Err(Self::illegal(insn));
                 }
                 let base_va = rs1 & !63;
-                let pa = self.translate(bus, base_va, Access::Store)?;
-                self.check_pmp_access(base_va, pa, 64, Access::Store)?;
+                let pa = self.translate(bus, base_va, Access::CacheBom)?;
+                self.check_pmp_access(base_va, pa, 64, Access::CacheBom)?;
                 self.invalidate_reservation(pa);
                 bus.invalidate_cache_line(pa, AccessSize::Double);
             }
@@ -1032,12 +1032,10 @@ impl Hart {
                     return Err(Self::illegal(insn));
                 }
                 let base_va = rs1 & !63;
-                let pa = self
-                    .translate(bus, base_va, Access::Load)
-                    .or_else(|_| self.translate(bus, base_va, Access::Store))?;
-                self.check_pmp_access(base_va, pa, 64, Access::Load)
-                    .or_else(|_| self.check_pmp_access(base_va, pa, 64, Access::Store))?;
+                let pa = self.translate(bus, base_va, Access::CacheBom)?;
+                self.check_pmp_access(base_va, pa, 64, Access::CacheBom)?;
                 self.invalidate_reservation(pa);
+                bus.invalidate_cache_line(pa, AccessSize::Double);
             }
             Op::CboZero => {
                 let ok = match self.prv {
