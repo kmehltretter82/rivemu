@@ -318,6 +318,12 @@ impl Hart {
     }
 
     #[inline]
+    fn sfence_vma(&mut self, rs1_idx: u8, rs2_idx: u8, va: u64, asid: u64) {
+        self.tlb.sfence_vma(rs1_idx, rs2_idx, va, asid);
+        self.fetch_vpn = 0;
+    }
+
+    #[inline]
     fn flush_icache(&mut self) {
         self.icache_gen = self.icache_gen.wrapping_add(1);
         if self.icache_gen == 0 {
@@ -994,13 +1000,13 @@ impl Hart {
                 {
                     return Err(Self::illegal(insn));
                 }
-                self.flush_tlb();
+                self.sfence_vma(insn.rs1, insn.rs2, rs1, rs2);
             }
             Op::SfenceWInval | Op::SfenceInvalIr => {
                 if self.prv == Priv::User {
                     return Err(Self::illegal(insn));
                 }
-                self.flush_tlb();
+                self.fetch_vpn = 0;
             }
 
             // Zicbom / Zicboz (64-byte cache-block operations).
@@ -1361,9 +1367,14 @@ impl Hart {
                 }
                 let mode = v >> 60;
                 if matches!(mode, 0 | 8 | 9) {
+                    let old_mode = self.csr.satp >> 60;
                     // MODE, ASID (ASIDLEN = 16) and PPN cover all 64 bits.
                     self.csr.satp = v;
-                    self.flush_tlb();
+                    if old_mode != mode && old_mode != 0 && mode != 0 {
+                        self.flush_tlb();
+                    } else {
+                        self.fetch_vpn = 0;
+                    }
                 }
             }
             csr::MVENDORID | csr::MARCHID | csr::MIMPID | csr::MHARTID | csr::MCONFIGPTR => {

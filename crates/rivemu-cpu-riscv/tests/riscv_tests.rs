@@ -559,3 +559,247 @@ fn zicbom_permits_read_only_targets_and_reports_store_fault_causes() {
     }
 }
 
+#[test]
+fn sfence_vma_respects_asid_global_and_superpages() {
+    use rivemu_cpu_riscv::{Priv, csr};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(4 * MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    const VA_LOCAL: u64 = 0x8000_2000;
+    const VA_GLOBAL: u64 = 0x8000_3000;
+    const VA_NONLEAF_G: u64 = 0x8020_0000;
+    const VA_SUPER_A: u64 = 0x8040_1000;
+    const VA_SUPER_B: u64 = 0x8040_5000;
+
+    const PA_LOCAL_1: u64 = 0x8000_4000;
+    const PA_LOCAL_2: u64 = 0x8000_5000;
+    const PA_GLOBAL_1: u64 = 0x8000_6000;
+    const PA_GLOBAL_2: u64 = 0x8000_7000;
+    const PA_NONLEAF_1: u64 = 0x8000_8000;
+    const PA_NONLEAF_2: u64 = 0x8000_9000;
+
+    const ROOT_PT1: u64 = 0x8001_0000;
+    const L1_PT1: u64 = 0x8001_1000;
+    const L0_PT1: u64 = 0x8001_2000;
+    const L0_G_PT1: u64 = 0x8001_3000;
+
+    bus.write(PA_LOCAL_1, AccessSize::Word, 0x1111_1111).unwrap();
+    bus.write(PA_LOCAL_2, AccessSize::Word, 0x2222_2222).unwrap();
+    bus.write(PA_GLOBAL_1, AccessSize::Word, 0xaaaa_1111).unwrap();
+    bus.write(PA_GLOBAL_2, AccessSize::Word, 0xaaaa_2222).unwrap();
+    bus.write(PA_NONLEAF_1, AccessSize::Word, 0xbbbb_1111).unwrap();
+    bus.write(PA_NONLEAF_2, AccessSize::Word, 0xbbbb_2222).unwrap();
+
+    // Instructions at CODE:
+    //   0x00: lwu x1, 0(x10)          (0x0005_6083)
+    //   0x04: sfence.vma x0, x11      (0x12b0_0073) - ASID flush
+    //   0x08: sfence.vma x10, x11     (0x12b5_0073) - VA + ASID flush
+    //   0x0c: sfence.vma x10, x0      (0x1205_0073) - VA all-ASID (including global) flush
+    //   0x10: sfence.vma x0, x0       (0x1200_0073) - Full flush
+    bus.write(CODE, AccessSize::Word, 0x0005_6083).unwrap();
+    bus.write(CODE + 4, AccessSize::Word, 0x12b0_0073).unwrap();
+    bus.write(CODE + 8, AccessSize::Word, 0x12b5_0073).unwrap();
+    bus.write(CODE + 12, AccessSize::Word, 0x1205_0073).unwrap();
+    bus.write(CODE + 16, AccessSize::Word, 0x1200_0073).unwrap();
+
+    // Build Sv39 page table:
+    // Root[2] -> L1_PT1
+    // L1_PT1[0] -> L0_PT1 (non-global branch)
+    // L1_PT1[1] -> L0_G_PT1 with non-leaf G=1 (0x21)
+    // L1_PT1[2] -> 2 MiB superpage at 0x8020_0000 (initially mapped to 0x8020_0000)
+    bus.write(ROOT_PT1 + 2 * 8, AccessSize::Double, ((L1_PT1 >> 12) << 10) | 0x01)
+        .unwrap();
+    bus.write(L1_PT1, AccessSize::Double, ((L0_PT1 >> 12) << 10) | 0x01)
+        .unwrap();
+    bus.write(
+        L1_PT1 + 8,
+        AccessSize::Double,
+        ((L0_G_PT1 >> 12) << 10) | 0x21, // V | G on non-leaf PTE!
+    )
+    .unwrap();
+    bus.write(
+        L1_PT1 + 2 * 8,
+        AccessSize::Double,
+        ((0x8020_0000u64 >> 12) << 10) | 0xcf, // 2 MiB leaf V|R|W|X|A|D
+    )
+    .unwrap();
+
+    // L0_PT1[0]: CODE -> CODE (V|R|X|G|A = 0x6b)
+    // L0_PT1[2]: VA_LOCAL -> PA_LOCAL_1 (V|R|A = 0x43, G=0)
+    // L0_PT1[3]: VA_GLOBAL -> PA_GLOBAL_1 (V|R|G|A = 0x63, G=1)
+    bus.write(L0_PT1, AccessSize::Double, ((CODE >> 12) << 10) | 0x6b)
+        .unwrap();
+    bus.write(
+        L0_PT1 + 2 * 8,
+        AccessSize::Double,
+        ((PA_LOCAL_1 >> 12) << 10) | 0x43,
+    )
+    .unwrap();
+    bus.write(
+        L0_PT1 + 3 * 8,
+        AccessSize::Double,
+        ((PA_GLOBAL_1 >> 12) << 10) | 0x63,
+    )
+    .unwrap();
+    // L0_G_PT1[0]: VA_NONLEAF_G -> PA_NONLEAF_1 with leaf G=0 (0x43), inherits G=1 from L1_PT1[1]!
+    bus.write(
+        L0_G_PT1,
+        AccessSize::Double,
+        ((PA_NONLEAF_1 >> 12) << 10) | 0x43,
+    )
+    .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.prv = Priv::Supervisor;
+    let satp_asid1 = (8u64 << 60) | (1u64 << 44) | (ROOT_PT1 >> 12);
+    let satp_asid2 = (8u64 << 60) | (2u64 << 44) | (ROOT_PT1 >> 12);
+    h.csr_write(csr::SATP, satp_asid1).unwrap();
+
+    // 1. Warm TLB under ASID 1 for VA_LOCAL, VA_GLOBAL, and VA_NONLEAF_G.
+    for (va, expected) in [
+        (VA_LOCAL, 0x1111_1111),
+        (VA_GLOBAL, 0xaaaa_1111),
+        (VA_NONLEAF_G, 0xbbbb_1111),
+    ] {
+        h.pc = CODE;
+        h.x[10] = va;
+        h.step(&bus);
+        assert_eq!(h.x[1], expected);
+    }
+
+    // Rewrite PTEs in RAM to point to the *_2 physical pages without sfence.vma.
+    bus.write(
+        L0_PT1 + 2 * 8,
+        AccessSize::Double,
+        ((PA_LOCAL_2 >> 12) << 10) | 0x43,
+    )
+    .unwrap();
+    bus.write(
+        L0_PT1 + 3 * 8,
+        AccessSize::Double,
+        ((PA_GLOBAL_2 >> 12) << 10) | 0x63,
+    )
+    .unwrap();
+    bus.write(
+        L0_G_PT1,
+        AccessSize::Double,
+        ((PA_NONLEAF_2 >> 12) << 10) | 0x43,
+    )
+    .unwrap();
+
+    // 2. Switch to ASID 2: VA_GLOBAL (leaf G=1) and VA_NONLEAF_G (non-leaf G=1)
+    // still hit the cached *_1 entries across the ASID change!
+    h.csr_write(csr::SATP, satp_asid2).unwrap();
+    for (va, expected) in [(VA_GLOBAL, 0xaaaa_1111), (VA_NONLEAF_G, 0xbbbb_1111)] {
+        h.pc = CODE;
+        h.x[10] = va;
+        h.step(&bus);
+        assert_eq!(h.x[1], expected);
+    }
+
+    // 3. Switch back to ASID 1 and execute `sfence.vma x0, x11` (ASID 2) and
+    // `sfence.vma x10, x11` (VA_LOCAL, ASID 2): ASID 1's cached VA_LOCAL
+    // (0x1111_1111) and global entries must survive!
+    h.csr_write(csr::SATP, satp_asid1).unwrap();
+    h.pc = CODE + 4;
+    h.x[11] = 2;
+    h.step(&bus);
+    h.pc = CODE + 8;
+    h.x[10] = VA_LOCAL;
+    h.x[11] = 2;
+    h.step(&bus);
+    h.pc = CODE;
+    h.x[10] = VA_LOCAL;
+    h.step(&bus);
+    assert_eq!(h.x[1], 0x1111_1111);
+
+    // Executing `sfence.vma` under ASID 2 for VA_LOCAL now misses ASID 1's entry
+    // and walks PA_LOCAL_2 (0x2222_2222).
+    h.csr_write(csr::SATP, satp_asid2).unwrap();
+    h.pc = CODE;
+    h.x[10] = VA_LOCAL;
+    h.step(&bus);
+    assert_eq!(h.x[1], 0x2222_2222);
+
+    // Re-warm VA_LOCAL with PA_LOCAL_1 under ASID 1, then rewrite PTE to PA_LOCAL_2.
+    bus.write(
+        L0_PT1 + 2 * 8,
+        AccessSize::Double,
+        ((PA_LOCAL_1 >> 12) << 10) | 0x43,
+    )
+    .unwrap();
+    h.csr_write(csr::SATP, satp_asid1).unwrap();
+    h.pc = CODE + 8;
+    h.x[10] = VA_LOCAL;
+    h.x[11] = 1;
+    h.step(&bus);
+    h.pc = CODE;
+    h.x[10] = VA_LOCAL;
+    h.step(&bus);
+    assert_eq!(h.x[1], 0x1111_1111);
+    bus.write(
+        L0_PT1 + 2 * 8,
+        AccessSize::Double,
+        ((PA_LOCAL_2 >> 12) << 10) | 0x43,
+    )
+    .unwrap();
+
+    // 4. Flush ASID 1 (`sfence.vma x0, x11` with x11=1):
+    // VA_LOCAL (G=0) is invalidated and reloads 0x2222_2222, while both global
+    // mappings (leaf G=1 and non-leaf G=1) survive ASID-scoped invalidation!
+    h.pc = CODE + 4;
+    h.x[11] = 1;
+    h.step(&bus);
+    for (va, expected) in [
+        (VA_LOCAL, 0x2222_2222),
+        (VA_GLOBAL, 0xaaaa_1111),
+        (VA_NONLEAF_G, 0xbbbb_1111),
+    ] {
+        h.pc = CODE;
+        h.x[10] = va;
+        h.step(&bus);
+        assert_eq!(h.x[1], expected);
+    }
+
+    // 5. `sfence.vma x10, x0` (rs2 = x0) invalidates global mappings at x10.
+    for (va, expected) in [(VA_GLOBAL, 0xaaaa_2222), (VA_NONLEAF_G, 0xbbbb_2222)] {
+        h.pc = CODE + 12;
+        h.x[10] = va;
+        h.step(&bus);
+        h.pc = CODE;
+        h.x[10] = va;
+        h.step(&bus);
+        assert_eq!(h.x[1], expected);
+    }
+
+    // 6. Superpage invalidation: map 2 MiB at VA 0x8040_0000 -> PA 0x8020_0000,
+    // load from VA_SUPER_A (0x8040_1000), remap L1_PT1[2] -> PA 0x8000_0000, and
+    // execute `sfence.vma x10, x0` with x10 = VA_SUPER_B (0x8040_5000, a different
+    // 4 KiB page inside the same 2 MiB superpage).
+    bus.write(0x8020_1000, AccessSize::Word, 0x5555_1111).unwrap();
+    bus.write(0x8000_1000, AccessSize::Word, 0x5555_2222).unwrap();
+    h.pc = CODE;
+    h.x[10] = VA_SUPER_A;
+    h.step(&bus);
+    assert_eq!(h.x[1], 0x5555_1111);
+
+    bus.write(
+        L1_PT1 + 2 * 8,
+        AccessSize::Double,
+        ((0x8000_0000u64 >> 12) << 10) | 0xcf,
+    )
+    .unwrap();
+    h.pc = CODE + 12;
+    h.x[10] = VA_SUPER_B;
+    h.step(&bus);
+
+    h.pc = CODE;
+    h.x[10] = VA_SUPER_A;
+    h.step(&bus);
+    assert_eq!(h.x[1], 0x5555_2222);
+}
+

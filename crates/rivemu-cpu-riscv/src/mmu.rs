@@ -44,6 +44,7 @@ mod pte {
     pub(super) const W: u64 = 1 << 2;
     pub(super) const X: u64 = 1 << 3;
     pub(super) const U: u64 = 1 << 4;
+    pub(super) const G: u64 = 1 << 5;
     pub(super) const A: u64 = 1 << 6;
     pub(super) const D: u64 = 1 << 7;
     pub(super) const PPN_MASK: u64 = (1 << 44) - 1;
@@ -62,8 +63,12 @@ struct TlbEntry {
     pa_page: u64,
     /// Flush epoch matching [`Tlb::epoch`].
     epoch: u32,
-    /// Leaf PTE flags (low 8 bits).
+    /// Address-space identifier (`satp.ASID`) when the entry was installed.
+    asid: u16,
+    /// Leaf PTE flags (low 8 bits, with non-leaf `G` propagated into bit 5).
     flags: u8,
+    /// Page-table level (`0` = 4 KiB, `1` = 2 MiB, `2` = 1 GiB, `3` = 512 GiB).
+    level: u8,
 }
 
 /// Direct-mapped TLB caching leaf translations. Permissions are re-checked
@@ -72,6 +77,7 @@ struct TlbEntry {
 pub(crate) struct Tlb {
     entries: Box<[TlbEntry; TLB_SIZE]>,
     epoch: u32,
+    has_superpages: bool,
 }
 
 impl Default for Tlb {
@@ -79,6 +85,7 @@ impl Default for Tlb {
         Self {
             entries: Box::new([TlbEntry::default(); TLB_SIZE]),
             epoch: 1,
+            has_superpages: false,
         }
     }
 }
@@ -90,6 +97,68 @@ impl Tlb {
         if self.epoch == 0 {
             self.entries.fill(TlbEntry::default());
             self.epoch = 1;
+        }
+        self.has_superpages = false;
+    }
+
+    /// Selective TLB invalidation for `sfence.vma` / `sinval.vma` per RISC-V
+    /// Privileged Spec Section 12.2.1.
+    pub(crate) fn sfence_vma(&mut self, rs1_idx: u8, rs2_idx: u8, va: u64, asid: u64) {
+        let target_asid = (asid & 0xffff) as u16;
+        let vpn = va >> 12;
+        match (rs1_idx != 0, rs2_idx != 0) {
+            (false, false) => self.flush(),
+            (true, false) => {
+                if !self.has_superpages {
+                    let e = &mut self.entries[(vpn as usize) & (TLB_SIZE - 1)];
+                    if e.epoch == self.epoch && e.tag == vpn.wrapping_add(1) {
+                        e.tag = 0;
+                    }
+                } else {
+                    for e in self.entries.iter_mut() {
+                        if e.epoch == self.epoch
+                            && e.tag != 0
+                            && ((e.tag - 1) ^ vpn) >> (9 * u32::from(e.level)) == 0
+                        {
+                            e.tag = 0;
+                        }
+                    }
+                }
+            }
+            (false, true) => {
+                for e in self.entries.iter_mut() {
+                    if e.epoch == self.epoch
+                        && e.tag != 0
+                        && e.flags & (pte::G as u8) == 0
+                        && e.asid == target_asid
+                    {
+                        e.tag = 0;
+                    }
+                }
+            }
+            (true, true) => {
+                if !self.has_superpages {
+                    let e = &mut self.entries[(vpn as usize) & (TLB_SIZE - 1)];
+                    if e.epoch == self.epoch
+                        && e.tag == vpn.wrapping_add(1)
+                        && e.flags & (pte::G as u8) == 0
+                        && e.asid == target_asid
+                    {
+                        e.tag = 0;
+                    }
+                } else {
+                    for e in self.entries.iter_mut() {
+                        if e.epoch == self.epoch
+                            && e.tag != 0
+                            && e.flags & (pte::G as u8) == 0
+                            && e.asid == target_asid
+                            && ((e.tag - 1) ^ vpn) >> (9 * u32::from(e.level)) == 0
+                        {
+                            e.tag = 0;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -260,11 +329,13 @@ impl Hart {
             }
             return Ok(va);
         }
+        let asid = ((self.csr.satp >> 44) & 0xffff) as u16;
         let tag = (va >> 12) + 1;
         let e = self.tlb.entries[((va >> 12) as usize) & (TLB_SIZE - 1)];
         let flags = u64::from(e.flags);
         if e.tag == tag
             && e.epoch == self.tlb.epoch
+            && (flags & pte::G != 0 || e.asid == asid)
             && self.pte_permits(flags, prv, acc)
             && (acc != Access::Store || flags & pte::D != 0)
         {
@@ -366,6 +437,7 @@ impl Hart {
             return Err(acc.page_fault(va));
         }
         let mut table = (self.csr.satp & pte::PPN_MASK) << 12;
+        let mut global = 0u64;
         for level in (0..levels).rev() {
             let idx = (va >> (12 + 9 * level)) & 0x1ff;
             let pte_addr = table + idx * 8;
@@ -381,6 +453,7 @@ impl Hart {
             {
                 return Err(acc.page_fault(va));
             }
+            global |= pte & pte::G;
             let pbmt = (pte & pte::PBMT_MASK) >> pte::PBMT_SHIFT;
             let ppn = (pte >> 10) & pte::PPN_MASK;
             if pte & (pte::R | pte::X) == 0 {
@@ -424,12 +497,18 @@ impl Hart {
                 bus.write(pte_addr, AccessSize::Double, new)
                     .map_err(|_| acc.access_fault(va))?;
             }
+            let asid = ((self.csr.satp >> 44) & 0xffff) as u16;
             let pa_page = (ppn | ((va >> 12) & low_mask)) << 12;
+            if level > 0 {
+                self.tlb.has_superpages = true;
+            }
             self.tlb.entries[((va >> 12) as usize) & (TLB_SIZE - 1)] = TlbEntry {
                 tag: (va >> 12) + 1,
                 pa_page,
                 epoch: self.tlb.epoch,
-                flags: new as u8,
+                asid,
+                flags: (new | global) as u8,
+                level: level as u8,
             };
             return Ok(pa_page | (va & 0xfff));
         }
