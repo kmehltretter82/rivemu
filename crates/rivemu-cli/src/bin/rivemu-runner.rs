@@ -47,6 +47,16 @@ fn find_kernel() -> Result<PathBuf> {
     ))
 }
 
+fn power_event_result(event: PowerEvent, require_poweroff: bool) -> Result<i32> {
+    match event {
+        PowerEvent::Poweroff(code) => Ok(code),
+        PowerEvent::Reset if require_poweroff => {
+            bail!("guest reset while RIVEMU_REQUIRE_POWEROFF is set")
+        }
+        PowerEvent::Reset => Ok(0),
+    }
+}
+
 fn run() -> Result<i32> {
     let mut args = std::env::args().skip(1);
     let Some(bin_arg) = args.next() else {
@@ -83,6 +93,7 @@ fn run() -> Result<i32> {
     }
 
     let strict = std::env::var_os("RIVEMU_STRICT").is_some();
+    let require_poweroff = std::env::var_os("RIVEMU_REQUIRE_POWEROFF").is_some();
     let mut machine = Machine::new(MachineConfig {
         ram_size: 256 * MIB,
         smp,
@@ -108,10 +119,7 @@ fn run() -> Result<i32> {
                 stdout.write_all(&out)?;
                 stdout.flush()?;
             }
-            return Ok(match ev {
-                PowerEvent::Poweroff(code) => code,
-                PowerEvent::Reset => 0,
-            });
+            return power_event_result(ev, require_poweroff);
         }
         let out = machine.uart.take_output();
         if !out.is_empty() {
@@ -121,5 +129,25 @@ fn run() -> Result<i32> {
         if machine.all_idle() {
             std::thread::sleep(machine.idle_timeout().min(Duration::from_millis(2)));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evidence_mode_requires_poweroff_instead_of_reset() {
+        assert_eq!(
+            power_event_result(PowerEvent::Poweroff(7), true).unwrap(),
+            7
+        );
+        assert_eq!(power_event_result(PowerEvent::Reset, false).unwrap(), 0);
+        assert!(
+            power_event_result(PowerEvent::Reset, true)
+                .unwrap_err()
+                .to_string()
+                .contains("RIVEMU_REQUIRE_POWEROFF")
+        );
     }
 }

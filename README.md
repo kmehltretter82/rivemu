@@ -68,6 +68,46 @@ Fetch the upstream OpenSBI v1.7 + Debian RISC-V Linux 6.12 + BusyBox + VirtIO te
 RIVEMU_LINUX_TEST=1 cargo test --release -p rivemu-machine --test linux_boot -- --nocapture
 ```
 
+### Linux kernel A/B evidence
+
+Use `scripts/linux_ab.py` (Python 3.10 or newer) to run one reproducer under two kernel images with the same Rivemu binary, machine shape, init payload, and guest arguments. The reproducer should print exactly one result line (for example, `RIVEMU_AB_RESULT=BUG` or `RIVEMU_AB_RESULT=PASS`) and then power off cleanly.
+
+```sh
+cargo build --release --bin rivemu-runner
+python3 scripts/linux_ab.py \
+    --kernel-a /path/to/Image.before \
+    --kernel-b /path/to/Image.after \
+    --label-a BAD_KERNEL_COMMIT \
+    --label-b FIXED_KERNEL_COMMIT \
+    --init /path/to/reproducer-init \
+    --expect-a 'RIVEMU_AB_RESULT=BUG' \
+    --expect-b 'RIVEMU_AB_RESULT=PASS' \
+    --smp 1 --strict --timeout 90 \
+    --out linux-ab-results/my-test -- reproducer.option=value
+```
+
+The driver runs A and B sequentially, requires clean poweroff, enforces a process-group timeout, rejects ambiguous or conflicting result markers, rejects mutable `RIVEMU_SHARE_DIR` state, and verifies that every hashed input remains unchanged across both runs. It refuses identical kernels unless `--allow-same-kernel` is supplied for an orchestration control. Its evidence directory contains both complete console logs, `manifest.json` with SHA-256 identities and run metadata, and `report.md` with wording suitable for a review note or commit message. The runner binary's SHA-256 is the executable identity; workspace Git state is recorded separately and is not claimed as a binary build stamp. Whole boot logs are retained but not compared because timestamps and SMP output ordering are not stable oracles.
+
+The downloaded smoke image can exercise the complete path as a same-kernel control:
+
+```sh
+python3 scripts/linux_ab.py \
+    --kernel-a images/linux-test/Image \
+    --kernel-b images/linux-test/Image \
+    --label-a control-a --label-b control-b \
+    --init images/linux-test/rootfs.cpio \
+    --expect-a RIVEMU_SMOKE_OK --expect-b RIVEMU_SMOKE_OK \
+    --allow-same-kernel --smp 1 --timeout 90 -- rivemu.poweroff
+```
+
+The generated control report is labeled `CONTROL PASS` and explicitly states that it is not kernel A/B evidence.
+
+Run the orchestration tests without booting a guest:
+
+```sh
+python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+```
+
 ## Workspace Layout
 
 | Crate | Purpose |
