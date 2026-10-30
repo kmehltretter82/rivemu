@@ -854,4 +854,127 @@ fn mret_with_zero_pmp_rules_retires_before_fetch_access_fault() {
     assert_eq!((post_mstatus >> 7) & 1, 1);
 }
 
+#[test]
+fn sv48_four_level_walk_superpages_and_canonical_check() {
+    use rivemu_cpu_riscv::{Priv, csr};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(16 * MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    const STVEC: u64 = 0x8000_1000;
+    const PA_POS: u64 = 0x8000_2000;
+    const PA_NEG: u64 = 0x8000_3000;
+    const L3_PT: u64 = 0x8001_0000;
+    const L2_POS_PT: u64 = 0x8001_1000;
+    const L1_POS_PT: u64 = 0x8001_2000;
+    const L0_POS_PT: u64 = 0x8001_3000;
+    const L2_NEG_PT: u64 = 0x8001_4000;
+
+    // Positive Sv48 4-level VA: vpn[3]=106 (0x6a), vpn[2]=170 (0xaa), vpn[1]=0, vpn[0]=2
+    const VA_POS_4K: u64 = (106u64 << 39) | (170u64 << 30) | (2u64 << 12);
+    // Negative canonical Sv48 VA (bits 63:47 all 1): vpn[3]=341 (0x155), vpn[2]=2 (1 GiB leaf)
+    const VA_NEG_1G: u64 = 0xffff_8000_0000_0000u64 | (341u64 << 39) | (2u64 << 30) | 0x3000;
+    // Misaligned 512 GiB L3 superpage at vpn[3]=200
+    const VA_MISALIGNED_512G: u64 = 200u64 << 39;
+    // Non-canonical Sv48 VAs: bit 47 = 1 with bits 63:48 = 0, and bit 47 = 0 with bits 63:48 = 0xffff
+    const VA_NONCANON_POS: u64 = 1u64 << 47;
+    const VA_NONCANON_NEG: u64 = 0xffff_0000_0000_0000u64;
+
+    // lw x1, 0(x10)
+    bus.write(CODE, AccessSize::Word, 0x0005_2083).unwrap();
+    bus.write(PA_POS, AccessSize::Word, 0x1234_5678).unwrap();
+    bus.write(PA_NEG, AccessSize::Word, 0x7654_3210).unwrap();
+
+    // Identity-map 0x8000_0000 via L3_PT[0] -> L2_POS_PT[2] (1 GiB leaf V|R|W|X|A|D = 0xcf)
+    bus.write(L3_PT, AccessSize::Double, ((L2_POS_PT >> 12) << 10) | 0x01)
+        .unwrap();
+    bus.write(
+        L2_POS_PT + 2 * 8,
+        AccessSize::Double,
+        ((0x8000_0000u64 >> 12) << 10) | 0xcf,
+    )
+    .unwrap();
+
+    // 4-level walk for VA_POS_4K: L3_PT[106] -> L2_POS_PT[170] -> L1_POS_PT[0] -> L0_POS_PT[2] -> PA_POS
+    bus.write(
+        L3_PT + 106 * 8,
+        AccessSize::Double,
+        ((L2_POS_PT >> 12) << 10) | 0x01,
+    )
+    .unwrap();
+    bus.write(
+        L2_POS_PT + 170 * 8,
+        AccessSize::Double,
+        ((L1_POS_PT >> 12) << 10) | 0x01,
+    )
+    .unwrap();
+    bus.write(L1_POS_PT, AccessSize::Double, ((L0_POS_PT >> 12) << 10) | 0x01)
+        .unwrap();
+    bus.write(
+        L0_POS_PT + 2 * 8,
+        AccessSize::Double,
+        ((PA_POS >> 12) << 10) | 0xc7,
+    )
+    .unwrap();
+
+    // Negative canonical 1 GiB superpage walk: L3_PT[341] -> L2_NEG_PT[2] -> 0x8000_0000 (1 GiB leaf)
+    bus.write(
+        L3_PT + 341 * 8,
+        AccessSize::Double,
+        ((L2_NEG_PT >> 12) << 10) | 0x01,
+    )
+    .unwrap();
+    bus.write(
+        L2_NEG_PT + 2 * 8,
+        AccessSize::Double,
+        ((0x8000_0000u64 >> 12) << 10) | 0xc7,
+    )
+    .unwrap();
+
+    // Misaligned 512 GiB L3 leaf at L3_PT[200]: PPN = 0x80000 (low 27 bits of PPN are non-zero!)
+    bus.write(
+        L3_PT + 200 * 8,
+        AccessSize::Double,
+        ((0x8000_0000u64 >> 12) << 10) | 0xc7,
+    )
+    .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.prv = Priv::Supervisor;
+    h.csr_write(csr::MEDELEG, 1 << 13).unwrap();
+    h.csr_write(csr::STVEC, STVEC).unwrap();
+    // satp.MODE = 9 (Sv48)
+    h.csr_write(csr::SATP, (9u64 << 60) | (L3_PT >> 12))
+        .unwrap();
+
+    // 1. 4-level positive Sv48 walk and debug_translate
+    assert_eq!(h.debug_translate(&bus, VA_POS_4K), Some(PA_POS));
+    h.pc = CODE;
+    h.x[10] = VA_POS_4K;
+    h.step(&bus);
+    assert_eq!(h.x[1], 0x1234_5678);
+
+    // 2. Negative canonical Sv48 1 GiB superpage walk and debug_translate
+    assert_eq!(h.debug_translate(&bus, VA_NEG_1G), Some(PA_NEG));
+    h.pc = CODE;
+    h.x[10] = VA_NEG_1G;
+    h.step(&bus);
+    assert_eq!(h.x[1], 0x7654_3210);
+
+    // 3. Misaligned 512 GiB L3 superpage and non-canonical Sv48 VAs must fault with Load Page Fault (13)
+    for bad_va in [VA_MISALIGNED_512G, VA_NONCANON_POS, VA_NONCANON_NEG] {
+        assert_eq!(h.debug_translate(&bus, bad_va), None);
+        h.pc = CODE;
+        h.x[10] = bad_va;
+        h.step(&bus);
+        assert_eq!(h.pc, STVEC);
+        assert_eq!(h.csr_read(csr::SCAUSE).unwrap(), 13);
+        assert_eq!(h.csr_read(csr::STVAL).unwrap(), bad_va);
+    }
+}
+
+
 

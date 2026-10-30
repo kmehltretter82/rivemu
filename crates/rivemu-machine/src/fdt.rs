@@ -85,7 +85,7 @@ pub(crate) fn build(p: &FdtParams<'_>) -> Vec<u8> {
         f.prop_strs("riscv,isa-extensions", ISA_EXTENSIONS);
         f.prop_u32("riscv,cbom-block-size", 64);
         f.prop_u32("riscv,cboz-block-size", 64);
-        f.prop_str("mmu-type", "riscv,sv39");
+        f.prop_str("mmu-type", "riscv,sv48");
         f.begin_node("interrupt-controller");
         f.prop_u32("#interrupt-cells", 1);
         f.prop_null("interrupt-controller");
