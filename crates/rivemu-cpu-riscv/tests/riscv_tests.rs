@@ -532,7 +532,7 @@ fn zicbom_permits_read_only_targets_and_reports_store_fault_causes() {
         h.step(&bus);
         assert_eq!(h.pc, TRAP);
         assert_eq!(h.csr.mcause, cause::STORE_ACCESS);
-        assert_eq!(h.csr.mtval, DATA);
+        assert_eq!(h.csr.mtval, DATA + 19);
     }
 
     // 3. On an execute-only Sv39 page (R=0, W=0, X=1) with open PMP, MXR=0
@@ -547,7 +547,7 @@ fn zicbom_permits_read_only_targets_and_reports_store_fault_causes() {
         h.step(&bus);
         assert_eq!(h.pc, TRAP);
         assert_eq!(h.csr.mcause, cause::STORE_PAGE_FAULT);
-        assert_eq!(h.csr.mtval, DATA);
+        assert_eq!(h.csr.mtval, DATA + 19);
     }
 
     h.csr.mstatus |= status::MXR;

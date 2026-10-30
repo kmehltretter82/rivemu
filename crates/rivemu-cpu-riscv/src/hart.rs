@@ -1017,8 +1017,10 @@ impl Hart {
                     return Err(Self::illegal(insn));
                 }
                 let base_va = rs1 & !63;
-                let pa = self.translate(bus, base_va, Access::CacheBom)?;
-                self.check_pmp_access(base_va, pa, 64, Access::CacheBom)?;
+                let pa = self
+                    .translate(bus, base_va, Access::CacheBom)
+                    .map_err(|e| Exception::new(e.cause, rs1))?;
+                self.check_pmp_access(rs1, pa, 64, Access::CacheBom)?;
                 self.invalidate_reservation(pa);
                 bus.invalidate_cache_line(pa, AccessSize::Double);
             }
@@ -1032,8 +1034,10 @@ impl Hart {
                     return Err(Self::illegal(insn));
                 }
                 let base_va = rs1 & !63;
-                let pa = self.translate(bus, base_va, Access::CacheBom)?;
-                self.check_pmp_access(base_va, pa, 64, Access::CacheBom)?;
+                let pa = self
+                    .translate(bus, base_va, Access::CacheBom)
+                    .map_err(|e| Exception::new(e.cause, rs1))?;
+                self.check_pmp_access(rs1, pa, 64, Access::CacheBom)?;
                 self.invalidate_reservation(pa);
                 bus.invalidate_cache_line(pa, AccessSize::Double);
             }
@@ -1047,13 +1051,15 @@ impl Hart {
                     return Err(Self::illegal(insn));
                 }
                 let base_va = rs1 & !63;
-                let pa = self.translate(bus, base_va, Access::Store)?;
-                self.check_pmp_access(base_va, pa, 64, Access::Store)?;
+                let pa = self
+                    .translate(bus, base_va, Access::Store)
+                    .map_err(|e| Exception::new(e.cause, rs1))?;
+                self.check_pmp_access(rs1, pa, 64, Access::Store)?;
                 self.invalidate_reservation(pa);
                 bus.invalidate_cache_line(pa, AccessSize::Double);
                 for off in (0..64u64).step_by(8) {
                     bus.write(pa + off, AccessSize::Double, 0)
-                        .map_err(|_| Exception::new(cause::STORE_ACCESS, base_va))?;
+                        .map_err(|_| Exception::new(cause::STORE_ACCESS, rs1))?;
                 }
             }
 

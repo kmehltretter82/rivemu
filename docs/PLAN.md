@@ -150,4 +150,77 @@ Total for P0–P5: roughly **4 months** for one developer.
 - [x] **P8** – `virtio-9p-device` (`9P2000.L`) host directory sharing (`-fsdev` / `-virtfs` / `-device virtio-9p-device`)
 - [x] **P9** – `Zba`, `Zbb`, `Zbc`, and `Zbs` RISC-V bit-manipulation extensions (RVA22U64 compliance) + FDT advertisement
 - [x] **P10** – Instant sparse VM snapshots (`-savevm` / `-loadvm` + HMP `savevm`) using dirty-page bitmaps for `< 50 ms` restore-to-shell
+- [x] **P11** – Hardware-realism `-strict` mode (`strict-align`, `Svade`/`Svadu` via `menvcfg.ADUE`, 16-entry `TOR`/`NA4`/`NAPOT` PMP with TLB-cached fast path, 64B cache-line `LR`/`SC` reservation directory with DMA invalidation) and RVA22S64 extensions (`Zicbom`, `Zicboz`, `Svpbmt`, `Svinval`)
+- [x] **P12** – PCIe ECAM host bridge (`pci-host-ecam-generic`) with MSI/INTx, `virtio-pci` 1.0 modern transport, QEMU `fw_cfg`, CFI01 NOR `pflash`, `virtio-gpu-device` (2D scanout), `virtio-input-device`, RFB/VNC server (`-vnc`), and PPM `screendump`
+- [x] **P13** – Differential lockstep verification (`rivemu-lockstep`) against Sail RISC-V (`sail-riscv-debug-v1`) and `qemu-system-riscv64` across 13 suites (`alu`, `control`, `fence-i`, `mul`, `bitmanip`, `float`, `fp-edges`, `mem`, `csr`, `privileged`, `sv39`, `atomics`, `compressed`) + report-grade Linux kernel A/B runner (`scripts/linux_ab.py`)
+
+---
+
+## 8. Extended Roadmap (P14–P20)
+
+```mermaid
+flowchart LR
+    P14["P14 ASID/VA TLB + Sv48/Svade/Svpbmt Lockstep"] --> P15["P15 Full RV64C + PMP Lockstep"]
+    P15 --> P16["P16 Cross-Privilege Boot Lockstep"]
+    P16 --> P17["P17 Superblock Cache + Direct SoftTLB"]
+    P17 --> P18["P18 Zicond, Zfa, Sscofpmf PMU"]
+    P18 --> P19["P19 PCIe NVMe, Vsock, Snapshot v2"]
+    P19 --> P20["P20 Continuous Lockstep Fuzzing"]
+```
+
+### P14 – Selective ASID/VA TLB & Extended Virtual-Memory Lockstep (`Sv48` / `Svade` / `Svpbmt` / `Svinval`)
+- **Selective TLB in `rivemu-cpu-riscv` (`src/mmu.rs`, `src/hart.rs`):**
+  - Tag [`TlbEntry`](../crates/rivemu-cpu-riscv/src/mmu.rs) with `asid: u16`, `global: bool` (`PTE_G`), and page-size mask (`level`: 4 KiB, 2 MiB, 1 GiB, 512 GiB).
+  - Avoid full-TLB flushes on `satp` ASID switches when `MODE` is unchanged; implement selective `sfence.vma rs1, rs2` and `sinval.vma rs1, rs2` invalidation by `(va, asid)` while honouring `PTE_G` (global mappings are not evicted by ASID-specific flushes).
+- **Extended VM Lockstep (`rivemu-lockstep`):**
+  - Add 4-level `Sv48` (`satp.MODE = 9`) lockstep coverage: 512 GiB / 1 GiB / 2 MiB superpages, misaligned superpages at levels 1..3, and 48-bit canonical-VA boundaries (`va[63:48] != sign_extend(va[47])`).
+  - Add `PTE_G` global-page preservation across `ASID`-selective `sfence.vma x0, rs2`.
+  - Add `Svade` (`A=0` / `D=0` page faults) vs. `Svadu` (`menvcfg.ADUE = 1` hardware A/D updates), `Svpbmt` (`PBMT` attributes and reserved `PBMT=3` faults), and `Svinval` (`sfence.w.inval` / `sinval.vma` / `sfence.inval.ir`) lockstep cases.
+- **Exit:** `rivemu` preserves non-matching TLB entries across selective `SFENCE.VMA` and ASID context switches; `sv39`/`sv48` lockstep suites pass against Sail and QEMU.
+
+### P15 – Complete RV64C & PMP Differential Lockstep
+- **Compressed (`Suite::Compressed`) Expansion (`rivemu-lockstep`):**
+  - Extend `generate_compressed_block` beyond integer/GPR scratch ops to include compressed floating-point loads/stores (`C.FLD`, `C.FSD`, `C.FLDSP`, `C.FSDSP`), forward compressed branches/jumps (`C.BEQZ`, `C.BNEZ`, `C.J`, `C.JR`, `C.JALR`), mixed 16/32-bit instruction alignment across 4 KiB page boundaries, and 16-bit illegal instructions (`c.unimp`, reserved encodings) verifying `mepc`/`sepc` `+2` advancement in trap handlers.
+- **PMP Lockstep (`Suite::Pmp`):**
+  - Add a PMP-enabled Sail configuration (`pmp.count = 16`) and a dedicated `pmp` lockstep suite exercising `OFF`, `TOR`, `NA4`, and `NAPOT` address matching, lowest-index priority precedence, `L`-bit enforcement in M-mode, boundary-straddling 2/4/8-byte loads and stores, S-mode page-table walks blocked by PMP, and `Zicbom`/`Zicboz` PMP access-fault reporting (`STORE_ACCESS = 7`).
+- **Exit:** `compressed` and `pmp` suites pass 100% in per-instruction lockstep against both Sail and QEMU.
+
+### P16 – Translated & Lower-Privilege Firmware/Kernel Boot Lockstep (`boot` v2)
+- **Device-Free Translated Stepping (`rivemu-lockstep/src/lockstep/mod.rs`):**
+  - Use `Hart::debug_translate` when reading instruction words at `pc` in `boot` mode, and decode both 16-bit and 32-bit instructions via `fetch_and_decode`.
+  - Permit `boot` lockstep to continue across `MRET` into S-mode and `satp` activation (with interrupts still masked or deterministically injected at `-icount` boundaries), comparing full privileged state (`ArchState`) across the OpenSBI $\to$ early Linux `head.S` / `setup_arch` handoff.
+- **Exit:** `rivemu-lockstep boot --check-csrs` steps through OpenSBI domain init, `MRET` to S-mode, and early Linux `Sv39`/`Sv48` page-table setup with zero divergence against QEMU.
+
+### P17 – Interpreter Superblock Cache & Direct-Pointer SoftTLB
+- **Decoded Basic-Block / Superblock Cache (`rivemu-cpu-riscv`):**
+  - Group contiguous decoded instructions up to a branch, trap-capable CSR write, or 4 KiB page boundary into cached basic blocks keyed by `(pa, prv_flags)` so sequential execution amortizes fetch/PC/icount bookkeeping across the block.
+  - Fuse high-frequency RISC-V instruction pairs (`auipc + addi`, `auipc + ld`, `auipc + jalr`, `lui + addi`, `slli + srli` 32-bit zero extension, `beq/bne + addi` loop tails).
+- **Direct Host-Offset SoftTLB:**
+  - Cache the pre-validated `fast_ram` byte offset directly inside `TlbEntry` when `PBMT == 0` and `!pmp_subpage`, turning a 64-bit aligned load/store TLB hit into a single tag check and direct `Ram` slice access.
+- **Exit:** Single-hart Linux-to-shell boot drops from `~16 s` to **< 8 s** on Apple Silicon (`-smp 4` in **< 10 s**) with `#![forbid(unsafe_code)]` preserved in `rivemu-cpu-riscv`.
+
+### P18 – Modern ISA Extensions: `Zicond`, `Zfa`, and `Sscofpmf` PMU Overflow
+- **`Zicond` (Integer Conditional Operations):**
+  - Implement `czero.eqz` and `czero.nez` in `rivemu-cpu-riscv`, advertise `zicond` in the generated FDT `riscv,isa-extensions`, and add lockstep coverage in `rivemu-lockstep`.
+- **`Zfa` (Additional Floating-Point Instructions):**
+  - Implement `fli.{s,d}`, `fminm.{s,d}`, `fmaxm.{s,d}`, `fround.{s,d}`, `froundnx.{s,d}`, `fcvtmod.w.d`, `fleq.{s,d}`, and `fltq.{s,d}` in `rivemu-softfloat` / `rivemu-cpu-riscv`, with directed edge cases in `Suite::FpEdges`.
+- **`Sscofpmf` (Count Overflow and Mode-Based Filtering):**
+  - Implement `scountovf` CSR (`0xda0`), `mhpmevent3..31` mode-filtering bits (`MINH`, `SINH`, `UINH`, `OF`), and local counter-overflow interrupt (`LCOFI`, interrupt cause 13) so guest Linux `perf` can profile workloads inside `rivemu`.
+- **Exit:** Differential lockstep passes for `Zicond` and `Zfa`; guest Linux `perf stat` and PMU overflow interrupts pass integration tests.
+
+### P19 – PCIe NVMe, `virtio-vsock`, and Instant Snapshot v2
+- **PCIe NVMe Controller (`rivemu-devices` / `rivemu-machine`):**
+  - Implement an NVMe 1.4 PCIe endpoint (`-device nvme,drive=...`) with Admin and I/O Submission/Completion Queues, PRP1/PRP2 DMA, and MSI-X / INTx interrupts on the existing PCIe ECAM bus for testing Linux NVMe and block-layer patches.
+- **`virtio-vsock` Host/Guest Transport (`rivemu-virtio` / `rivemu-backends`):**
+  - Add `virtio-vsock-device` (`AF_VSOCK` CID 2 host $\leftrightarrow$ CID 3 guest) for low-latency, network-free command execution and structured result streaming in `rivemu-runner` and `scripts/linux_ab.py`.
+- **Snapshot v2 (PCI + QCOW2 State):**
+  - Extend `-savevm` / `-loadvm` to serialize PCI config space, `virtio-pci` queues, and dirty QCOW2 clusters so `scripts/linux_ab.py` or interactive sessions can snapshot a booted userspace and restore in `< 20 ms`.
+- **Exit:** Linux mounts an NVMe root/scratch disk over PCIe ECAM; `virtio-vsock` and Snapshot v2 pass end-to-end guest tests.
+
+### P20 – Continuous Multi-Worker Lockstep Fuzzing & Auto-Minimization
+- **Unified `Suite::All` v2 & Campaign Runner (`rivemu-lockstep`):**
+  - Add `rivemu-lockstep campaign --workers N --duration <secs>` running randomized seeds across all 14+ suites in parallel against Sail and QEMU.
+  - On any divergence, automatically bisect to 1 instruction and emit a self-contained Rust regression test skeleton ready to paste into `crates/rivemu-cpu-riscv/tests/riscv_tests.rs`.
+- **Exit:** 100,000+ instruction lockstep campaigns run cleanly in CI/overnight mode with zero divergences.
+
 
