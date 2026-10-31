@@ -523,6 +523,44 @@ impl AddressSpace {
         }
     }
 
+    /// 128-bit atomic compare-and-swap on guest RAM (`amocas.q`).
+    #[inline]
+    pub fn atomic_cas128(
+        &self,
+        addr: GuestAddr,
+        expected: (u64, u64),
+        new: (u64, u64),
+    ) -> Result<(u64, u64), BusError> {
+        if let Some((base, len, ref ram)) = self.fast_ram {
+            let off = addr.wrapping_sub(base);
+            if off < len {
+                let old = ram
+                    .atomic_cas128(off, expected, new)
+                    .ok_or(BusError::CrossesBoundary { addr, size: 16 })?;
+                invalidate_reservation_range(&self.line_seq, addr, 16);
+                return Ok(old);
+            }
+        }
+        let r = self
+            .find(addr)
+            .ok_or(BusError::Unmapped { addr, size: 16 })?;
+        if !r.fits(addr, 16) {
+            return Err(BusError::CrossesBoundary { addr, size: 16 });
+        }
+        let off = addr - r.base;
+        match &r.kind {
+            RegionKind::Ram(m) => {
+                let old = m
+                    .atomic_cas128(off, expected, new)
+                    .ok_or(BusError::CrossesBoundary { addr, size: 16 })?;
+                invalidate_reservation_range(&self.line_seq, addr, 16);
+                Ok(old)
+            }
+            RegionKind::Rom(_) => Err(BusError::ReadOnly { addr }),
+            RegionKind::Mmio(_) => Err(BusError::NotMemory { addr }),
+        }
+    }
+
     /// Applies `f(memory, offset_in_region, offset_in_request, chunk_len)` to
     /// every memory chunk covering `[addr, addr + len)`. Spans adjacent
     /// RAM/ROM regions; fails on holes or MMIO.

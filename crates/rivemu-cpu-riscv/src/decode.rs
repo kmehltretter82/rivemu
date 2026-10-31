@@ -78,10 +78,13 @@ pub enum Op {
     Divuw,
     Remw,
     Remuw,
-    // A (`dbl` selects .D; `funct` holds the AMO operation)
+    // A / Zacas / Zabha / Zalasr (`imm` holds funct3 width 0..=4; `funct` holds funct5)
     Lr,
     Sc,
     Amo,
+    AmoCas,
+    LoadAq,
+    StoreRl,
     // Zicsr (`imm` holds the CSR number; immediate forms use `rs1` as zimm)
     Csrrw,
     Csrrs,
@@ -518,25 +521,34 @@ pub fn decode(raw: u32) -> Insn {
                 (op, (raw >> 20) as i32)
             }
         },
-        0x2f if f3 == 2 || f3 == 3 => {
+        0x2f => {
             insn.dbl = f3 == 3;
             let f5 = (raw >> 27) as u8;
+            let aq = (raw >> 26) & 1 != 0;
+            let rl = (raw >> 25) & 1 != 0;
             insn.funct = f5;
-            let op = match f5 {
-                0x02 if rs2 == 0 => Op::Lr,
-                0x03 => Op::Sc,
-                amo::ADD
-                | amo::SWAP
-                | amo::XOR
-                | amo::OR
-                | amo::AND
-                | amo::MIN
-                | amo::MAX
-                | amo::MINU
-                | amo::MAXU => Op::Amo,
+            let op = match (f5, f3) {
+                (0x02, 2 | 3) if rs2 == 0 => Op::Lr,
+                (0x03, 2 | 3) => Op::Sc,
+                (0x05, 0..=3) => Op::AmoCas,
+                (0x05, 4) if (rd | rs2) & 1 == 0 => Op::AmoCas,
+                (0x06, 0..=3) if aq && rs2 == 0 => Op::LoadAq,
+                (0x07, 0..=3) if rl && rd == 0 => Op::StoreRl,
+                (
+                    amo::ADD
+                    | amo::SWAP
+                    | amo::XOR
+                    | amo::OR
+                    | amo::AND
+                    | amo::MIN
+                    | amo::MAX
+                    | amo::MINU
+                    | amo::MAXU,
+                    0..=3,
+                ) => Op::Amo,
                 _ => Op::Illegal,
             };
-            (op, 0)
+            (op, f3 as i32)
         }
         0x07 if f3 == 2 || f3 == 3 => {
             insn.dbl = f3 == 3;

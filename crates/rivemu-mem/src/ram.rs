@@ -303,9 +303,9 @@ impl Ram {
         true
     }
 
-    /// Atomic compare-and-exchange for 32-bit or 64-bit aligned guest accesses
-    /// (`sc.w` / `sc.d`). Returns `Some(true)` on success, `Some(false)` on
-    /// mismatch, or `None` if out of bounds or unaligned.
+    /// Atomic compare-and-exchange for aligned guest accesses
+    /// (`sc.w` / `sc.d` / `amocas.*`). Returns `Some(true)` on success,
+    /// `Some(false)` on mismatch, or `None` if out of bounds or unaligned.
     #[inline]
     pub fn compare_exchange(
         &self,
@@ -322,6 +322,30 @@ impl Ram {
         // SAFETY: bounds checked above; alignment verified in each arm.
         unsafe {
             match size {
+                AccessSize::Byte => {
+                    let atom = AtomicU8::from_ptr(p);
+                    Some(
+                        atom.compare_exchange(
+                            expected as u8,
+                            new as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok(),
+                    )
+                }
+                AccessSize::Half if p.cast::<u16>().is_aligned() => {
+                    let atom = AtomicU16::from_ptr(p.cast());
+                    Some(
+                        atom.compare_exchange(
+                            (expected as u16).to_le(),
+                            (new as u16).to_le(),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok(),
+                    )
+                }
                 AccessSize::Word if p.cast::<u32>().is_aligned() => {
                     let atom = AtomicU32::from_ptr(p.cast());
                     Some(
@@ -351,9 +375,9 @@ impl Ram {
         }
     }
 
-    /// Atomic read-modify-write for 32-bit or 64-bit aligned guest accesses
-    /// (`amo*.w` / `amo*.d`). Returns the old value (`u64`), or `None` if out
-    /// of bounds or unaligned.
+    /// Atomic read-modify-write for aligned guest accesses
+    /// (`amo*.b` / `amo*.h` / `amo*.w` / `amo*.d`). Returns the old value
+    /// (`u64`), or `None` if out of bounds or unaligned.
     #[inline]
     pub fn atomic_rmw(
         &self,
@@ -369,6 +393,39 @@ impl Ram {
         // SAFETY: bounds checked above; alignment verified in each arm.
         unsafe {
             match size {
+                AccessSize::Byte => {
+                    let atom = AtomicU8::from_ptr(p);
+                    let mut cur = atom.load(Ordering::Acquire);
+                    loop {
+                        let next = f(u64::from(cur)) as u8;
+                        match atom.compare_exchange_weak(
+                            cur,
+                            next,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => return Some(u64::from(cur)),
+                            Err(actual) => cur = actual,
+                        }
+                    }
+                }
+                AccessSize::Half if p.cast::<u16>().is_aligned() => {
+                    let atom = AtomicU16::from_ptr(p.cast());
+                    let mut cur_le = atom.load(Ordering::Acquire);
+                    loop {
+                        let cur = u64::from(u16::from_le(cur_le));
+                        let next_le = (f(cur) as u16).to_le();
+                        match atom.compare_exchange_weak(
+                            cur_le,
+                            next_le,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => return Some(cur),
+                            Err(actual) => cur_le = actual,
+                        }
+                    }
+                }
                 AccessSize::Word if p.cast::<u32>().is_aligned() => {
                     let atom = AtomicU32::from_ptr(p.cast());
                     let mut cur_le = atom.load(Ordering::Acquire);
@@ -405,6 +462,36 @@ impl Ram {
                 }
                 _ => None,
             }
+        }
+    }
+
+    /// 128-bit compare-and-swap (`amocas.q`) for 16-byte aligned guest RAM
+    /// accesses. Returns the original `(lo, hi)` pair, or `None` if out of
+    /// bounds or unaligned.
+    #[inline]
+    pub fn atomic_cas128(
+        &self,
+        offset: u64,
+        expected: (u64, u64),
+        new: (u64, u64),
+    ) -> Option<(u64, u64)> {
+        if offset & 15 != 0 || !self.in_bounds(offset, 16) {
+            return None;
+        }
+        self.mark_dirty_range(offset, 16);
+        let p = self.at(offset).cast::<u64>();
+        // SAFETY: `self.ptr` is page-aligned (`mmap`), `offset` is 16-byte
+        // aligned, and `offset + 16 <= self.len`.
+        unsafe {
+            let atom_lo = AtomicU64::from_ptr(p);
+            let atom_hi = AtomicU64::from_ptr(p.add(1));
+            let old_lo = u64::from_le(atom_lo.load(Ordering::Acquire));
+            let old_hi = u64::from_le(atom_hi.load(Ordering::Acquire));
+            if (old_lo, old_hi) == expected {
+                atom_lo.store(new.0.to_le(), Ordering::Release);
+                atom_hi.store(new.1.to_le(), Ordering::Release);
+            }
+            Some((old_lo, old_hi))
         }
     }
 }

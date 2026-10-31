@@ -981,8 +981,10 @@ impl Hart {
                 self.set_x(rd, sext32(u64::from(v)));
             }
 
-            // A extension.
-            Op::Lr | Op::Sc | Op::Amo => self.exec_atomic(bus, insn, rs1, rs2)?,
+            // A / Zacas / Zabha / Zalasr extensions.
+            Op::Lr | Op::Sc | Op::Amo | Op::AmoCas | Op::LoadAq | Op::StoreRl => {
+                self.exec_atomic(bus, insn, rs1, rs2)?;
+            }
 
             // Zicsr.
             Op::Csrrw | Op::Csrrs | Op::Csrrc | Op::Csrrwi | Op::Csrrsi | Op::Csrrci => {
@@ -1136,14 +1138,60 @@ impl Hart {
         addr: u64,
         src: u64,
     ) -> Result<(), Exception> {
-        let size = if insn.dbl {
-            AccessSize::Double
-        } else {
-            AccessSize::Word
+        if insn.op == Op::AmoCas && insn.imm == 4 {
+            if addr & 15 != 0 {
+                return Err(Exception::new(cause::STORE_MISALIGNED, addr));
+            }
+            let pa = self.translate(bus, addr, Access::Store)?;
+            self.check_pmp_access(addr, pa, 16, Access::Store)?;
+            let cmp = if insn.rd == 0 {
+                (0, 0)
+            } else {
+                (
+                    self.x[usize::from(insn.rd)],
+                    self.x[usize::from(insn.rd + 1)],
+                )
+            };
+            let new = if insn.rs2 == 0 {
+                (0, 0)
+            } else {
+                (
+                    self.x[usize::from(insn.rs2)],
+                    self.x[usize::from(insn.rs2 + 1)],
+                )
+            };
+            let (old_lo, old_hi) = bus
+                .atomic_cas128(pa, cmp, new)
+                .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
+            self.invalidate_reservation(pa);
+            self.invalidate_reservation(pa.wrapping_add(8));
+            if insn.rd != 0 {
+                self.set_x(insn.rd, old_lo);
+                self.set_x(insn.rd + 1, old_hi);
+            }
+            return Ok(());
+        }
+
+        let size = match insn.imm {
+            0 => AccessSize::Byte,
+            1 => AccessSize::Half,
+            2 => AccessSize::Word,
+            _ => AccessSize::Double,
         };
-        let fix = |v: u64| if insn.dbl { v } else { sext32(v) };
+        let sext = |v: u64| match size {
+            AccessSize::Byte => v as i8 as i64 as u64,
+            AccessSize::Half => v as i16 as i64 as u64,
+            AccessSize::Word => sext32(v),
+            AccessSize::Double => v,
+        };
+        let zext = |v: u64| match size {
+            AccessSize::Byte => u64::from(v as u8),
+            AccessSize::Half => u64::from(v as u16),
+            AccessSize::Word => u64::from(v as u32),
+            AccessSize::Double => v,
+        };
         if addr & (size.bytes() - 1) != 0 {
-            let c = if insn.op == Op::Lr {
+            let c = if matches!(insn.op, Op::Lr | Op::LoadAq) {
                 cause::LOAD_MISALIGNED
             } else {
                 cause::STORE_MISALIGNED
@@ -1164,7 +1212,7 @@ impl Hart {
                     val: v,
                     seq,
                 });
-                self.set_x(insn.rd, fix(v));
+                self.set_x(insn.rd, sext(v));
             }
             Op::Sc => {
                 let pa = self.translate(bus, addr, Access::Store)?;
@@ -1178,32 +1226,65 @@ impl Hart {
                     .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
                 self.set_x(insn.rd, u64::from(!ok));
             }
-            _ => {
+            Op::LoadAq => {
+                let pa = self.translate(bus, addr, Access::Load)?;
+                self.check_pmp_access(addr, pa, size.bytes(), Access::Load)?;
+                let v = bus
+                    .read(pa, size)
+                    .map_err(|_| Exception::new(cause::LOAD_ACCESS, addr))?;
+                std::sync::atomic::fence(Ordering::SeqCst);
+                self.set_x(insn.rd, sext(v));
+            }
+            Op::StoreRl => {
                 let pa = self.translate(bus, addr, Access::Store)?;
                 self.check_pmp_access(addr, pa, size.bytes(), Access::Store)?;
-                let b = fix(src);
-                let funct = insn.funct;
-                let dbl = insn.dbl;
+                std::sync::atomic::fence(Ordering::SeqCst);
+                bus.write(pa, size, src)
+                    .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
+                self.invalidate_reservation(pa);
+            }
+            Op::AmoCas => {
+                let pa = self.translate(bus, addr, Access::Store)?;
+                self.check_pmp_access(addr, pa, size.bytes(), Access::Store)?;
+                let cmp = zext(self.x[usize::from(insn.rd)]);
+                let new_val = zext(src);
                 let old = bus
                     .atomic_rmw(pa, size, |old_raw| {
-                        let a = fix(old_raw);
-                        match funct {
-                            amo::SWAP => b,
-                            amo::ADD => a.wrapping_add(b),
-                            amo::XOR => a ^ b,
-                            amo::AND => a & b,
-                            amo::OR => a | b,
-                            amo::MIN => (a as i64).min(b as i64) as u64,
-                            amo::MAX => (a as i64).max(b as i64) as u64,
-                            amo::MINU if dbl => a.min(b),
-                            amo::MAXU if dbl => a.max(b),
-                            amo::MINU => u64::from((a as u32).min(b as u32)),
-                            _ => u64::from((a as u32).max(b as u32)),
+                        if zext(old_raw) == cmp {
+                            new_val
+                        } else {
+                            old_raw
                         }
                     })
                     .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
                 self.invalidate_reservation(pa);
-                self.set_x(insn.rd, fix(old));
+                self.set_x(insn.rd, sext(old));
+            }
+            _ => {
+                let pa = self.translate(bus, addr, Access::Store)?;
+                self.check_pmp_access(addr, pa, size.bytes(), Access::Store)?;
+                let b_s = sext(src) as i64;
+                let b_u = zext(src);
+                let funct = insn.funct;
+                let old = bus
+                    .atomic_rmw(pa, size, |old_raw| {
+                        let a_s = sext(old_raw) as i64;
+                        let a_u = zext(old_raw);
+                        match funct {
+                            amo::SWAP => b_u,
+                            amo::ADD => a_u.wrapping_add(b_u),
+                            amo::XOR => a_u ^ b_u,
+                            amo::AND => a_u & b_u,
+                            amo::OR => a_u | b_u,
+                            amo::MIN => a_s.min(b_s) as u64,
+                            amo::MAX => a_s.max(b_s) as u64,
+                            amo::MINU => a_u.min(b_u),
+                            _ => a_u.max(b_u),
+                        }
+                    })
+                    .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
+                self.invalidate_reservation(pa);
+                self.set_x(insn.rd, sext(old));
             }
         }
         Ok(())

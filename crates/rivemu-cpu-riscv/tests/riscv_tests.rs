@@ -1189,6 +1189,129 @@ fn zfa_fli_fminm_fmaxm_fround_fcvtmod_and_quiet_compares() {
     assert_eq!(h.csr_read(csr::FFLAGS).unwrap(), 16);
 }
 
+#[test]
+fn zacas_zabha_and_zalasr_atomic_extensions() {
+    use rivemu_cpu_riscv::csr;
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    const DATA: u64 = 0x8000_2000;
+    const MTVEC: u64 = 0x8000_1000;
+
+    let encode_amo = |f5: u32, aq: u32, rl: u32, rs2: u32, rs1: u32, f3: u32, rd: u32| -> u32 {
+        (f5 << 27) | (aq << 26) | (rl << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | 0x2f
+    };
+
+    let insns: &[u32] = &[
+        // 0: amoadd.b  x5, x6, (x10)   -- byte at DATA: 0xfe (-2) + 5 = 3, x5 = sext8(0xfe) = -2
+        encode_amo(0x00, 0, 0, 6, 10, 0, 5),
+        // 1: amomin.b  x7, x8, (x10)   -- byte at DATA: 3 vs x8=0x80 (-128) -> -128 (0x80), x7 = 3
+        encode_amo(0x10, 0, 0, 8, 10, 0, 7),
+        // 2: amomaxu.h x9, x11, (x12)  -- half at DATA+2: 0x8001 vs x11=0x7fff -> stays 0x8001, x9 = sext16(0x8001)
+        encode_amo(0x1c, 0, 0, 11, 12, 1, 9),
+        // 3: amocas.w  x13, x14, (x15) -- word at DATA+4: 0x8000_0001; x13 has upper bits 0x1234_5678_8000_0001 -> matches low 32 bits!
+        encode_amo(0x05, 1, 1, 14, 15, 2, 13),
+        // 4: amocas.d  x0, x14, (x16)  -- double at DATA+8 is 0 -> matches x0=0, writes x14, x0 stays 0!
+        encode_amo(0x05, 1, 1, 14, 16, 3, 0),
+        // 5: amocas.d  x0, x6, (x16)   -- double at DATA+8 is now x14 (!= 0) -> mismatch against x0=0, memory stays x14!
+        encode_amo(0x05, 1, 1, 6, 16, 3, 0),
+        // 6: amocas.q  x18, x20, (x17) -- 128-bit at DATA+16: matches (x18, x19), writes (x20, x21), loads old into (x18, x19)
+        encode_amo(0x05, 1, 1, 20, 17, 4, 18),
+        // 7: sb.rl     x6, (x10)       -- Zalasr store-release byte (x6 = 0xf0) to DATA
+        encode_amo(0x07, 0, 1, 6, 10, 0, 0),
+        // 8: lb.aq     x22, (x10)      -- Zalasr load-acquire byte from DATA -> sext8(0xf0) = -16
+        encode_amo(0x06, 1, 0, 0, 10, 0, 22),
+        // 9: ld.aq     x0, (x16)       -- Zalasr load-acquire with rd=x0 -> x0 stays 0
+        encode_amo(0x06, 1, 0, 0, 16, 3, 0),
+    ];
+    for (i, &w) in insns.iter().enumerate() {
+        bus.write(CODE + (i as u64) * 4, AccessSize::Word, u64::from(w))
+            .unwrap();
+    }
+
+    bus.write(DATA, AccessSize::Byte, 0xfe).unwrap();
+    bus.write(DATA + 2, AccessSize::Half, 0x8001).unwrap();
+    bus.write(DATA + 4, AccessSize::Word, 0x8000_0001).unwrap();
+    bus.write(DATA + 8, AccessSize::Double, 0).unwrap();
+    bus.write(DATA + 16, AccessSize::Double, 0x1111_2222_3333_4444)
+        .unwrap();
+    bus.write(DATA + 24, AccessSize::Double, 0x5555_6666_7777_8888)
+        .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr_write(csr::MTVEC, MTVEC).unwrap();
+
+    h.x[6] = 5;
+    h.x[8] = 0x80;
+    h.x[10] = DATA;
+    h.x[11] = 0x7fff;
+    h.x[12] = DATA + 2;
+    h.x[13] = 0x1234_5678_8000_0001;
+    h.x[14] = 0xcafe_babe_dead_beef;
+    h.x[15] = DATA + 4;
+    h.x[16] = DATA + 8;
+    h.x[17] = DATA + 16;
+    h.x[18] = 0x1111_2222_3333_4444;
+    h.x[19] = 0x5555_6666_7777_8888;
+    h.x[20] = 0xaaaa_bbbb_cccc_dddd;
+    h.x[21] = 0xeeee_ffff_0000_1111;
+
+    // Steps 0..7
+    for _ in 0..7 {
+        h.step(&bus);
+    }
+    assert_eq!(h.x[5], (-2i64) as u64);
+    assert_eq!(h.x[7], 3);
+    assert_eq!(bus.read(DATA, AccessSize::Byte).unwrap(), 0x80);
+    assert_eq!(h.x[9], 0xffff_ffff_ffff_8001);
+    assert_eq!(h.x[13], 0xffff_ffff_8000_0001);
+    assert_eq!(bus.read(DATA + 4, AccessSize::Word).unwrap(), 0xdead_beef);
+    assert_eq!(h.x[0], 0);
+    assert_eq!(
+        bus.read(DATA + 8, AccessSize::Double).unwrap(),
+        0xcafe_babe_dead_beef
+    );
+    assert_eq!(
+        bus.read(DATA + 16, AccessSize::Double).unwrap(),
+        0xaaaa_bbbb_cccc_dddd
+    );
+    assert_eq!(
+        bus.read(DATA + 24, AccessSize::Double).unwrap(),
+        0xeeee_ffff_0000_1111
+    );
+
+    // Steps 7..10: Zalasr sb.rl, lb.aq, ld.aq x0
+    h.x[6] = 0xf0;
+    for _ in 7..10 {
+        h.step(&bus);
+    }
+    assert_eq!(h.x[22], (-16i64) as u64);
+    assert_eq!(h.x[0], 0);
+
+    // Odd register in amocas.q (rd = 5) raises ILLEGAL_INSN (mcause = 2).
+    let odd_amocas_q = encode_amo(0x05, 0, 0, 20, 17, 4, 5);
+    bus.write(CODE + 40, AccessSize::Word, u64::from(odd_amocas_q))
+        .unwrap();
+    h.pc = CODE + 40;
+    h.step(&bus);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE).unwrap(), 2);
+
+    // Misaligned lh.aq raises LOAD_MISALIGNED (mcause = 4).
+    let misaligned_lh_aq = encode_amo(0x06, 1, 0, 0, 10, 1, 5);
+    bus.write(CODE + 44, AccessSize::Word, u64::from(misaligned_lh_aq))
+        .unwrap();
+    h.x[10] = DATA + 1;
+    h.pc = CODE + 44;
+    h.step(&bus);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE).unwrap(), 4);
+}
+
 
 
 
