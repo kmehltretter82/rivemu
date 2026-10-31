@@ -1283,6 +1283,17 @@ impl Hart {
                     self.yield_slice = true;
                 }
             }
+            Op::WrsNto => {
+                if self.prv != Priv::Machine && self.csr.mstatus & status::TW != 0 {
+                    return Err(Self::illegal(insn));
+                }
+                self.reservation = None;
+                self.yield_slice = true;
+            }
+            Op::WrsSto => {
+                self.reservation = None;
+                self.yield_slice = true;
+            }
             Op::SfenceVma | Op::SinvalVma => {
                 if self.prv == Priv::User
                     || (self.prv == Priv::Supervisor && self.csr.mstatus & status::TVM != 0)
@@ -1860,7 +1871,7 @@ impl Hart {
                     return None;
                 }
                 let mode = v >> 60;
-                if matches!(mode, 0 | 8 | 9) {
+                if matches!(mode, 0 | 8 | 9 | 10) {
                     let old_mode = self.csr.satp >> 60;
                     // MODE, ASID (ASIDLEN = 16) and PPN cover all 64 bits.
                     self.csr.satp = v;

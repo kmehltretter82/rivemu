@@ -200,6 +200,9 @@ pub enum Op {
     Sspush,
     Sspopchk,
     Ssamoswap,
+    // Zawrs
+    WrsNto,
+    WrsSto,
 }
 
 /// AMO operation codes (instruction bits 31:27).
@@ -503,6 +506,8 @@ pub fn decode(raw: u32) -> Insn {
                 let op = match raw {
                     0x0000_0073 => Op::Ecall,
                     0x0010_0073 => Op::Ebreak,
+                    0x00d0_0073 => Op::WrsNto,
+                    0x01d0_0073 => Op::WrsSto,
                     0x3020_0073 => Op::Mret,
                     0x1020_0073 => Op::Sret,
                     0x1050_0073 => Op::Wfi,

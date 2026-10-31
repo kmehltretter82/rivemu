@@ -1819,6 +1819,168 @@ fn svukte_zjpm_and_zicfilp_semantics() {
     assert_eq!(h.csr.stval, 2);
 }
 
+#[test]
+fn svnapot_sv57_and_zawrs_semantics() {
+    use rivemu_cpu_riscv::{Priv, cause, csr};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(2 * MIB).unwrap()))
+        .unwrap();
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(0x8002_0000);
+    h.csr.mtvec = 0x8000_0100;
+
+    // 5-level Sv57 page table setup:
+    //   L4 root at 0x8001_0000
+    //   L3 at      0x8001_1000
+    //   L2 at      0x8001_2000
+    //   L1 at      0x8001_3000
+    //   L0 at      0x8001_4000
+    const L4: u64 = 0x8001_0000;
+    const L3: u64 = 0x8001_1000;
+    const L2: u64 = 0x8001_2000;
+    const L1: u64 = 0x8001_3000;
+    const L0: u64 = 0x8001_4000;
+    const CODE_PA: u64 = 0x8002_0000;
+    const NAPOT_BASE_PA: u64 = 0x8004_0000; // 64 KiB aligned
+    const ALT_BASE_PA: u64 = 0x8006_0000; // 64 KiB aligned
+    const NAPOT_BASE_VA: u64 = 0x8004_0000;
+    const PTE_N: u64 = 1 << 63;
+
+    // Identity-map L4[0] -> L3[0] -> L2[2] -> L1[0] -> L0:
+    bus.write(L4, AccessSize::Double, ((L3 >> 12) << 10) | 0x01)
+        .unwrap();
+    bus.write(L3, AccessSize::Double, ((L2 >> 12) << 10) | 0x01)
+        .unwrap();
+    bus.write(L2 + 2 * 8, AccessSize::Double, ((L1 >> 12) << 10) | 0x01)
+        .unwrap();
+    bus.write(L1, AccessSize::Double, ((L0 >> 12) << 10) | 0x01)
+        .unwrap();
+    // Map CODE_PA (vpn0 = 0x20) as R|W|X|A|D:
+    bus.write(
+        L0 + 0x20 * 8,
+        AccessSize::Double,
+        ((CODE_PA >> 12) << 10) | 0xcf,
+    )
+    .unwrap();
+
+    // Install 64 KiB Svnapot leaf PTEs at L0[0x40..0x50] mapping NAPOT_BASE_VA -> NAPOT_BASE_PA:
+    // ppn[3:0] must be 0b1000 (0x8).
+    let napot_ppn = ((NAPOT_BASE_PA >> 12) & !0xf) | 0x8;
+    let napot_pte = PTE_N | (napot_ppn << 10) | 0xc7;
+    for i in 0..16u64 {
+        bus.write(L0 + (0x40 + i) * 8, AccessSize::Double, napot_pte)
+            .unwrap();
+        bus.write(
+            NAPOT_BASE_PA + i * 0x1000,
+            AccessSize::Double,
+            0x1111_0000_0000_0000 | i,
+        )
+        .unwrap();
+        bus.write(
+            ALT_BASE_PA + i * 0x1000,
+            AccessSize::Double,
+            0x2222_0000_0000_0000 | i,
+        )
+        .unwrap();
+    }
+
+    // Also install a high Sv57 256 TiB superpage leaf at L4[511] (VA 0xffff_0000_0000_0000 -> PA 0x0):
+    bus.write(L4 + 511 * 8, AccessSize::Double, 0xc7).unwrap();
+
+    // Enable Sv57 (MODE = 10):
+    h.csr_write(csr::SATP, (10u64 << 60) | (L4 >> 12)).unwrap();
+    assert_eq!(h.csr.satp >> 60, 10);
+
+    // 1. Svnapot 64 KiB translation & TLB invalidation across the 64 KiB range:
+    bus.write(CODE_PA, AccessSize::Word, 0x0005_3583).unwrap(); // ld x11, 0(x10)
+    bus.write(CODE_PA + 4, AccessSize::Word, 0x1205_0073)
+        .unwrap(); // sfence.vma x10, x0
+    h.prv = Priv::Supervisor;
+
+    // Warm TLB at offset +0x0000 and +0xf000 within the 64 KiB NAPOT region:
+    h.pc = CODE_PA;
+    h.x[10] = NAPOT_BASE_VA;
+    h.step(&bus);
+    assert_eq!(h.x[11], 0x1111_0000_0000_0000);
+
+    h.pc = CODE_PA;
+    h.x[10] = NAPOT_BASE_VA + 0xf000;
+    h.step(&bus);
+    assert_eq!(h.x[11], 0x1111_0000_0000_000f);
+
+    // Rewrite PTEs to point to ALT_BASE_PA, then execute sfence.vma on NAPOT_BASE_VA + 0x5000:
+    // Because the cached entry at +0xf000 has vpn_shift = 4 (64 KiB), sfence.vma on +0x5000 must flush it!
+    let alt_napot_ppn = ((ALT_BASE_PA >> 12) & !0xf) | 0x8;
+    let alt_napot_pte = PTE_N | (alt_napot_ppn << 10) | 0xc7;
+    for i in 0..16u64 {
+        bus.write(L0 + (0x40 + i) * 8, AccessSize::Double, alt_napot_pte)
+            .unwrap();
+    }
+    h.pc = CODE_PA + 4;
+    h.x[10] = NAPOT_BASE_VA + 0x5000;
+    h.step(&bus); // sfence.vma x10, x0
+
+    h.pc = CODE_PA;
+    h.x[10] = NAPOT_BASE_VA + 0xf000;
+    h.step(&bus);
+    assert_eq!(h.x[11], 0x2222_0000_0000_000f);
+
+    // Reserved Svnapot encoding (N=1 with ppn[3:0] != 8) must raise LOAD_PAGE_FAULT (13):
+    let bad_napot_pte = PTE_N | (((NAPOT_BASE_PA >> 12) & !0xf | 0x4) << 10) | 0xc7;
+    bus.write(L0 + 0x50 * 8, AccessSize::Double, bad_napot_pte)
+        .unwrap();
+    h.prv = Priv::Supervisor;
+    h.pc = CODE_PA;
+    h.x[10] = 0x8005_0000;
+    h.step(&bus);
+    assert_eq!(h.csr.mcause, cause::LOAD_PAGE_FAULT);
+    assert_eq!(h.csr.mtval, 0x8005_0000);
+
+    // 2. Sv57 256 TiB superpage at 0xffff_0000_8002_0000 and non-canonical 57-bit VA check:
+    h.prv = Priv::Supervisor;
+    h.pc = CODE_PA;
+    h.x[10] = 0xffff_0000_8002_0000;
+    h.step(&bus);
+    assert_eq!(h.x[11] as u32, 0x0005_3583);
+
+    // Non-canonical Sv57 VA (bit 56 = 0, bit 57 = 1: 0x0200_0000_8002_0000) raises LOAD_PAGE_FAULT:
+    h.prv = Priv::Supervisor;
+    h.pc = CODE_PA;
+    h.x[10] = 0x0200_0000_8002_0000;
+    h.step(&bus);
+    assert_eq!(h.csr.mcause, cause::LOAD_PAGE_FAULT);
+    assert_eq!(h.csr.mtval, 0x0200_0000_8002_0000);
+
+    // 3. Zawrs (wrs.nto = 0x00d0_0073, wrs.sto = 0x01d0_0073):
+    bus.write(CODE_PA + 0x10, AccessSize::Word, 0x00d0_0073)
+        .unwrap(); // wrs.nto
+    bus.write(CODE_PA + 0x14, AccessSize::Word, 0x01d0_0073)
+        .unwrap(); // wrs.sto
+
+    // With TW=0 in S-mode, both wrs.nto and wrs.sto retire normally:
+    h.prv = Priv::Supervisor;
+    h.pc = CODE_PA + 0x10;
+    h.step(&bus);
+    assert_eq!(h.pc, CODE_PA + 0x14);
+    h.step(&bus);
+    assert_eq!(h.pc, CODE_PA + 0x18);
+
+    // With TW=1 in S-mode, wrs.sto still retires, while wrs.nto raises ILLEGAL_INSN (cause=2):
+    h.csr.mstatus |= csr::status::TW;
+    h.prv = Priv::Supervisor;
+    h.pc = CODE_PA + 0x14;
+    h.step(&bus); // wrs.sto succeeds even when TW=1
+    assert_eq!(h.pc, CODE_PA + 0x18);
+
+    h.prv = Priv::Supervisor;
+    h.pc = CODE_PA + 0x10;
+    h.step(&bus); // wrs.nto traps when TW=1 in S-mode
+    assert_eq!(h.prv, Priv::Machine);
+    assert_eq!(h.csr.mcause, cause::ILLEGAL_INSN);
+    assert_eq!(h.csr.mtval, 0x00d0_0073);
+}
+
 
 
 

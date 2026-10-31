@@ -1,4 +1,4 @@
-//! Sv39/Sv48 address translation with a small software TLB.
+//! Sv39/Sv48/Sv57 and Svnapot address translation with a small software TLB.
 
 use rivemu_core::AccessSize;
 use rivemu_mem::AddressSpace;
@@ -60,7 +60,8 @@ mod pte {
     pub(super) const PPN_MASK: u64 = (1 << 44) - 1;
     pub(super) const PBMT_SHIFT: u32 = 61;
     pub(super) const PBMT_MASK: u64 = 3 << PBMT_SHIFT;
-    pub(super) const RESERVED_HIGH_MASK: u64 = !((1u64 << 54) - 1) & !PBMT_MASK;
+    pub(super) const N: u64 = 1 << 63;
+    pub(super) const RESERVED_HIGH_MASK: u64 = !((1u64 << 54) - 1) & !(PBMT_MASK | N);
 }
 
 const TLB_SIZE: usize = 1024;
@@ -80,8 +81,8 @@ struct TlbEntry {
     asid: u16,
     /// Leaf PTE flags (low 8 bits, with non-leaf `G` propagated into bit 5).
     flags: u8,
-    /// Page-table level (`0` = 4 KiB, `1` = 2 MiB, `2` = 1 GiB, `3` = 512 GiB).
-    level: u8,
+    /// VPN shift for range invalidation (`0` = 4 KiB, `4` = 64 KiB `Svnapot`, `9 * level` = superpages).
+    vpn_shift: u8,
 }
 
 impl Default for TlbEntry {
@@ -93,7 +94,7 @@ impl Default for TlbEntry {
             epoch: 0,
             asid: 0,
             flags: 0,
-            level: 0,
+            vpn_shift: 0,
         }
     }
 }
@@ -145,7 +146,7 @@ impl Tlb {
                     for e in self.entries.iter_mut() {
                         if e.epoch == self.epoch
                             && e.tag != 0
-                            && ((e.tag - 1) ^ vpn) >> (9 * u32::from(e.level)) == 0
+                            && ((e.tag - 1) ^ vpn) >> u32::from(e.vpn_shift) == 0
                         {
                             e.tag = 0;
                         }
@@ -179,7 +180,7 @@ impl Tlb {
                             && e.tag != 0
                             && e.flags & (pte::G as u8) == 0
                             && e.asid == target_asid
-                            && ((e.tag - 1) ^ vpn) >> (9 * u32::from(e.level)) == 0
+                            && ((e.tag - 1) ^ vpn) >> u32::from(e.vpn_shift) == 0
                         {
                             e.tag = 0;
                         }
@@ -391,11 +392,7 @@ impl Hart {
             }
             return Ok((va, u64::MAX));
         }
-        if mode == 8
-            && prv == Priv::User
-            && (self.csr.senvcfg & envcfg::UKTE) != 0
-            && (va >> 63) != 0
-        {
+        if prv == Priv::User && (self.csr.senvcfg & envcfg::UKTE) != 0 && (va >> 63) != 0 {
             return Err(acc.page_fault(va));
         }
         let asid = ((self.csr.satp >> 44) & 0xffff) as u16;
@@ -447,16 +444,13 @@ impl Hart {
         if self.prv == Priv::Machine || mode == 0 {
             return Some(va);
         }
-        if mode == 8
-            && self.prv == Priv::User
-            && (self.csr.senvcfg & envcfg::UKTE) != 0
-            && (va >> 63) != 0
-        {
+        if self.prv == Priv::User && (self.csr.senvcfg & envcfg::UKTE) != 0 && (va >> 63) != 0 {
             return None;
         }
         let levels: u32 = match mode {
             8 => 3,
             9 => 4,
+            10 => 5,
             _ => return None,
         };
         let va_bits = 12 + 9 * levels;
@@ -477,7 +471,7 @@ impl Hart {
             let pbmt = (pte & pte::PBMT_MASK) >> pte::PBMT_SHIFT;
             let ppn = (pte >> 10) & pte::PPN_MASK;
             if pte & (pte::R | pte::X) == 0 {
-                if level == 0 || pte & (pte::D | pte::A | pte::U) != 0 || pbmt != 0 {
+                if level == 0 || pte & (pte::D | pte::A | pte::U | pte::N) != 0 || pbmt != 0 {
                     return None;
                 }
                 table = ppn << 12;
@@ -486,11 +480,18 @@ impl Hart {
             if pbmt != 0 && (self.csr.menvcfg & envcfg::PBMTE == 0 || pbmt == 3) {
                 return None;
             }
-            let low_mask = (1u64 << (9 * level)) - 1;
-            if ppn & low_mask != 0 {
-                return None;
-            }
-            let pa_page = (ppn | ((va >> 12) & low_mask)) << 12;
+            let pa_page = if pte & pte::N != 0 {
+                if level != 0 || (ppn & 0xf) != 0x8 {
+                    return None;
+                }
+                ((ppn & !0xf) | ((va >> 12) & 0xf)) << 12
+            } else {
+                let low_mask = (1u64 << (9 * level)) - 1;
+                if ppn & low_mask != 0 {
+                    return None;
+                }
+                (ppn | ((va >> 12) & low_mask)) << 12
+            };
             return Some(pa_page | (va & 0xfff));
         }
         None
@@ -526,12 +527,12 @@ impl Hart {
         prv: Priv,
         mode: u64,
     ) -> Result<u64, Exception> {
-        let levels: u32 = if mode == 8 { 3 } else { 4 };
-        if mode == 8
-            && prv == Priv::User
-            && (self.csr.senvcfg & envcfg::UKTE) != 0
-            && (va >> 63) != 0
-        {
+        let levels: u32 = match mode {
+            8 => 3,
+            9 => 4,
+            _ => 5,
+        };
+        if prv == Priv::User && (self.csr.senvcfg & envcfg::UKTE) != 0 && (va >> 63) != 0 {
             return Err(acc.page_fault(va));
         }
         let va_bits = 12 + 9 * levels;
@@ -563,7 +564,7 @@ impl Hart {
             let ppn = (pte >> 10) & pte::PPN_MASK;
             if pte & (pte::R | pte::W | pte::X) == 0 {
                 // Pointer to the next level.
-                if level == 0 || pte & (pte::D | pte::A | pte::U) != 0 || pbmt != 0 {
+                if level == 0 || pte & (pte::D | pte::A | pte::U | pte::N) != 0 || pbmt != 0 {
                     return Err(acc.page_fault(va));
                 }
                 table = ppn << 12;
@@ -594,10 +595,19 @@ impl Hart {
                 }
                 return Err(acc.page_fault(va));
             }
-            let low_mask = (1u64 << (9 * level)) - 1;
-            if ppn & low_mask != 0 {
-                return Err(acc.page_fault(va)); // misaligned superpage
-            }
+            let (pa_page, vpn_shift) = if pte & pte::N != 0 {
+                // Svnapot: only 64 KiB (`level == 0`, `ppn[3:0] == 0b1000`) is defined.
+                if level != 0 || (ppn & 0xf) != 0x8 {
+                    return Err(acc.page_fault(va));
+                }
+                (((ppn & !0xf) | ((va >> 12) & 0xf)) << 12, 4u8)
+            } else {
+                let low_mask = (1u64 << (9 * level)) - 1;
+                if ppn & low_mask != 0 {
+                    return Err(acc.page_fault(va)); // misaligned superpage
+                }
+                ((ppn | ((va >> 12) & low_mask)) << 12, (9 * level) as u8)
+            };
             // Svade vs Svadu: when Svade is active (`self.svade` and `menvcfg.ADUE == 0`),
             // missing A (or D on a store / shadow-stack store) raises a page fault instead of updating the PTE.
             let needs_dirty = matches!(acc, Access::Store | Access::ShadowStackStore);
@@ -622,13 +632,12 @@ impl Hart {
                     .map_err(|_| acc.access_fault(va))?;
             }
             let asid = ((self.csr.satp >> 44) & 0xffff) as u16;
-            let pa_page = (ppn | ((va >> 12) & low_mask)) << 12;
             let ram_page_off = if pbmt == 0 {
                 bus.fast_ram_page_offset(pa_page).unwrap_or(u64::MAX)
             } else {
                 u64::MAX
             };
-            if level > 0 {
+            if vpn_shift > 0 {
                 self.tlb.has_superpages = true;
             }
             self.tlb.entries[((va >> 12) as usize) & (TLB_SIZE - 1)] = TlbEntry {
@@ -638,7 +647,7 @@ impl Hart {
                 epoch: self.tlb.epoch,
                 asid,
                 flags: (new | global) as u8,
-                level: level as u8,
+                vpn_shift,
             };
             return Ok(pa_page | (va & 0xfff));
         }
