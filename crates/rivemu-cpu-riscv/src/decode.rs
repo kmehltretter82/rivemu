@@ -629,12 +629,14 @@ pub fn decode(raw: u32) -> Insn {
             };
             (op, f3 as i32)
         }
-        0x07 if f3 == 2 || f3 == 3 => {
+        0x07 if matches!(f3, 1..=3) => {
             insn.dbl = f3 == 3;
+            insn.funct = f3 as u8;
             (Op::Fload, imm_i(raw))
         }
-        0x27 if f3 == 2 || f3 == 3 => {
+        0x27 if matches!(f3, 1..=3) => {
             insn.dbl = f3 == 3;
+            insn.funct = f3 as u8;
             (Op::Fstore, imm_s(raw))
         }
         opc @ (0x43 | 0x47 | 0x4b | 0x4f) => {
@@ -643,19 +645,19 @@ pub fn decode(raw: u32) -> Insn {
             insn.rs3 = (raw >> 27) as u8;
             insn.funct = f3 as u8;
             let op = match (fmt, opc) {
-                (2 | 3, _) => Op::Illegal,
+                (3, _) => Op::Illegal,
                 (_, 0x43) => Op::Fmadd,
                 (_, 0x47) => Op::Fmsub,
                 (_, 0x4b) => Op::Fnmsub,
                 _ => Op::Fnmadd,
             };
-            (op, 0)
+            (op, fmt as i32)
         }
         0x53 => {
             let fmt = f7 & 3;
             insn.dbl = fmt == 1;
             insn.funct = f3 as u8;
-            let op = if fmt > 1 {
+            let op = if fmt == 3 {
                 Op::Illegal
             } else {
                 match (f7 >> 2, f3, rs2) {
@@ -671,9 +673,10 @@ pub fn decode(raw: u32) -> Insn {
                     (0x05, 1, _) => Op::Fmax,
                     (0x05, 2, _) => Op::Fminm,
                     (0x05, 3, _) => Op::Fmaxm,
-                    // fcvt.s.d: fmt=S, rs2=1; fcvt.d.s: fmt=D, rs2=0
-                    (0x08, _, 1) if fmt == 0 => Op::FcvtFF,
-                    (0x08, _, 0) if fmt == 1 => Op::FcvtFF,
+                    // fcvt.{s,d,h}.{s,d,h} and Zfbfmin fcvt.s.bf16 / fcvt.bf16.s
+                    (0x08, _, 1 | 2 | 6) if fmt == 0 => Op::FcvtFF,
+                    (0x08, _, 0 | 2) if fmt == 1 => Op::FcvtFF,
+                    (0x08, _, 0 | 1 | 8) if fmt == 2 => Op::FcvtFF,
                     (0x08, _, 4) => Op::Fround,
                     (0x08, _, 5) => Op::Froundnx,
                     (0x14, 2, _) => Op::Feq,
@@ -691,7 +694,7 @@ pub fn decode(raw: u32) -> Insn {
                     _ => Op::Illegal,
                 }
             };
-            (op, 0)
+            (op, fmt as i32)
         }
         _ => (Op::Illegal, 0),
     };

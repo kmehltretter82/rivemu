@@ -24,7 +24,7 @@
 
 mod imp;
 
-use imp::{F32, F64};
+use imp::{BF16, F16, F32, F64};
 
 /// IEEE rounding mode, numbered like the RISC-V `rm` field / `frm` CSR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +74,10 @@ impl Flags {
     pub const INVALID: u8 = 16;
 }
 
+/// The RISC-V canonical binary16 (`Zfh`) NaN.
+pub const F16_CANONICAL_NAN: u16 = 0x7e00;
+/// The RISC-V canonical BFloat16 (`Zfbfmin`) NaN.
+pub const BF16_CANONICAL_NAN: u16 = 0x7fc0;
 /// The RISC-V canonical binary32 NaN.
 pub const F32_CANONICAL_NAN: u32 = 0x7fc0_0000;
 /// The RISC-V canonical binary64 NaN.
@@ -262,6 +266,38 @@ macro_rules! define_format {
 }
 
 define_format!(
+    u16,
+    F16,
+    "binary16",
+    f16_add,
+    f16_sub,
+    f16_mul,
+    f16_div,
+    f16_sqrt,
+    f16_mul_add,
+    f16_min,
+    f16_max,
+    f16_minm,
+    f16_maxm,
+    f16_round,
+    f16_roundnx,
+    f16_eq,
+    f16_lt,
+    f16_le,
+    f16_ltq,
+    f16_leq,
+    f16_classify,
+    f16_to_i32,
+    f16_to_u32,
+    f16_to_i64,
+    f16_to_u64,
+    i32_to_f16,
+    u32_to_f16,
+    i64_to_f16,
+    u64_to_f16,
+);
+
+define_format!(
     u32,
     F32,
     "binary32",
@@ -331,6 +367,42 @@ define_format!(
 pub fn f64_to_i32_mod(a: u64, fl: &mut Flags) -> i32 {
     imp::to_i32_mod_f64(a, fl)
 }
+
+/// Zfa `fli.h` constant table (indexed by `rs1` in `0..32`).
+pub const FLI_H_TABLE: [u16; 32] = [
+    0xbc00, // 0: -1.0
+    0x0400, // 1: minimum positive normal (2^-14)
+    0x0100, // 2: 2^-16 (subnormal)
+    0x0200, // 3: 2^-15 (subnormal)
+    0x1c00, // 4: 2^-8
+    0x2000, // 5: 2^-7
+    0x2c00, // 6: 2^-4
+    0x3000, // 7: 2^-3
+    0x3400, // 8: 0.25
+    0x3500, // 9: 0.3125
+    0x3600, // 10: 0.375
+    0x3700, // 11: 0.4375
+    0x3800, // 12: 0.5
+    0x3900, // 13: 0.625
+    0x3a00, // 14: 0.75
+    0x3b00, // 15: 0.875
+    0x3c00, // 16: 1.0
+    0x3d00, // 17: 1.25
+    0x3e00, // 18: 1.5
+    0x3f00, // 19: 1.75
+    0x4000, // 20: 2.0
+    0x4100, // 21: 2.5
+    0x4200, // 22: 3.0
+    0x4400, // 23: 4.0
+    0x4800, // 24: 8.0
+    0x4c00, // 25: 16.0
+    0x5800, // 26: 128.0
+    0x5c00, // 27: 256.0
+    0x7800, // 28: 2^15
+    0x7c00, // 29: 2^16 (+inf in binary16)
+    0x7c00, // 30: +inf
+    0x7e00, // 31: canonical NaN
+];
 
 /// Zfa `fli.s` constant table (indexed by `rs1` in `0..32`).
 pub const FLI_S_TABLE: [u32; 32] = [
@@ -404,6 +476,42 @@ pub const FLI_D_TABLE: [u64; 32] = [
     0x7ff8_0000_0000_0000, // 31: canonical NaN
 ];
 
+/// Converts binary16 to binary32 (`fcvt.s.h`); always exact.
+#[inline]
+pub fn f16_to_f32(a: u16, fl: &mut Flags) -> u32 {
+    imp::convert::<F16, F32>(u64::from(a), RoundingMode::NearestEven, fl) as u32
+}
+
+/// Converts binary32 to binary16 (`fcvt.h.s`), rounding per `rm`.
+#[inline]
+pub fn f32_to_f16(a: u32, rm: RoundingMode, fl: &mut Flags) -> u16 {
+    imp::convert::<F32, F16>(u64::from(a), rm, fl) as u16
+}
+
+/// Converts binary16 to binary64 (`fcvt.d.h`); always exact.
+#[inline]
+pub fn f16_to_f64(a: u16, fl: &mut Flags) -> u64 {
+    imp::convert::<F16, F64>(u64::from(a), RoundingMode::NearestEven, fl)
+}
+
+/// Converts binary64 to binary16 (`fcvt.h.d`), rounding per `rm`.
+#[inline]
+pub fn f64_to_f16(a: u64, rm: RoundingMode, fl: &mut Flags) -> u16 {
+    imp::convert::<F64, F16>(a, rm, fl) as u16
+}
+
+/// Converts BFloat16 to binary32 (`fcvt.s.bf16`); always exact.
+#[inline]
+pub fn bf16_to_f32(a: u16, fl: &mut Flags) -> u32 {
+    imp::convert::<BF16, F32>(u64::from(a), RoundingMode::NearestEven, fl) as u32
+}
+
+/// Converts binary32 to BFloat16 (`fcvt.bf16.s`), rounding per `rm`.
+#[inline]
+pub fn f32_to_bf16(a: u32, rm: RoundingMode, fl: &mut Flags) -> u16 {
+    imp::convert::<F32, BF16>(u64::from(a), rm, fl) as u16
+}
+
 /// Converts binary32 to binary64 (`fcvt.d.s`); always exact.
 ///
 /// NaN inputs give the canonical binary64 NaN (`INVALID` for signaling NaNs).
@@ -427,6 +535,8 @@ mod tests {
     #[test]
     fn canonical_nans_match_format() {
         use imp::Format;
+        assert_eq!(F16::NAN, u64::from(F16_CANONICAL_NAN));
+        assert_eq!(BF16::NAN, u64::from(BF16_CANONICAL_NAN));
         assert_eq!(F32::NAN, F32_CANONICAL_NAN as u64);
         assert_eq!(F64::NAN, F64_CANONICAL_NAN);
     }

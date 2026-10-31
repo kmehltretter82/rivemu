@@ -2272,5 +2272,82 @@ fn decoded_basic_block_cache_execution_and_mid_block_trap_accuracy() {
     assert_eq!(h.csr.mtval, 0xdead_0000);
 }
 
+#[test]
+fn zfh_zfhmin_zfbfmin_and_zfa_fp16_semantics() {
+    use rivemu_cpu_riscv::csr::{self, status};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    const DATA: u64 = 0x8000_2000;
+
+    let insns: &[u32] = &[
+        0xf410_00d3, // fli.h      f1, -1.0      (0xbc00)
+        0xf41a_0153, // fli.h      f2, 2.0       (rs1=20 -> 0x4000)
+        0x0420_f1d3, // fadd.h     f3, f1, f2    (1.0 = 0x3c00)
+        0x0c21_7243, // fmadd.h    f4, f2, f2, f1 (3.0 = 0x4200)
+        0x0045_1027, // fsh        f4, 0(x10)
+        0x0005_1287, // flh        f5, 0(x10)
+        0xe400_85d3, // fmv.x.h    x11, f1       (0xffff_ffff_ffff_bc00)
+        0xf406_0353, // fmv.h.x    f6, x12       (NaN-boxed 0x3800 = 0.5)
+        0x4022_73d3, // fcvt.s.h   f7, f4        (3.0 in fp32 = 0x4040_0000)
+        0x4403_f453, // fcvt.h.s   f8, f7        (3.0 in fp16 = 0x4200)
+        0x4483_f4d3, // fcvt.bf16.s f9, f7       (3.0 in bf16 = 0x4040)
+        0x4064_f553, // fcvt.s.bf16 f10, f9      (3.0 in fp32 = 0x4040_0000)
+        0x2c40_a5d3, // fminm.h    f11, f1, f4   (-1.0 = 0xbc00)
+        0x2c40_b653, // fmaxm.h    f12, f1, f4   (3.0 = 0x4200)
+        0xa440_c6d3, // fleq.h     x13, f1, f4   (1)
+        0xa412_5753, // fltq.h     x14, f4, f1   (0)
+        0x4083_77d3, // fround.h   f15, f6, rmm  (round(0.5, rmm) = 1.0 = 0x3c00 -> fmt=2: 0x4483_47d3)
+    ];
+    for (i, &w) in insns[..16].iter().enumerate() {
+        bus.write(CODE + (i as u64) * 4, AccessSize::Word, u64::from(w))
+            .unwrap();
+    }
+    // 16: fround.h f15, f6, rmm (f7=0x22, rs2=4, rs1=6, f3=4, rd=15, opc=0x53 -> 0x4443_47d3)
+    bus.write(CODE + 16 * 4, AccessSize::Word, 0x4443_47d3)
+        .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr_write(csr::MSTATUS, status::FS).unwrap();
+    h.x[10] = DATA;
+    h.x[12] = 0x1234_5678_0000_3800; // low 16 bits = 0x3800 (0.5 in fp16)
+
+    for _ in 0..17 {
+        h.step(&bus);
+    }
+
+    const BOX16: u64 = 0xffff_ffff_ffff_0000;
+    const BOX32: u64 = 0xffff_ffff_0000_0000;
+    assert_eq!(h.f[1], BOX16 | 0xbc00);
+    assert_eq!(h.f[2], BOX16 | 0x4000);
+    assert_eq!(h.f[3], BOX16 | 0x3c00);
+    assert_eq!(h.f[4], BOX16 | 0x4200);
+    assert_eq!(h.f[5], BOX16 | 0x4200);
+    assert_eq!(bus.read(DATA, AccessSize::Half).unwrap(), 0x4200);
+    assert_eq!(h.x[11], 0xffff_ffff_ffff_bc00);
+    assert_eq!(h.f[6], BOX16 | 0x3800);
+    assert_eq!(h.f[7], BOX32 | 0x4040_0000);
+    assert_eq!(h.f[8], BOX16 | 0x4200);
+    assert_eq!(h.f[9], BOX16 | 0x4040);
+    assert_eq!(h.f[10], BOX32 | 0x4040_0000);
+    assert_eq!(h.f[11], BOX16 | 0xbc00);
+    assert_eq!(h.f[12], BOX16 | 0x4200);
+    assert_eq!(h.x[13], 1);
+    assert_eq!(h.x[14], 0);
+    assert_eq!(h.f[15], BOX16 | 0x3c00);
+
+    // Improperly NaN-boxed 16-bit operand unboxes to canonical NaN (0x7e00 for f16, 0x7fc0 for bf16):
+    h.f[1] = 0x0000_0000_0000_3c00; // not 16-bit NaN-boxed!
+    // fadd.h f3, f1, f2 -> canonical NaN (0x7e00)
+    h.pc = CODE + 2 * 4;
+    h.step(&bus);
+    assert_eq!(h.f[3], BOX16 | 0x7e00);
+}
+
+
 
 

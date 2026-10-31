@@ -38,6 +38,22 @@ pub(crate) trait Format {
     const EMIN: i32 = 1 - Self::BIAS;
 }
 
+/// IEEE binary16.
+#[derive(Debug)]
+pub(crate) struct F16;
+impl Format for F16 {
+    const EXP_BITS: u32 = 5;
+    const FRAC_BITS: u32 = 10;
+}
+
+/// BFloat16 (`Zfbfmin`).
+#[derive(Debug)]
+pub(crate) struct BF16;
+impl Format for BF16 {
+    const EXP_BITS: u32 = 8;
+    const FRAC_BITS: u32 = 7;
+}
+
 /// IEEE binary32.
 #[derive(Debug)]
 pub(crate) struct F32;
