@@ -3,7 +3,7 @@
 use rivemu_core::AccessSize;
 use rivemu_mem::AddressSpace;
 
-use crate::csr::{PMP_ENTRIES, envcfg, status};
+use crate::csr::{PMP_ENTRIES, envcfg, mseccfg, status};
 use crate::hart::{Exception, Hart, Priv, cause};
 use crate::log::LogFlags;
 
@@ -277,13 +277,15 @@ impl Hart {
                 count += 1;
             }
         }
+        let mseccfg_active = (self.csr.mseccfg & (mseccfg::MML | mseccfg::MMWP)) != 0;
         self.pmp_count = count as u8;
-        self.pmp_any_locked = any_locked;
+        self.pmp_any_locked = any_locked || mseccfg_active;
         // Entry 0 as an unlocked NAPOT catch-all (`R|W|X`) covering >= 56 bits
-        // grants unconditional access to all privileges.
-        let full_open_entry0 =
-            (self.csr.pmpcfg[0] & 0x9f) == 0x1f && (!self.csr.pmpaddr[0]).trailing_zeros() >= 53;
-        self.pmp_enforced = !full_open_entry0 && (any_active || self.strict_pmp);
+        // grants unconditional access to all privileges unless Smepmp (`MML`/`MMWP`) is active.
+        let full_open_entry0 = !mseccfg_active
+            && (self.csr.pmpcfg[0] & 0x9f) == 0x1f
+            && (!self.csr.pmpaddr[0]).trailing_zeros() >= 53;
+        self.pmp_enforced = !full_open_entry0 && (any_active || self.strict_pmp || mseccfg_active);
         self.pmp_subpage = self.pmp_enforced && subpage;
     }
 
@@ -321,10 +323,20 @@ impl Hart {
     }
 
     /// Checks `[pa, pa + size - 1]` against the active PMP entries per RISC-V
-    /// Privileged Spec Section 3.7.
+    /// Privileged Spec Section 3.7 and `Smepmp`.
     #[cold]
     pub(crate) fn pmp_check(&self, pa: u64, size: u64, prv: Priv, acc: Access) -> bool {
-        if prv == Priv::Machine && !self.pmp_any_locked && (!self.pmp_subpage || size <= 1) {
+        const MML_M_PERMS: [u8; 16] = [0, 0, 3, 3, 0, 0, 0, 0, 0, 4, 4, 5, 1, 5, 3, 1];
+        const MML_SU_PERMS: [u8; 16] = [0, 4, 1, 3, 1, 5, 3, 7, 0, 0, 4, 4, 0, 0, 0, 1];
+
+        let mml = (self.csr.mseccfg & mseccfg::MML) != 0;
+        let mmwp = (self.csr.mseccfg & mseccfg::MMWP) != 0;
+        if prv == Priv::Machine
+            && !self.pmp_any_locked
+            && !mml
+            && !mmwp
+            && (!self.pmp_subpage || size <= 1)
+        {
             return true;
         }
         let last = pa.saturating_add(size.saturating_sub(1));
@@ -334,23 +346,39 @@ impl Hart {
                 if pa < lo || last > hi {
                     return false;
                 }
-                // Unlocked M-mode accesses always succeed.
-                if prv == Priv::Machine && cfg & 0x80 == 0 {
-                    return true;
-                }
+                let rwx = if mml {
+                    let idx =
+                        (((cfg >> 4) & 8) | ((cfg & 1) << 2) | (cfg & 2) | ((cfg >> 2) & 1))
+                            as usize;
+                    if prv == Priv::Machine {
+                        MML_M_PERMS[idx]
+                    } else {
+                        MML_SU_PERMS[idx]
+                    }
+                } else if prv == Priv::Machine && cfg & 0x80 == 0 {
+                    0x07
+                } else {
+                    cfg & 0x07
+                };
                 return match acc {
-                    Access::Fetch => cfg & 0x04 != 0,
-                    Access::Load => cfg & 0x01 != 0,
-                    Access::Store => cfg & 0x02 != 0,
-                    Access::CacheBom => cfg & 0x03 != 0,
-                    Access::ShadowStackLoad | Access::ShadowStackStore => (cfg & 0x03) == 0x03,
+                    Access::Fetch => rwx & 0x04 != 0,
+                    Access::Load => rwx & 0x01 != 0,
+                    Access::Store => rwx & 0x02 != 0,
+                    Access::CacheBom => rwx & 0x03 != 0,
+                    Access::ShadowStackLoad | Access::ShadowStackStore => (rwx & 0x03) == 0x03,
                 };
             }
         }
         if prv == Priv::Machine {
-            true
+            if mmwp {
+                false
+            } else if mml {
+                acc != Access::Fetch
+            } else {
+                true
+            }
         } else {
-            !self.strict_pmp && self.pmp_count == 0
+            !self.strict_pmp && self.pmp_count == 0 && !mmwp && !mml
         }
     }
 

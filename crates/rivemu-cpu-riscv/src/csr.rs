@@ -19,6 +19,8 @@ pub const SIE: u16 = 0x104;
 pub const STVEC: u16 = 0x105;
 pub const SCOUNTEREN: u16 = 0x106;
 pub const SENVCFG: u16 = 0x10a;
+pub const SSTATEEN0: u16 = 0x10c;
+pub const SSTATEEN3: u16 = 0x10f;
 pub const SSCRATCH: u16 = 0x140;
 pub const SEPC: u16 = 0x141;
 pub const SCAUSE: u16 = 0x142;
@@ -42,6 +44,8 @@ pub const MIE: u16 = 0x304;
 pub const MTVEC: u16 = 0x305;
 pub const MCOUNTEREN: u16 = 0x306;
 pub const MENVCFG: u16 = 0x30a;
+pub const MSTATEEN0: u16 = 0x30c;
+pub const MSTATEEN3: u16 = 0x30f;
 pub const MCOUNTINHIBIT: u16 = 0x320;
 pub const MCYCLECFG: u16 = 0x321;
 pub const MINSTRETCFG: u16 = 0x322;
@@ -186,6 +190,24 @@ pub mod envcfg {
     }
 }
 
+/// `mseccfg` bits (`Smepmp`, `Zicfilp`, `Smnpm`).
+pub mod mseccfg {
+    pub const MML: u64 = 1 << 0;
+    pub const MMWP: u64 = 1 << 1;
+    pub const RLB: u64 = 1 << 2;
+    pub const MLPE: u64 = 1 << 10;
+    pub const PMM_SHIFT: u32 = 32;
+    pub const PMM_MASK: u64 = 3 << PMM_SHIFT;
+}
+
+/// `mstateen0..3` / `sstateen0..3` bits (`Smstateen` / `Ssstateen`).
+pub mod stateen {
+    pub const ENVCFG: u64 = 1 << 62;
+    pub const SE: u64 = 1 << 63;
+    pub const M0_MASK: u64 = SE | ENVCFG;
+    pub const M1_3_MASK: u64 = SE;
+}
+
 /// `misa` value: RV64 IMAFDC + S + U.
 pub const MISA_VALUE: u64 = (2 << 62)
     | (1 << 0)  // A
@@ -240,6 +262,9 @@ pub struct Csrs {
     pub fflags: u64,
     pub frm: u64,
     pub ssp: u64,
+    pub mseccfg: u64,
+    pub mstateen: [u64; 4],
+    pub sstateen: [u64; 4],
     pub pmpcfg: [u8; PMP_ENTRIES],
     pub pmpaddr: [u64; PMP_ENTRIES],
     pub minstret: u64,
@@ -260,7 +285,7 @@ impl Csrs {
     #[inline]
     pub fn landing_pad_enabled(&self, prv: crate::hart::Priv) -> bool {
         match prv {
-            crate::hart::Priv::Machine => false,
+            crate::hart::Priv::Machine => (self.mseccfg & mseccfg::MLPE) != 0,
             crate::hart::Priv::Supervisor => (self.menvcfg & envcfg::LPE) != 0,
             crate::hart::Priv::User => (self.senvcfg & envcfg::LPE) != 0,
         }
@@ -273,7 +298,9 @@ impl Csrs {
             return 0;
         }
         let pmm = match prv {
-            crate::hart::Priv::Machine => 0,
+            crate::hart::Priv::Machine => {
+                (self.mseccfg & mseccfg::PMM_MASK) >> mseccfg::PMM_SHIFT
+            }
             crate::hart::Priv::Supervisor => (self.menvcfg & envcfg::PMM_MASK) >> envcfg::PMM_SHIFT,
             crate::hart::Priv::User => (self.senvcfg & envcfg::PMM_MASK) >> envcfg::PMM_SHIFT,
         };
@@ -334,6 +361,14 @@ impl Default for Csrs {
             fflags: 0,
             frm: 0,
             ssp: 0,
+            mseccfg: 0,
+            mstateen: [
+                stateen::M0_MASK,
+                stateen::M1_3_MASK,
+                stateen::M1_3_MASK,
+                stateen::M1_3_MASK,
+            ],
+            sstateen: [0; 4],
             pmpcfg: [0; PMP_ENTRIES],
             pmpaddr: [0; PMP_ENTRIES],
             minstret: 0,

@@ -1981,9 +1981,139 @@ fn svnapot_sv57_and_zawrs_semantics() {
     assert_eq!(h.csr.mtval, 0x00d0_0073);
 }
 
+#[test]
+fn smepmp_and_smstateen_semantics() {
+    use rivemu_cpu_riscv::{Priv, cause, csr};
 
+    const CODE: u64 = 0x8000_0000;
+    const DATA: u64 = 0x8001_0000;
 
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(2 * MIB).unwrap()))
+        .unwrap();
+    bus.write(CODE, AccessSize::Word, 0x0005_3583).unwrap(); // ld x11, 0(x10)
+    bus.write(CODE + 4, AccessSize::Word, 0x00c5_3023).unwrap(); // sd x12, 0(x10)
+    bus.write(DATA, AccessSize::Double, 0xaaaa_bbbb_cccc_dddd)
+        .unwrap();
 
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mtvec = 0x8000_0100;
 
+    // 1. Smstateen / Ssstateen:
+    // By default, mstateen0 has SE (bit 63) and ENVCFG (bit 62) enabled:
+    assert_eq!(
+        h.csr_read(csr::MSTATEEN0).unwrap(),
+        csr::stateen::SE | csr::stateen::ENVCFG
+    );
+    h.prv = Priv::Supervisor;
+    assert!(h.csr_read(csr::SENVCFG).is_some());
+    assert_eq!(h.csr_read(csr::SSTATEEN0).unwrap(), 0);
 
+    // Clear mstateen0.ENVCFG in M-mode -> S-mode access to senvcfg traps (returns None):
+    h.prv = Priv::Machine;
+    h.csr_write(csr::MSTATEEN0, csr::stateen::SE).unwrap();
+    h.prv = Priv::Supervisor;
+    assert!(h.csr_read(csr::SENVCFG).is_none());
+    assert!(h.csr_write(csr::SENVCFG, 0).is_none());
+    assert_eq!(h.csr_read(csr::SSTATEEN0).unwrap(), 0);
+
+    // Clear mstateen0.SE in M-mode -> S-mode access to sstateen0 traps (returns None):
+    h.prv = Priv::Machine;
+    h.csr_write(csr::MSTATEEN0, 0).unwrap();
+    h.prv = Priv::Supervisor;
+    assert!(h.csr_read(csr::SSTATEEN0).is_none());
+    assert!(h.csr_write(csr::SSTATEEN0, 0).is_none());
+
+    // Restore mstateen0:
+    h.prv = Priv::Machine;
+    h.csr_write(csr::MSTATEEN0, csr::stateen::M0_MASK).unwrap();
+
+    // 2. Smepmp RLB (Rule Locking Bypass):
+    // Lock PMP entry 0 as TOR [0, 0x8000_1000) with L=1, R=1, X=1 (0x8d):
+    h.csr_write(csr::PMPADDR0, 0x8000_1000 >> 2).unwrap();
+    h.csr_write(csr::PMPCFG0, 0x8d).unwrap();
+    assert_eq!(h.csr_read(csr::PMPCFG0).unwrap() & 0xff, 0x8d);
+
+    // Setting RLB when a locked PMP entry already exists is ignored:
+    h.csr_write(csr::MSECCFG, csr::mseccfg::RLB).unwrap();
+    assert_eq!(h.csr_read(csr::MSECCFG).unwrap() & csr::mseccfg::RLB, 0);
+
+    // Reset hart, set RLB=1 before locking any entry, then lock entry 0 and modify it while RLB=1:
+    h.reset(CODE);
+    h.csr_write(csr::MSECCFG, csr::mseccfg::RLB).unwrap();
+    assert_eq!(
+        h.csr_read(csr::MSECCFG).unwrap(),
+        csr::mseccfg::RLB
+    );
+    h.csr_write(csr::PMPADDR0, 0x8000_1000 >> 2).unwrap();
+    h.csr_write(csr::PMPCFG0, 0x8d).unwrap(); // L=1, TOR, R=1, X=1
+    assert_eq!(h.csr_read(csr::PMPCFG0).unwrap() & 0xff, 0x8d);
+    // Because RLB=1, we can modify locked pmpcfg0 and even stage R=0, W=1 (shared data region):
+    // Configure entry 0: TOR [0, 0x8001_0000) with L=1, R=0, W=0, X=1 (M-mode X-only = 0x8c)
+    // Configure entry 1: TOR [0x8001_0000, 0x8002_0000) with L=0, R=0, W=1, X=0 (Shared R/W M, R S/U = 0x0a)
+    h.csr_write(csr::PMPADDR0, DATA >> 2).unwrap();
+    h.csr_write(csr::PMPADDR0 + 1, (DATA + 0x1000) >> 2)
+        .unwrap();
+    h.csr_write(csr::PMPCFG0, 0x0a8c).unwrap();
+    assert_eq!(h.csr_read(csr::PMPCFG0).unwrap() & 0xffff, 0x0a8c);
+
+    // Clear RLB and enable MML (sticky) and MMWP (sticky):
+    h.csr_write(csr::MSECCFG, csr::mseccfg::MML | csr::mseccfg::MMWP)
+        .unwrap();
+    assert_eq!(
+        h.csr_read(csr::MSECCFG).unwrap(),
+        csr::mseccfg::MML | csr::mseccfg::MMWP
+    );
+    // MML and MMWP cannot be cleared once set:
+    h.csr_write(csr::MSECCFG, 0).unwrap();
+    assert_eq!(
+        h.csr_read(csr::MSECCFG).unwrap(),
+        csr::mseccfg::MML | csr::mseccfg::MMWP
+    );
+    // Under MML=1 and RLB=0, attempting to add a new locked executable rule in entry 2 is ignored:
+    h.csr_write(csr::PMPCFG0, 0x8c_0a8c).unwrap();
+    assert_eq!(h.csr_read(csr::PMPCFG0).unwrap() & 0xff_ffff, 0x00_0a8c);
+
+    // Entry 0 (L=1, R=0, W=0, X=1) allows M-mode instruction fetch at CODE, and Entry 1
+    // (L=0, R=0, W=1, X=0) allows M-mode R+W at DATA:
+    h.prv = Priv::Machine;
+    h.pc = CODE;
+    h.x[10] = DATA;
+    h.x[12] = 0x1234_5678_9abc_def0;
+    h.step(&bus); // ld x11, 0(x10)
+    assert_eq!(h.x[11], 0xaaaa_bbbb_cccc_dddd);
+    h.step(&bus); // sd x12, 0(x10)
+    assert_eq!(
+        bus.read(DATA, AccessSize::Double).unwrap(),
+        0x1234_5678_9abc_def0
+    );
+
+    // Unmatched M-mode access at DATA + 0x2000 is denied because MMWP=1:
+    h.pc = CODE;
+    h.x[10] = DATA + 0x2000;
+    h.step(&bus);
+    assert_eq!(h.csr.mcause, cause::LOAD_ACCESS);
+    assert_eq!(h.csr.mtval, DATA + 0x2000);
+
+    // Entry 1 (L=0, R=0, W=1, X=0) grants S-mode Read-only (no Write):
+    // Configure entry 2 as unlocked S-mode X-only (`L=0, R=0, W=0, X=1` = 0x0c) at [0x8002_0000, 0x8003_0000):
+    let scode = DATA + 0x1000;
+    bus.write(scode, AccessSize::Word, 0x0005_3583).unwrap(); // ld x11, 0(x10)
+    bus.write(scode + 4, AccessSize::Word, 0x00c5_3023).unwrap(); // sd x12, 0(x10)
+    h.csr_write(csr::PMPADDR0 + 2, (scode + 0x1000) >> 2)
+        .unwrap();
+    h.csr_write(csr::PMPCFG0, 0x0c_0a8c).unwrap();
+
+    h.prv = Priv::Supervisor;
+    h.pc = scode;
+    h.x[10] = DATA;
+    h.x[11] = 0;
+    h.step(&bus); // S-mode load from shared DATA succeeds!
+    assert_eq!(h.x[11], 0x1234_5678_9abc_def0);
+    h.step(&bus); // S-mode store to shared DATA traps with STORE_ACCESS!
+    assert_eq!(h.prv, Priv::Machine);
+    assert_eq!(h.csr.mcause, cause::STORE_ACCESS);
+    assert_eq!(h.csr.mtval, DATA);
+}
 

@@ -1717,11 +1717,21 @@ impl Hart {
             csr::STVEC => c.stvec,
             csr::SCOUNTEREN => c.scounteren,
             csr::SENVCFG => {
+                if self.prv != Priv::Machine && (c.mstateen[0] & csr::stateen::ENVCFG) == 0 {
+                    return None;
+                }
                 let mut v = c.senvcfg;
                 if c.menvcfg & envcfg::SSE == 0 {
                     v &= !envcfg::SSE;
                 }
                 v
+            }
+            csr::SSTATEEN0..=csr::SSTATEEN3 => {
+                let i = (num - csr::SSTATEEN0) as usize;
+                if self.prv != Priv::Machine && (c.mstateen[i] & csr::stateen::SE) == 0 {
+                    return None;
+                }
+                c.sstateen[i] & c.mstateen[i]
             }
             csr::SSCRATCH => c.sscratch,
             csr::SEPC => c.sepc,
@@ -1750,6 +1760,7 @@ impl Hart {
             csr::MTVEC => c.mtvec,
             csr::MCOUNTEREN => c.mcounteren,
             csr::MENVCFG => c.menvcfg,
+            csr::MSTATEEN0..=csr::MSTATEEN3 => c.mstateen[(num - csr::MSTATEEN0) as usize],
             csr::MCOUNTINHIBIT => c.mcountinhibit,
             csr::MCYCLECFG => c.mcyclecfg,
             csr::MINSTRETCFG => c.minstretcfg,
@@ -1779,6 +1790,7 @@ impl Hart {
                 let n = (num - csr::PMPADDR0) as usize;
                 c.pmpaddr.get(n).copied().unwrap_or(0)
             }
+            csr::MSECCFG => c.mseccfg,
             csr::TSELECT..=csr::TDATA3 | csr::TINFO => 0,
             csr::MCYCLE | csr::MINSTRET => c.minstret,
             csr::MHPMCOUNTER3..=csr::MHPMCOUNTER31 => {
@@ -1845,12 +1857,22 @@ impl Hart {
             }
             csr::SCOUNTEREN => self.csr.scounteren = v & 0xffff_ffff,
             csr::SENVCFG => {
+                if self.prv != Priv::Machine && (self.csr.mstateen[0] & csr::stateen::ENVCFG) == 0 {
+                    return None;
+                }
                 let mut mask = envcfg::S_MASK;
                 if self.csr.menvcfg & envcfg::SSE == 0 {
                     mask &= !envcfg::SSE;
                 }
                 self.csr.senvcfg = envcfg::sanitize(v, self.csr.senvcfg, mask);
                 self.flush_tlb();
+            }
+            csr::SSTATEEN0..=csr::SSTATEEN3 => {
+                let i = (num - csr::SSTATEEN0) as usize;
+                if self.prv != Priv::Machine && (self.csr.mstateen[i] & csr::stateen::SE) == 0 {
+                    return None;
+                }
+                self.csr.sstateen[i] = 0;
             }
             csr::SSCRATCH => self.csr.sscratch = v,
             csr::SEPC => self.csr.sepc = v & !1,
@@ -1911,6 +1933,18 @@ impl Hart {
                 }
                 self.flush_tlb();
             }
+            csr::MSTATEEN0..=csr::MSTATEEN3 => {
+                let i = (num - csr::MSTATEEN0) as usize;
+                let mask = if i == 0 {
+                    csr::stateen::M0_MASK
+                } else {
+                    csr::stateen::M1_3_MASK
+                };
+                self.csr.mstateen[i] = v & mask;
+                if i == 0 {
+                    self.csr.sstateen[0] &= self.csr.mstateen[0];
+                }
+            }
             csr::MCOUNTINHIBIT => {
                 self.csr.mcountinhibit = v & 0xffff_fffd;
                 self.csr.update_active_hpm_mask();
@@ -1938,14 +1972,24 @@ impl Hart {
                 if n % 2 == 1 {
                     return None;
                 }
+                let rlb = (self.csr.mseccfg & csr::mseccfg::RLB) != 0;
+                let mml = (self.csr.mseccfg & csr::mseccfg::MML) != 0;
                 for i in 0..8 {
                     let e = n * 4 + i;
-                    if e >= csr::PMP_ENTRIES || self.csr.pmpcfg[e] & 0x80 != 0 {
+                    if e >= csr::PMP_ENTRIES || (!rlb && self.csr.pmpcfg[e] & 0x80 != 0) {
                         continue;
                     }
                     let b = (v >> (8 * i)) as u8 & 0x9f;
-                    // R=0, W=1 is reserved: ignore the write for this entry.
-                    if b & 3 == 2 {
+                    if mml && !rlb {
+                        // Under Smepmp with MML=1 and RLB=0, adding a locked rule
+                        // that grants M-mode execute or has R=0, W=1, X=0 is ignored.
+                        let idx =
+                            (((b >> 4) & 8) | ((b & 1) << 2) | (b & 2) | ((b >> 2) & 1)) as u32;
+                        if (0xd1ffu32 >> idx) & 1 == 0 {
+                            continue;
+                        }
+                    } else if !mml && !rlb && (b & 3) == 2 {
+                        // R=0, W=1 is reserved when MML=0 and RLB=0: ignore the write.
                         continue;
                     }
                     self.csr.pmpcfg[e] = b;
@@ -1955,13 +1999,34 @@ impl Hart {
             }
             csr::PMPADDR0..=csr::PMPADDR63 => {
                 let n = (num - csr::PMPADDR0) as usize;
+                let rlb = (self.csr.mseccfg & csr::mseccfg::RLB) != 0;
                 let tor_locked =
-                    n + 1 < csr::PMP_ENTRIES && (self.csr.pmpcfg[n + 1] & 0x98) == 0x88;
-                if n < csr::PMP_ENTRIES && self.csr.pmpcfg[n] & 0x80 == 0 && !tor_locked {
+                    !rlb && n + 1 < csr::PMP_ENTRIES && (self.csr.pmpcfg[n + 1] & 0x98) == 0x88;
+                if n < csr::PMP_ENTRIES && (rlb || self.csr.pmpcfg[n] & 0x80 == 0) && !tor_locked {
                     self.csr.pmpaddr[n] = v & ((1 << 54) - 1);
                     self.update_pmp_state();
                     self.flush_tlb();
                 }
+            }
+            csr::MSECCFG => {
+                let old = self.csr.mseccfg;
+                let sticky = csr::mseccfg::MML | csr::mseccfg::MMWP;
+                let mut next = (old & sticky) | (v & (sticky | csr::mseccfg::MLPE));
+                if v & csr::mseccfg::RLB != 0 {
+                    let any_locked = self.csr.pmpcfg.iter().any(|&cfg| cfg & 0x80 != 0);
+                    if (old & csr::mseccfg::RLB) != 0 || !any_locked {
+                        next |= csr::mseccfg::RLB;
+                    }
+                }
+                let pmm = v & csr::mseccfg::PMM_MASK;
+                if pmm == (1 << csr::mseccfg::PMM_SHIFT) {
+                    next |= old & csr::mseccfg::PMM_MASK;
+                } else {
+                    next |= pmm;
+                }
+                self.csr.mseccfg = next;
+                self.update_pmp_state();
+                self.flush_tlb();
             }
             csr::TSELECT..=csr::TDATA3 | csr::TINFO => {}
             csr::MCYCLE | csr::MINSTRET => {
