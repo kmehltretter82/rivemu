@@ -153,6 +153,19 @@ Total for P0–P5: roughly **4 months** for one developer.
 - [x] **P11** – Hardware-realism `-strict` mode (`strict-align`, `Svade`/`Svadu` via `menvcfg.ADUE`, 16-entry `TOR`/`NA4`/`NAPOT` PMP with TLB-cached fast path, 64B cache-line `LR`/`SC` reservation directory with DMA invalidation) and RVA22S64 extensions (`Zicbom`, `Zicboz`, `Svpbmt`, `Svinval`)
 - [x] **P12** – PCIe ECAM host bridge (`pci-host-ecam-generic`) with MSI/INTx, `virtio-pci` 1.0 modern transport, QEMU `fw_cfg`, CFI01 NOR `pflash`, `virtio-gpu-device` (2D scanout), `virtio-input-device`, RFB/VNC server (`-vnc`), and PPM `screendump`
 - [x] **P13** – Differential lockstep verification (`rivemu-lockstep`) against Sail RISC-V (`sail-riscv-debug-v1`) and `qemu-system-riscv64` across 13 suites (`alu`, `control`, `fence-i`, `mul`, `bitmanip`, `float`, `fp-edges`, `mem`, `csr`, `privileged`, `sv39`, `atomics`, `compressed`) + report-grade Linux kernel A/B runner (`scripts/linux_ab.py`)
+- [x] **P14** – Selective ASID/VA TLB (`asid`, `PTE_G`, superpages) and `Sv48` / `Svade` / `Svadu` / `Svpbmt` / `Svinval` differential lockstep
+- [x] **P15** – Complete `RV64C` (`Zca`/`Zcb`/`Zcd`) and 16-entry `PMP` (`Suite::Pmp`) differential lockstep
+- [x] **P16** – Cross-privilege (`M` $\to$ `S`) & `Sv39`-translated firmware/kernel boot lockstep (`boot` v2)
+- [x] **P17** – Macro-op fusion (`auipc+addi`, `lui+addi`, `lui+addiw`, `slli+srli` `zext.w`, `auipc+jalr`) and direct `fast_ram` host-offset SoftTLB
+- [x] **P18** – `Zicond` (`czero.eqz`/`czero.nez`), `Zfa` (`fli`, `fminm`, `fmaxm`, `fround`, `froundnx`, `fcvtmod.w.d`, `fleq`, `fltq`), and `Sscofpmf` / `Smcntrpmf` PMU filtering & `LCOFI` overflow interrupts
+- [x] **P19** – PCIe NVMe 1.4 controller (`-device nvme`), `virtio-vsock-device` (`AF_VSOCK`), and Snapshot v2 (PCI + `virtio-pci` + QCOW2 state)
+- [x] **P20** – Multi-worker `rivemu-lockstep campaign` runner with 1-instruction auto-bisection (`--emit-repro`) + `Zcb`, `Zacas`, `Zabha`, and `Zalasr` atomic extensions
+- [x] **P21** – RVA23 Control-Flow Integrity (`Zicfiss` shadow stack, `Zicfilp` landing pads), May-Be-Operations (`Zimop`, `Zcmop`), Pointer Masking (`Ssnpm`, `Smnpm`), `Svukte`, and `Suite::Cfi` lockstep
+- [x] **P22** – `Svnapot` (64 KiB NAPOT PTEs), `Sv57` (5-level page tables), and `Zawrs` (`wrs.nto` / `wrs.sto`) + lockstep coverage
+- [x] **P23** – `Smepmp` (`mseccfg`: `MML`, `MMWP`, `RLB`) and `Smstateen` / `Ssstateen` (`mstateen0..3`, `sstateen0..3`) + lockstep coverage
+- [x] **P24** – Scalar Cryptography extensions (`Zbkb`, `Zbkc`, `Zbkx`, `Zknd`, `Zkne`, `Zknh`) and `Suite::Crypto` differential lockstep
+- [x] **P25** – Decoded Basic-Block Cache (`bbcache`) in `rivemu-cpu-riscv` (`#![forbid(unsafe_code)]`)
+- [x] **P26** – Device-aware `boot` v3 lockstep (`UART`/`CLINT` MMIO load synchronization + non-trapping/trapping `WFI` handling)
 
 ---
 
@@ -222,5 +235,33 @@ flowchart LR
   - Add `rivemu-lockstep campaign --workers N --duration <secs>` running randomized seeds across all 14+ suites in parallel against Sail and QEMU.
   - On any divergence, automatically bisect to 1 instruction and emit a self-contained Rust regression test skeleton ready to paste into `crates/rivemu-cpu-riscv/tests/riscv_tests.rs`.
 - **Exit:** 100,000+ instruction lockstep campaigns run cleanly in CI/overnight mode with zero divergences.
+
+---
+
+## 9. RVA23, Security, Cryptography & Device-Aware Lockstep Roadmap (P21–P26)
+
+### P21 – RVA23 Control-Flow Integrity (`Zicfiss`, `Zicfilp`), MOP (`Zimop`, `Zcmop`), Pointer Masking (`Ssnpm`, `Smnpm`), and `Svukte`
+- **`Zicfiss` & `Zicfilp`:** Shadow-stack PTE (`R=0, W=1, X=0`) enforcement, `ssp` (`0x011`), `sspush`/`c.sspush`, `sspopchk`/`c.sspopchk` (`SW_CHECK` `tval=3`), `ssrdp`, `ssamoswap.{w,d}`, and landing-pad tracking (`ELP`, `lpad`, `SW_CHECK` `tval=2`, `MPELP`/`SPELP`).
+- **`Ssnpm`, `Smnpm` & `Svukte`:** Effective data-address pointer masking (`PMLEN = 0/7/16`) across U/S/M (`MPRV=1`) and `senvcfg.UKTE` user kernel-half VA faults.
+- **`Suite::Cfi` (`rivemu-lockstep`):** Directed 8-subcase lockstep verification against Sail and QEMU.
+
+### P22 – `Svnapot` (64 KiB NAPOT PTEs), `Sv57` (5-Level Page Tables), and `Zawrs` (`wrs.nto` / `wrs.sto`)
+- **`Svnapot` & `Sv57`:** `pte.N` (bit 63, `ppn[3:0] == 0b1000`) 64 KiB contiguous TLB translations and `satp.MODE = 10` 5-level page walks with 57-bit canonical VA checks.
+- **`Zawrs`:** `wrs.nto` (`0x00d0_0073`) and `wrs.sto` (`0x01d0_0073`) reservation-wait hints and `mstatus.TW` trap enforcement.
+
+### P23 – `Smepmp` (`mseccfg`: `MML`, `MMWP`, `RLB`) & `Smstateen` (`mstateen0..3` / `sstateen0..3`)
+- **`Smepmp`:** `mseccfg` (`0x747`) sticky `MML`/`MMWP`, `RLB`, `MLPE`, and `PMM`, plus full M-mode/S/U-mode shared-region permission lookup tables.
+- **`Smstateen` / `Ssstateen`:** `mstateen0..3` (`0x30c..0x30f`) and `sstateen0..3` (`0x10c..0x10f`) CSR access gating (`SE0` for `fcsr`/`fflags`/`frm`, `ENVCFG` for `senvcfg`).
+
+### P24 – Scalar Cryptography Extensions (`Zbkb`, `Zbkc`, `Zbkx`, `Zknd`, `Zkne`, `Zknh`) & `Suite::Crypto`
+- **Instructions:** `pack`, `packh`, `packw`, `brev8`, `clmul`, `clmulh`, `xperm4`, `xperm8`, `aes64es`, `aes64esm`, `aes64ds`, `aes64dsm`, `aes64im`, `aes64ks1i`, `aes64ks2`, `sha256sum0..1`, `sha256sig0..1`, `sha512sum0..1`, `sha512sig0..1`.
+- **Verification:** `Suite::Crypto` (`scalar-crypto`) differential lockstep against both Sail 0.16 and QEMU.
+
+### P25 – Decoded Basic-Block Cache (`bbcache`) in `rivemu-cpu-riscv`
+- **Basic-Block Cache:** 1024-entry `BbCacheEntry` table grouping up to 8 sequential instructions up to a branch/jump or 4 KiB page boundary, with O(1) `icache_gen` invalidation on `fence.i` and mid-block trap accuracy (`minstret`/`mepc`), preserving `#![forbid(unsafe_code)]`.
+
+### P26 – Device-Aware `boot` v3 Lockstep
+- **MMIO & `WFI` Stepping (`rivemu-lockstep/src/lockstep/mod.rs`):** Synchronizes non-trapping MMIO load results (`UART`, `CLINT` `mtime`, `RTC`, `PLIC`) from QEMU to `rivemu` and advances non-trapping `WFI` instructions deterministically while preserving trapping `WFI` (`TW=1` or U-mode) verification.
+
 
 

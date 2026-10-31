@@ -2,13 +2,13 @@
 
 A pure-Rust full-system RISC-V (`RV64GC`) emulator with a QEMU-compatible command line (`rivemu-system-riscv64`).
 
-> **Status:** Milestones **P0–P5** complete (see [docs/PLAN.md](docs/PLAN.md)).
-> Passes all **244/244** official `riscv-tests` (`rv64{ui,um,ua,uf,ud,uc,mi,si}-p` and `rv64u*-v`) and boots upstream Debian RISC-V 6.12 SMP Linux (`-smp 4`) with OpenSBI, BusyBox, and VirtIO (`blk`, `net`, `console`, `rng`) in **~19.9 s** (**~16.0 s** for `-smp 1`) on Apple Silicon without a JIT.
+> **Status:** Milestones **P0–P26** complete (see [docs/PLAN.md](docs/PLAN.md)).
+> Passes all **244/244** official `riscv-tests` (`rv64{ui,um,ua,uf,ud,uc,mi,si}-p` and `rv64u*-v`), 17 differential lockstep suites against Sail 0.16 and `qemu-system-riscv64` (`rivemu-lockstep`), and boots upstream Debian RISC-V 6.12 SMP Linux (`-smp 4`) with OpenSBI, BusyBox, and VirtIO (`blk`, `net`, `console`, `rng`, `9p`, `vsock`, `gpu`, `input`) plus PCIe NVMe on Apple Silicon without a JIT.
 
 ## Features
 
-- **Guest ISA:** RISC-V **RV64GC** (`RV64IMAFDC` + `Zicsr` + `Zifencei` + `Zicntr` + `Sstc` + `Zihintpause`), M/S/U privilege modes, Sv39/Sv48 MMU with software TLB, 16-entry PMP, and IEEE-754 compliant softfloat (`rivemu-softfloat`).
-- **Interpreter Fast Paths (no JIT):** 8192-entry decoded-instruction cache (`icache`), 1-entry fetch page cache, 1024-entry per-hart software TLB with O(1) epoch flush, and O(1) direct DRAM lookup.
+- **Guest ISA:** RISC-V **RV64GC** + **RVA22/RVA23** & Scalar Cryptography (`RV64IMAFDC`, `Zba`, `Zbb`, `Zbc`, `Zbkb`, `Zbkc`, `Zbkx`, `Zbs`, `Zca`, `Zcb`, `Zcd`, `Zcmop`, `Zfa`, `Zicbom`, `Zicboz`, `Zicfilp`, `Zicfiss`, `Zicntr`, `Zicond`, `Zicsr`, `Zifencei`, `Zihintpause`, `Zimop`, `Zacas`, `Zabha`, `Zalasr`, `Zawrs`, `Zknd`, `Zkne`, `Zknh`, `Sstc`, `Sscofpmf`, `Smcntrpmf`, `Smepmp`, `Smstateen`, `Ssstateen`, `Ssnpm`, `Smnpm`, `Svpbmt`, `Svinval`, `Svnapot`, `Svukte`), M/S/U privilege modes, `Sv39`/`Sv48`/`Sv57` MMU with ASID/global/superpage/NAPOT software TLB, 16-entry PMP (`TOR`/`NA4`/`NAPOT` + `Smepmp` `mseccfg`), and IEEE-754 compliant softfloat (`rivemu-softfloat`).
+- **Interpreter Fast Paths (no JIT):** 8192-entry decoded-instruction cache (`icache`) with macro-op fusion (`auipc+addi`, `lui+addi`, `lui+addiw`, `slli+srli`, `auipc+jalr`), 1024-entry decoded basic-block cache (`bbcache`), 1-entry fetch page cache, and 1024-entry per-hart software TLB with direct `fast_ram` host-offset lookup.
 - **Machine Model (`virt`):** QEMU-compatible physical memory map with 16550A UART, SiFive CLINT (ACLINT MSWI + MTIMER), SiFive PLIC, Goldfish RTC, SiFive test/syscon power controller, and automatic Flattened Device Tree (DTB v17) generation (`rivemu-fdt`).
 - **VirtIO (`virtio-mmio` v2):** Split virtqueues with indirect descriptors (`VIRTIO_RING_F_INDIRECT_DESC`) and `VIRTIO_RING_F_EVENT_IDX`:
   - `virtio-blk-device` backed by raw files, in-memory disks, or **QCOW2 v2/v3** images.
