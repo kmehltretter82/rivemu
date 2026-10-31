@@ -9,11 +9,11 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use rivemu_cpu_riscv::Priv;
-use rivemu_virtio::VirtQueue;
+use rivemu_virtio::{NvmeCq, NvmeSnapshot, NvmeSq, VirtQueue, VirtioPciSnapshot};
 
 use crate::virt::{Machine, memmap};
 
-const SNAPSHOT_MAGIC: &[u8; 8] = b"RIVSNAP1";
+const SNAPSHOT_MAGIC: &[u8; 8] = b"RIVSNAP2";
 
 impl Machine {
     /// Saves the complete VM state (CPUs, devices, and non-zero 4 KiB RAM
@@ -107,14 +107,58 @@ impl Machine {
                 write_u32(&mut w, r)?;
             }
             write_u64(&mut w, feats)?;
-            write_u32(&mut w, queues.len() as u32)?;
-            for q in queues {
-                write_u32(&mut w, q.num)?;
-                w.write_all(&[u8::from(q.ready)])?;
-                write_u16(&mut w, q.last_avail_idx)?;
-                write_u64(&mut w, q.desc_addr)?;
-                write_u64(&mut w, q.avail_addr)?;
-                write_u64(&mut w, q.used_addr)?;
+            write_queues(&mut w, &queues)?;
+        }
+
+        // PCIe host bridge (`virtio-pci` and `nvme` functions)
+        let (pci_virtio, pci_nvme) = self.pci.snapshot();
+        write_u32(&mut w, pci_virtio.len() as u32)?;
+        for vp in &pci_virtio {
+            write_u16(&mut w, vp.command)?;
+            write_u32(&mut w, vp.bar0)?;
+            w.write_all(&[
+                vp.irq_line,
+                vp.status,
+                vp.interrupt_status,
+                vp.config_generation,
+            ])?;
+            write_u32(&mut w, vp.device_feature_sel)?;
+            write_u32(&mut w, vp.driver_feature_sel)?;
+            write_u64(&mut w, vp.driver_features)?;
+            write_u16(&mut w, vp.queue_sel)?;
+            write_u16(&mut w, vp.msix_config)?;
+            write_queues(&mut w, &vp.queues)?;
+        }
+        write_u32(&mut w, pci_nvme.len() as u32)?;
+        for nv in &pci_nvme {
+            write_u16(&mut w, nv.command)?;
+            write_u32(&mut w, nv.bar0)?;
+            w.write_all(&[nv.irq_line])?;
+            write_u32(&mut w, nv.intms)?;
+            write_u32(&mut w, nv.cc)?;
+            write_u32(&mut w, nv.csts)?;
+            write_u32(&mut w, nv.aqa)?;
+            write_u64(&mut w, nv.asq)?;
+            write_u64(&mut w, nv.acq)?;
+            for sq in &nv.sqs {
+                write_u64(&mut w, sq.base)?;
+                write_u16(&mut w, sq.size)?;
+                write_u16(&mut w, sq.cqid)?;
+                write_u16(&mut w, sq.head)?;
+                write_u16(&mut w, sq.tail)?;
+                w.write_all(&[u8::from(sq.valid)])?;
+            }
+            for cq in &nv.cqs {
+                write_u64(&mut w, cq.base)?;
+                write_u16(&mut w, cq.size)?;
+                write_u16(&mut w, cq.head)?;
+                write_u16(&mut w, cq.tail)?;
+                w.write_all(&[
+                    cq.phase,
+                    u8::from(cq.irq_enabled),
+                    u8::from(cq.irq_pending),
+                    u8::from(cq.valid),
+                ])?;
             }
         }
 
@@ -270,27 +314,104 @@ impl Machine {
                 *reg = read_u32(&mut r)?;
             }
             let feats = read_u64(&mut r)?;
-            let qlen = read_u32(&mut r)? as usize;
-            let mut queues = Vec::with_capacity(qlen);
-            for _ in 0..qlen {
-                let num = read_u32(&mut r)?;
-                let mut ready = [0u8; 1];
-                r.read_exact(&mut ready)?;
-                let last_avail_idx = read_u16(&mut r)?;
-                let desc_addr = read_u64(&mut r)?;
-                let avail_addr = read_u64(&mut r)?;
-                let used_addr = read_u64(&mut r)?;
-                queues.push(VirtQueue {
-                    num,
-                    ready: ready[0] != 0,
-                    desc_addr,
-                    avail_addr,
-                    used_addr,
-                    last_avail_idx,
-                });
-            }
+            let queues = read_queues(&mut r)?;
             v.restore(regs, feats, queues);
         }
+
+        // PCIe host bridge (`virtio-pci` and `nvme` functions)
+        let pci_virtio_len = read_u32(&mut r)? as usize;
+        let mut pci_virtio = Vec::with_capacity(pci_virtio_len);
+        for _ in 0..pci_virtio_len {
+            let command = read_u16(&mut r)?;
+            let bar0 = read_u32(&mut r)?;
+            let mut b4 = [0u8; 4];
+            r.read_exact(&mut b4)?;
+            let device_feature_sel = read_u32(&mut r)?;
+            let driver_feature_sel = read_u32(&mut r)?;
+            let driver_features = read_u64(&mut r)?;
+            let queue_sel = read_u16(&mut r)?;
+            let msix_config = read_u16(&mut r)?;
+            let queues = read_queues(&mut r)?;
+            pci_virtio.push(VirtioPciSnapshot {
+                command,
+                bar0,
+                irq_line: b4[0],
+                status: b4[1],
+                interrupt_status: b4[2],
+                config_generation: b4[3],
+                device_feature_sel,
+                driver_feature_sel,
+                driver_features,
+                queue_sel,
+                msix_config,
+                queues,
+            });
+        }
+        let pci_nvme_len = read_u32(&mut r)? as usize;
+        let mut pci_nvme = Vec::with_capacity(pci_nvme_len);
+        for _ in 0..pci_nvme_len {
+            let command = read_u16(&mut r)?;
+            let bar0 = read_u32(&mut r)?;
+            let mut b1 = [0u8; 1];
+            r.read_exact(&mut b1)?;
+            let intms = read_u32(&mut r)?;
+            let cc = read_u32(&mut r)?;
+            let csts = read_u32(&mut r)?;
+            let aqa = read_u32(&mut r)?;
+            let asq = read_u64(&mut r)?;
+            let acq = read_u64(&mut r)?;
+            let mut sqs = [NvmeSq::default(); 16];
+            for sq in &mut sqs {
+                let base = read_u64(&mut r)?;
+                let size = read_u16(&mut r)?;
+                let cqid = read_u16(&mut r)?;
+                let head = read_u16(&mut r)?;
+                let tail = read_u16(&mut r)?;
+                let mut valid = [0u8; 1];
+                r.read_exact(&mut valid)?;
+                *sq = NvmeSq {
+                    base,
+                    size,
+                    cqid,
+                    head,
+                    tail,
+                    valid: valid[0] != 0,
+                };
+            }
+            let mut cqs = [NvmeCq::default(); 16];
+            for cq in &mut cqs {
+                let base = read_u64(&mut r)?;
+                let size = read_u16(&mut r)?;
+                let head = read_u16(&mut r)?;
+                let tail = read_u16(&mut r)?;
+                let mut flags = [0u8; 4];
+                r.read_exact(&mut flags)?;
+                *cq = NvmeCq {
+                    base,
+                    size,
+                    head,
+                    tail,
+                    phase: flags[0],
+                    irq_enabled: flags[1] != 0,
+                    irq_pending: flags[2] != 0,
+                    valid: flags[3] != 0,
+                };
+            }
+            pci_nvme.push(NvmeSnapshot {
+                command,
+                bar0,
+                irq_line: b1[0],
+                intms,
+                cc,
+                csts,
+                aqa,
+                asq,
+                acq,
+                sqs,
+                cqs,
+            });
+        }
+        self.pci.restore(pci_virtio, pci_nvme);
 
         // Sparse 4 KiB RAM pages: zero any dirty pages not in the snapshot, then bulk-copy saved pages.
         let pages = read_u32s(&mut r)?;
@@ -305,6 +426,42 @@ impl Machine {
             .invalidate_range(memmap::DRAM_BASE, self.ram.len());
         Ok(())
     }
+}
+
+fn write_queues(w: &mut impl Write, queues: &[VirtQueue]) -> io::Result<()> {
+    write_u32(w, queues.len() as u32)?;
+    for q in queues {
+        write_u32(w, q.num)?;
+        w.write_all(&[u8::from(q.ready)])?;
+        write_u16(w, q.last_avail_idx)?;
+        write_u64(w, q.desc_addr)?;
+        write_u64(w, q.avail_addr)?;
+        write_u64(w, q.used_addr)?;
+    }
+    Ok(())
+}
+
+fn read_queues(r: &mut impl Read) -> io::Result<Vec<VirtQueue>> {
+    let qlen = read_u32(r)? as usize;
+    let mut queues = Vec::with_capacity(qlen);
+    for _ in 0..qlen {
+        let num = read_u32(r)?;
+        let mut ready = [0u8; 1];
+        r.read_exact(&mut ready)?;
+        let last_avail_idx = read_u16(r)?;
+        let desc_addr = read_u64(r)?;
+        let avail_addr = read_u64(r)?;
+        let used_addr = read_u64(r)?;
+        queues.push(VirtQueue {
+            num,
+            ready: ready[0] != 0,
+            desc_addr,
+            avail_addr,
+            used_addr,
+            last_avail_idx,
+        });
+    }
+    Ok(queues)
 }
 
 fn write_u16(w: &mut impl Write, v: u16) -> io::Result<()> {

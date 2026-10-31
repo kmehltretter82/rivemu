@@ -21,7 +21,7 @@ use rivemu_mem::{AddressSpace, MapError, Ram};
 use rivemu_virtio::{
     DEFAULT_GPU_HEIGHT, DEFAULT_GPU_WIDTH, DmaRam, Framebuffer, InputHub, PciBus, Virtio9p,
     VirtioBlk, VirtioConsole, VirtioDevice, VirtioGpu, VirtioInput, VirtioMmio, VirtioNet,
-    VirtioRng,
+    VirtioRng, VirtioVsock, VsockHostEndpoint,
 };
 use thiserror::Error;
 
@@ -122,6 +122,18 @@ pub enum VirtioDeviceConfig {
     },
     /// `virtio-keyboard-device` / `virtio-input-pci` (`evdev` keyboard & tablet).
     Input,
+    /// `vhost-vsock-device` / `vhost-vsock-pci` (`virtio-vsock`, `DeviceID = 19`).
+    Vsock {
+        /// Guest CID (`>= 3`).
+        guest_cid: u64,
+    },
+    /// PCIe NVMe 1.4 controller (`-device nvme,drive=...`).
+    Nvme {
+        /// Storage backend.
+        backend: Arc<dyn BlockBackend>,
+        /// Controller serial string.
+        serial: String,
+    },
 }
 
 /// Board configuration (already resolved from the command line).
@@ -491,9 +503,11 @@ impl Machine {
             .unwrap_or((DEFAULT_GPU_WIDTH, DEFAULT_GPU_HEIGHT));
         let framebuffer = Arc::new(Framebuffer::new(gpu_dims.0, gpu_dims.1));
         let input = InputHub::new();
+        let vsock_endpoint = VsockHostEndpoint::new();
         let build_virtio = |vcfg: &VirtioDeviceConfig| -> Box<dyn VirtioDevice> {
             match vcfg {
-                VirtioDeviceConfig::Blk { backend, serial } => {
+                VirtioDeviceConfig::Blk { backend, serial }
+                | VirtioDeviceConfig::Nvme { backend, serial } => {
                     Box::new(VirtioBlk::new(backend.clone(), serial))
                 }
                 VirtioDeviceConfig::Net { backend } => Box::new(VirtioNet::new(backend.clone())),
@@ -508,6 +522,9 @@ impl Machine {
                     Box::new(VirtioGpu::new(*width, *height, framebuffer.clone()))
                 }
                 VirtioDeviceConfig::Input => Box::new(VirtioInput::new(input.clone())),
+                VirtioDeviceConfig::Vsock { guest_cid } => {
+                    Box::new(VirtioVsock::new(*guest_cid, vsock_endpoint.clone()))
+                }
             }
         };
 
@@ -525,7 +542,11 @@ impl Machine {
             pci.add_virtio_device(Box::new(VirtioRng::default()));
         } else {
             for vcfg in &config.virtio_pci {
-                pci.add_virtio_device(build_virtio(vcfg));
+                if let VirtioDeviceConfig::Nvme { backend, serial } = vcfg {
+                    pci.add_nvme_device(backend.clone(), serial);
+                } else {
+                    pci.add_virtio_device(build_virtio(vcfg));
+                }
             }
         }
         bus.add_mmio(

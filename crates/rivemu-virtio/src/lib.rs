@@ -7,11 +7,13 @@ pub mod console;
 pub mod gpu;
 pub mod input;
 pub mod net;
+pub mod nvme;
 pub mod p9;
 pub mod pci;
 pub mod queue;
 pub mod rng;
 pub mod vnc;
+pub mod vsock;
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -24,11 +26,18 @@ pub use console::VirtioConsole;
 pub use gpu::{DEFAULT_GPU_HEIGHT, DEFAULT_GPU_WIDTH, Framebuffer, VirtioGpu};
 pub use input::{InputHub, VirtioInput, VirtioInputEvent};
 pub use net::VirtioNet;
+pub use nvme::{NvmeController, NvmeCq, NvmeSnapshot, NvmeSq};
 pub use p9::Virtio9p;
-pub use pci::{PCIE_MMIO_BASE, PciBus, PciEcamWindow, PciMmioWindow, VIRTIO_PCI_BAR0_SIZE};
+pub use pci::{
+    PCIE_MMIO_BASE, PciBus, PciEcamWindow, PciMmioWindow, VIRTIO_PCI_BAR0_SIZE, VirtioPciSnapshot,
+};
 pub use queue::{DmaRam, QUEUE_MAX_SIZE, VirtQueue};
 pub use rng::VirtioRng;
 pub use vnc::VncServer;
+pub use vsock::{
+    DEFAULT_GUEST_CID, VIRTIO_VSOCK_TYPE_STREAM, VMADDR_CID_HOST, VSOCK_HDR_SIZE, VirtioVsock,
+    VsockHeader, VsockHostEndpoint, vsock_op,
+};
 
 /// VirtIO MMIO magic value (`"virt"`).
 pub const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
@@ -804,5 +813,189 @@ mod tests {
         assert_eq!(dma.read_u16(ev0 + 2), Some(30)); // KEY_A
         assert_eq!(dma.read_u32(ev0 + 4), Some(1)); // down = 1
         assert_eq!(dma.read_u16(ev1), Some(0)); // EV_SYN
+    }
+
+    #[test]
+    fn virtio_vsock_connect_stream_rw_and_credit_update() {
+        let dma = test_dma(0x10000);
+        let irq = Arc::new(TestIrq::default());
+        let endpoint = VsockHostEndpoint::new();
+        let mmio = VirtioMmio::new(
+            Box::new(VirtioVsock::new(DEFAULT_GUEST_CID, endpoint.clone())),
+            dma.clone(),
+            irq.clone(),
+        );
+
+        assert_eq!(mmio.read(0x008, AccessSize::Word), 19);
+        assert_eq!(mmio.read(0x100, AccessSize::Double), DEFAULT_GUEST_CID);
+
+        // Setup queue 0 (rx) and queue 1 (tx)
+        let (rx_desc, rx_avail, rx_used) = (0x8000_1000, 0x8000_2000, 0x8000_3000);
+        let (tx_desc, tx_avail, tx_used) = (0x8000_4000, 0x8000_5000, 0x8000_6000);
+        setup_queue(&mmio, rx_desc, rx_avail, rx_used);
+        mmio.write(0x030, AccessSize::Word, 1);
+        mmio.write(0x038, AccessSize::Word, 16);
+        mmio.write(0x080, AccessSize::Word, tx_desc);
+        mmio.write(0x084, AccessSize::Word, tx_desc >> 32);
+        mmio.write(0x090, AccessSize::Word, tx_avail);
+        mmio.write(0x094, AccessSize::Word, tx_avail >> 32);
+        mmio.write(0x0a0, AccessSize::Word, tx_used);
+        mmio.write(0x0a4, AccessSize::Word, tx_used >> 32);
+        mmio.write(0x044, AccessSize::Word, 1);
+
+        // Provide two RX buffers at 0x8000_7000 and 0x8000_7200
+        write_desc(&dma, rx_desc, 0, 0x8000_7000, 256, VIRTQ_DESC_F_WRITE, 0);
+        write_desc(&dma, rx_desc, 1, 0x8000_7200, 256, VIRTQ_DESC_F_WRITE, 0);
+        dma.write_u16(rx_avail + 2, 2).unwrap();
+        dma.write_u16(rx_avail + 4, 0).unwrap();
+        dma.write_u16(rx_avail + 6, 1).unwrap();
+
+        // Guest sends REQUEST (op=1) followed by RW (op=5, payload="hello-vsock") on TX queue
+        let req_hdr = VsockHeader {
+            src_cid: DEFAULT_GUEST_CID,
+            dst_cid: VMADDR_CID_HOST,
+            src_port: 1024,
+            dst_port: 9000,
+            len: 0,
+            r#type: VIRTIO_VSOCK_TYPE_STREAM,
+            op: vsock_op::REQUEST,
+            flags: 0,
+            buf_alloc: 65536,
+            fwd_cnt: 0,
+        };
+        let rw_hdr = VsockHeader {
+            len: 11,
+            op: vsock_op::RW,
+            ..req_hdr
+        };
+        dma.write_bytes(0x8000_8000, &req_hdr.to_bytes());
+        let mut rw_pkt = rw_hdr.to_bytes().to_vec();
+        rw_pkt.extend_from_slice(b"hello-vsock");
+        dma.write_bytes(0x8000_8100, &rw_pkt);
+
+        write_desc(&dma, tx_desc, 0, 0x8000_8000, VSOCK_HDR_SIZE as u32, 0, 0);
+        write_desc(&dma, tx_desc, 1, 0x8000_8100, rw_pkt.len() as u32, 0, 0);
+        dma.write_u16(tx_avail + 2, 2).unwrap();
+        dma.write_u16(tx_avail + 4, 0).unwrap();
+        dma.write_u16(tx_avail + 6, 1).unwrap();
+        mmio.write(0x050, AccessSize::Word, 1); // notify TX
+
+        // Poll RX queue to deliver RESPONSE and CREDIT_UPDATE
+        mmio.poll();
+        assert_eq!(dma.read_u16(rx_used + 2), Some(2));
+
+        let mut resp_buf = [0u8; VSOCK_HDR_SIZE];
+        dma.read_bytes(0x8000_7000, &mut resp_buf);
+        let resp = VsockHeader::from_bytes(&resp_buf).unwrap();
+        assert_eq!(resp.op, vsock_op::RESPONSE);
+        assert_eq!(resp.src_cid, VMADDR_CID_HOST);
+        assert_eq!(resp.dst_cid, DEFAULT_GUEST_CID);
+        assert_eq!(resp.dst_port, 1024);
+
+        let mut credit_buf = [0u8; VSOCK_HDR_SIZE];
+        dma.read_bytes(0x8000_7200, &mut credit_buf);
+        let credit = VsockHeader::from_bytes(&credit_buf).unwrap();
+        assert_eq!(credit.op, vsock_op::CREDIT_UPDATE);
+        assert_eq!(credit.fwd_cnt, 11);
+
+        let payloads = endpoint.take_tx_payloads();
+        assert_eq!(payloads, vec![(1024, 9000, b"hello-vsock".to_vec())]);
+    }
+
+    #[test]
+    fn pcie_nvme_identify_create_io_queues_write_read_and_snapshot() {
+        let dma = test_dma(0x10000);
+        let irq: Arc<dyn IrqLine> = Arc::new(TestIrq::default());
+        let irqs: [Arc<dyn IrqLine>; 4] = [irq.clone(), irq.clone(), irq.clone(), irq.clone()];
+        let pci = PciBus::new(dma.clone(), irqs);
+        let disk = MemoryBlock::new(64 * 1024, false);
+        pci.add_nvme_device(disk, "NVME-TEST-01");
+
+        let ecam = pci.ecam_window();
+        let mmio = pci.mmio_window();
+
+        // Slot 1 ECAM offset = 1 << 15: Vendor 0x1b36, Device 0x0010, Class 0x010802
+        let slot1_ecam = 1u64 << 15;
+        assert_eq!(ecam.read(slot1_ecam, AccessSize::Word), 0x0010_1b36);
+        assert_eq!(ecam.read(slot1_ecam + 0x08, AccessSize::Word) >> 8, 0x010802);
+
+        // Slot 1 BAR0 is at offset 0x1_0000 in PCI MMIO window (`0x4001_0000`)
+        let bar0 = 0x1_0000u64;
+        assert_eq!(mmio.read(bar0 + 0x08, AccessSize::Word), 0x0001_0400); // VS = 1.4.0
+
+        // Configure Admin SQ @ 0x8000_1000, Admin CQ @ 0x8000_2000, AQA = (15 << 16) | 15, CC.EN = 1
+        let (asq, acq) = (0x8000_1000u64, 0x8000_2000u64);
+        mmio.write(bar0 + 0x24, AccessSize::Word, (15 << 16) | 15);
+        mmio.write(bar0 + 0x28, AccessSize::Double, asq);
+        mmio.write(bar0 + 0x30, AccessSize::Double, acq);
+        mmio.write(bar0 + 0x14, AccessSize::Word, 1); // CC.EN = 1
+        assert_eq!(mmio.read(bar0 + 0x1c, AccessSize::Word) & 1, 1); // CSTS.RDY = 1
+
+        // Helper to submit a 64-byte SQE on queue `qid` at slot `tail`
+        let submit = |qid: u64, sq_base: u64, idx: u64, sqe: &[u8; 64]| {
+            dma.write_bytes(sq_base + idx * 64, sqe);
+            mmio.write(bar0 + 0x1000 + (2 * qid) * 4, AccessSize::Word, idx + 1);
+        };
+
+        // 1. Admin Identify Controller (opcode 0x06, CNS=1) -> PRP1 = 0x8000_3000
+        let mut sqe = [0u8; 64];
+        sqe[0] = 0x06;
+        sqe[2..4].copy_from_slice(&1u16.to_le_bytes()); // CID = 1
+        sqe[24..32].copy_from_slice(&0x8000_3000u64.to_le_bytes()); // PRP1
+        sqe[40..44].copy_from_slice(&1u32.to_le_bytes()); // CDW10: CNS = 1
+        submit(0, asq, 0, &sqe);
+
+        let mut sn = [0u8; 12];
+        dma.read_bytes(0x8000_3004, &mut sn);
+        assert_eq!(&sn, b"NVME-TEST-01");
+        assert_eq!(dma.read_u16(acq + 12), Some(1)); // CQE0 CID = 1
+        assert_eq!(dma.read_u16(acq + 14), Some(1)); // status=0, phase=1
+
+        // 2. Create I/O CQ 1 @ 0x8000_5000 (opcode 0x05) and I/O SQ 1 @ 0x8000_4000 (opcode 0x01)
+        let (iosq, iocq) = (0x8000_4000u64, 0x8000_5000u64);
+        let mut create_cq = [0u8; 64];
+        create_cq[0] = 0x05;
+        create_cq[24..32].copy_from_slice(&iocq.to_le_bytes());
+        create_cq[40..44].copy_from_slice(&((15u32 << 16) | 1).to_le_bytes()); // QID=1, QSIZE=15
+        create_cq[44..48].copy_from_slice(&3u32.to_le_bytes()); // PC=1, IEN=1
+        submit(0, asq, 1, &create_cq);
+
+        let mut create_sq = [0u8; 64];
+        create_sq[0] = 0x01;
+        create_sq[24..32].copy_from_slice(&iosq.to_le_bytes());
+        create_sq[40..44].copy_from_slice(&((15u32 << 16) | 1).to_le_bytes()); // QID=1, QSIZE=15
+        create_sq[44..48].copy_from_slice(&((1u32 << 16) | 1).to_le_bytes()); // CQID=1, PC=1
+        submit(0, asq, 2, &create_sq);
+
+        // Snapshot PCI bus state, reset NVMe controller, and restore snapshot!
+        let (v_snap, n_snap) = pci.snapshot();
+        mmio.write(bar0 + 0x14, AccessSize::Word, 0); // CC.EN = 0 (reset)
+        assert_eq!(mmio.read(bar0 + 0x1c, AccessSize::Word) & 1, 0);
+        pci.restore(v_snap, n_snap);
+        assert_eq!(mmio.read(bar0 + 0x1c, AccessSize::Word) & 1, 1);
+
+        // 3. I/O Write (opcode 0x01) 1 sector (512B) at LBA 4 from 0x8000_6000, then Read (opcode 0x02) into 0x8000_7000
+        let pattern = [0xa5u8; 512];
+        dma.write_bytes(0x8000_6000, &pattern);
+        let mut io_write = [0u8; 64];
+        io_write[0] = 0x01;
+        io_write[2..4].copy_from_slice(&0x42u16.to_le_bytes());
+        io_write[4..8].copy_from_slice(&1u32.to_le_bytes()); // NSID = 1
+        io_write[24..32].copy_from_slice(&0x8000_6000u64.to_le_bytes()); // PRP1
+        io_write[40..44].copy_from_slice(&4u32.to_le_bytes()); // SLBA = 4
+        submit(1, iosq, 0, &io_write);
+
+        let mut io_read = [0u8; 64];
+        io_read[0] = 0x02;
+        io_read[2..4].copy_from_slice(&0x43u16.to_le_bytes());
+        io_read[4..8].copy_from_slice(&1u32.to_le_bytes()); // NSID = 1
+        io_read[24..32].copy_from_slice(&0x8000_7000u64.to_le_bytes()); // PRP1
+        io_read[40..44].copy_from_slice(&4u32.to_le_bytes()); // SLBA = 4
+        submit(1, iosq, 1, &io_read);
+
+        let mut readback = [0u8; 512];
+        dma.read_bytes(0x8000_7000, &mut readback);
+        assert_eq!(readback, pattern);
+        assert_eq!(dma.read_u16(iocq + 16 + 12), Some(0x43)); // second I/O CQE CID
     }
 }

@@ -10,9 +10,11 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use rivemu_backends::BlockBackend;
 use rivemu_core::{AccessSize, IrqLine};
 use rivemu_mem::MmioDevice;
 
+use crate::nvme::{NvmeController, NvmeSnapshot};
 use crate::{
     DmaRam, QUEUE_MAX_SIZE, VIRTIO_F_VERSION_1, VIRTIO_RING_F_EVENT_IDX,
     VIRTIO_RING_F_INDIRECT_DESC, VirtQueue, VirtioDevice,
@@ -24,6 +26,35 @@ pub const PCIE_MMIO_BASE: u64 = 0x4000_0000;
 pub const VIRTIO_PCI_BAR0_SIZE: u32 = 0x4000;
 
 const INT_VRING: u8 = 1 << 0;
+
+/// Serializable snapshot of a [`VirtioPciFunction`].
+#[derive(Clone, Debug)]
+pub struct VirtioPciSnapshot {
+    /// PCI Command register.
+    pub command: u16,
+    /// PCI BAR0 register.
+    pub bar0: u32,
+    /// PCI Interrupt Line register.
+    pub irq_line: u8,
+    /// VirtIO `device_status`.
+    pub status: u8,
+    /// VirtIO `device_feature_select`.
+    pub device_feature_sel: u32,
+    /// VirtIO `driver_feature_select`.
+    pub driver_feature_sel: u32,
+    /// Negotiated `driver_features`.
+    pub driver_features: u64,
+    /// VirtIO `queue_select`.
+    pub queue_sel: u16,
+    /// VirtIO `msix_config`.
+    pub msix_config: u16,
+    /// VirtIO `interrupt_status`.
+    pub interrupt_status: u8,
+    /// VirtIO `config_generation`.
+    pub config_generation: u8,
+    /// VirtQueue states.
+    pub queues: Vec<VirtQueue>,
+}
 
 struct VirtioPciFunction {
     slot: u8,
@@ -102,8 +133,44 @@ impl VirtioPciFunction {
             9 => 0x00_0200,  // Filesystem / 9P share
             16 => 0x03_8000, // Display controller: 2D GPU
             18 => 0x09_8000, // Input device controller: Keyboard/Tablet
+            19 => 0x07_8000, // Communication controller: Socket (vsock)
             _ => 0x00_ff00,
         }
+    }
+
+    fn snapshot(&self) -> VirtioPciSnapshot {
+        VirtioPciSnapshot {
+            command: self.command,
+            bar0: self.bar0,
+            irq_line: self.irq_line,
+            status: self.status,
+            device_feature_sel: self.device_feature_sel,
+            driver_feature_sel: self.driver_feature_sel,
+            driver_features: self.driver_features,
+            queue_sel: self.queue_sel,
+            msix_config: self.msix_config,
+            interrupt_status: self.interrupt_status,
+            config_generation: self.config_generation,
+            queues: self.queues.clone(),
+        }
+    }
+
+    fn restore(&mut self, snap: VirtioPciSnapshot) {
+        self.command = snap.command;
+        self.bar0 = snap.bar0;
+        self.irq_line = snap.irq_line;
+        self.status = snap.status;
+        self.device_feature_sel = snap.device_feature_sel;
+        self.driver_feature_sel = snap.driver_feature_sel;
+        self.driver_features = snap.driver_features;
+        self.queue_sel = snap.queue_sel;
+        self.msix_config = snap.msix_config;
+        self.interrupt_status = snap.interrupt_status;
+        self.config_generation = snap.config_generation;
+        for (dst, src) in self.queues.iter_mut().zip(snap.queues) {
+            *dst = src;
+        }
+        self.irq.set_level(self.interrupt_status != 0);
     }
 
     fn config_byte(&self, reg: u16) -> u8 {
@@ -383,12 +450,14 @@ pub struct PciBus {
     dma: DmaRam,
     irqs: [Arc<dyn IrqLine>; 4],
     funcs: Mutex<Vec<VirtioPciFunction>>,
+    nvme: Mutex<Vec<NvmeController>>,
 }
 
 impl fmt::Debug for PciBus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PciBus")
             .field("funcs", &self.funcs)
+            .field("nvme", &self.nvme)
             .finish_non_exhaustive()
     }
 }
@@ -400,17 +469,56 @@ impl PciBus {
             dma,
             irqs,
             funcs: Mutex::new(Vec::new()),
+            nvme: Mutex::new(Vec::new()),
         })
+    }
+
+    fn next_slot(funcs: &[VirtioPciFunction], nvme: &[NvmeController]) -> u8 {
+        (funcs.len() + nvme.len() + 1) as u8
     }
 
     /// Attaches a [`VirtioDevice`] as a Modern VirtIO 1.0 PCI function at the next slot (`00:01.0..`).
     pub fn add_virtio_device(&self, dev: Box<dyn VirtioDevice>) {
         let mut funcs = self.funcs.lock().unwrap();
-        let slot = (funcs.len() as u8) + 1;
+        let nvme = self.nvme.lock().unwrap();
+        let slot = Self::next_slot(&funcs, &nvme);
         if slot < 32 {
             // Standard PCI INTx swizzle for INTA# (pin 1): `(slot + 0) % 4`.
             let irq = self.irqs[(slot as usize) % 4].clone();
             funcs.push(VirtioPciFunction::new(slot, dev, irq));
+        }
+    }
+
+    /// Attaches a PCIe NVMe 1.4 controller (`1b36:0010`) at the next slot (`00:01.0..`).
+    pub fn add_nvme_device(&self, backend: Arc<dyn BlockBackend>, serial: &str) {
+        let funcs = self.funcs.lock().unwrap();
+        let mut nvme = self.nvme.lock().unwrap();
+        let slot = Self::next_slot(&funcs, &nvme);
+        if slot < 32 {
+            let irq = self.irqs[(slot as usize) % 4].clone();
+            nvme.push(NvmeController::new(slot, backend, serial, irq));
+        }
+    }
+
+    /// Captures a snapshot of all attached `virtio-pci` and `nvme` functions.
+    pub fn snapshot(&self) -> (Vec<VirtioPciSnapshot>, Vec<NvmeSnapshot>) {
+        let funcs = self.funcs.lock().unwrap();
+        let nvme = self.nvme.lock().unwrap();
+        (
+            funcs.iter().map(VirtioPciFunction::snapshot).collect(),
+            nvme.iter().map(NvmeController::snapshot).collect(),
+        )
+    }
+
+    /// Restores all attached `virtio-pci` and `nvme` functions from a snapshot.
+    pub fn restore(&self, virtio_snaps: Vec<VirtioPciSnapshot>, nvme_snaps: Vec<NvmeSnapshot>) {
+        let mut funcs = self.funcs.lock().unwrap();
+        for (dst, snap) in funcs.iter_mut().zip(virtio_snaps) {
+            dst.restore(snap);
+        }
+        let mut nvme = self.nvme.lock().unwrap();
+        for (dst, snap) in nvme.iter_mut().zip(nvme_snaps) {
+            dst.restore(snap);
         }
     }
 
@@ -479,10 +587,15 @@ impl MmioDevice for PciEcamWindow {
             return v;
         }
         let funcs = self.0.funcs.lock().unwrap();
-        let Some(f) = funcs.iter().find(|f| f.slot == slot) else {
-            return size.mask();
-        };
-        f.read_config_space(reg, size)
+        if let Some(f) = funcs.iter().find(|f| f.slot == slot) {
+            return f.read_config_space(reg, size);
+        }
+        drop(funcs);
+        let nvme = self.0.nvme.lock().unwrap();
+        if let Some(n) = nvme.iter().find(|n| n.slot == slot) {
+            return n.read_config_space(reg, size);
+        }
+        size.mask()
     }
 
     fn write(&self, offset: u64, size: AccessSize, value: u64) {
@@ -496,6 +609,12 @@ impl MmioDevice for PciEcamWindow {
         let mut funcs = self.0.funcs.lock().unwrap();
         if let Some(f) = funcs.iter_mut().find(|f| f.slot == slot) {
             f.write_config_space(reg, size, value);
+            return;
+        }
+        drop(funcs);
+        let mut nvme = self.0.nvme.lock().unwrap();
+        if let Some(n) = nvme.iter_mut().find(|n| n.slot == slot) {
+            n.write_config_space(reg, size, value);
         }
     }
 }
@@ -515,6 +634,15 @@ impl MmioDevice for PciMmioWindow {
                 return f.read_bar0(gpa - base, size);
             }
         }
+        drop(funcs);
+        let nvme = self.0.nvme.lock().unwrap();
+        for n in nvme.iter() {
+            let base = u64::from(n.bar0 & !0xf);
+            if base >= PCIE_MMIO_BASE && gpa >= base && gpa < base + u64::from(VIRTIO_PCI_BAR0_SIZE)
+            {
+                return n.read_bar0(gpa - base, size);
+            }
+        }
         size.mask()
     }
 
@@ -526,6 +654,16 @@ impl MmioDevice for PciMmioWindow {
             if base >= PCIE_MMIO_BASE && gpa >= base && gpa < base + u64::from(VIRTIO_PCI_BAR0_SIZE)
             {
                 f.write_bar0(gpa - base, size, value, &self.0.dma);
+                return;
+            }
+        }
+        drop(funcs);
+        let mut nvme = self.0.nvme.lock().unwrap();
+        for n in nvme.iter_mut() {
+            let base = u64::from(n.bar0 & !0xf);
+            if base >= PCIE_MMIO_BASE && gpa >= base && gpa < base + u64::from(VIRTIO_PCI_BAR0_SIZE)
+            {
+                n.write_bar0(gpa - base, size, value, &self.0.dma);
                 return;
             }
         }

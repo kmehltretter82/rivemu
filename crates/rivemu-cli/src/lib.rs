@@ -823,6 +823,29 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
             | "virtio-mouse-pci" => {
                 push_dev(VirtioDeviceConfig::Input);
             }
+            "vhost-vsock-device"
+            | "vhost-vsock-pci"
+            | "virtio-vsock-device"
+            | "virtio-vsock-pci" => {
+                let guest_cid = dev
+                    .get("guest-cid")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(3);
+                push_dev(VirtioDeviceConfig::Vsock { guest_cid });
+            }
+            "nvme" => {
+                let drive_id = dev
+                    .get("drive")
+                    .ok_or_else(|| "-device nvme: missing 'drive='".to_string())?;
+                let backend = drives
+                    .get(drive_id)
+                    .ok_or_else(|| format!("-device nvme: unknown drive '{drive_id}'"))?;
+                let serial = dev.get("serial").unwrap_or(drive_id).to_owned();
+                virtio_pci.push(VirtioDeviceConfig::Nvme {
+                    backend: backend.clone(),
+                    serial,
+                });
+            }
             other => {
                 return Err(format!(
                     "-device {other}: unsupported device (use -device help)"
