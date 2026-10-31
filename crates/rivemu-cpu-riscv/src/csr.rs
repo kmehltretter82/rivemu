@@ -93,9 +93,11 @@ pub mod status {
     pub const TW: u64 = 1 << 21;
     pub const TSR: u64 = 1 << 22;
     pub const SPELP: u64 = 1 << 23;
+    pub const SDT: u64 = 1 << 24;
     pub const UXL: u64 = 3 << 32;
     pub const SXL: u64 = 3 << 34;
     pub const MPELP: u64 = 1 << 41;
+    pub const MDT: u64 = 1 << 42;
     pub const SD: u64 = 1 << 63;
 
     /// Bits writable through `mstatus`.
@@ -113,11 +115,13 @@ pub mod status {
         | TW
         | TSR
         | SPELP
-        | MPELP;
+        | SDT
+        | MPELP
+        | MDT;
     /// Bits visible through `sstatus`.
-    pub const S_READABLE: u64 = SIE | SPIE | SPP | FS | SUM | MXR | SPELP | UXL | SD;
+    pub const S_READABLE: u64 = SIE | SPIE | SPP | FS | SUM | MXR | SPELP | SDT | UXL | SD;
     /// Bits writable through `sstatus`.
-    pub const S_WRITABLE: u64 = SIE | SPIE | SPP | FS | SUM | MXR | SPELP;
+    pub const S_WRITABLE: u64 = SIE | SPIE | SPP | FS | SUM | MXR | SPELP | SDT;
 }
 
 /// Interrupt bits in `mip` / `mie` (and interrupt cause numbers).
@@ -173,12 +177,13 @@ pub mod envcfg {
     pub const PMM_MASK: u64 = 3 << PMM_SHIFT;
     pub const PMM_PMLEN_7: u64 = 2 << PMM_SHIFT;
     pub const PMM_PMLEN_16: u64 = 3 << PMM_SHIFT;
+    pub const DTE: u64 = 1 << 59;
     pub const ADUE: u64 = 1 << 61;
     pub const PBMTE: u64 = 1 << 62;
     pub const STCE: u64 = 1 << 63;
 
     pub const S_MASK: u64 = FIOM | LPE | SSE | CBIE_MASK | CBCFE | CBZE | UKTE | PMM_MASK;
-    pub const M_MASK: u64 = (S_MASK & !UKTE) | ADUE | PBMTE | STCE;
+    pub const M_MASK: u64 = (S_MASK & !UKTE) | DTE | ADUE | PBMTE | STCE;
 
     /// Masks `v` to `mask`, clears the reserved `CBIE = 0b10` encoding (WARL),
     /// and preserves the previous `PMM` field if `v` specifies reserved `PMM = 0b01`.

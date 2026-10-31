@@ -28,6 +28,7 @@ pub mod cause {
     pub const INSN_PAGE_FAULT: u64 = 12;
     pub const LOAD_PAGE_FAULT: u64 = 13;
     pub const STORE_PAGE_FAULT: u64 = 15;
+    pub const DOUBLE_TRAP: u64 = 16;
     pub const SW_CHECK: u64 = 18;
 }
 
@@ -845,11 +846,19 @@ impl Hart {
         } else {
             self.csr.medeleg
         };
+        let delegated_to_s = self.prv <= Priv::Supervisor && (deleg >> code) & 1 != 0;
+        let dte = self.csr.menvcfg & envcfg::DTE != 0;
+        let s_double_trap = delegated_to_s && dte && (self.csr.mstatus & status::SDT) != 0;
+        let (code, interrupt, tval, to_s) = if s_double_trap {
+            (cause::DOUBLE_TRAP, false, if interrupt { 0 } else { tval }, false)
+        } else {
+            (code, interrupt, tval, delegated_to_s)
+        };
         let cause = code | (u64::from(interrupt) << 63);
         let save_elp = self.elp && self.csr.landing_pad_enabled(old_prv);
         self.elp = false;
         let s = &mut self.csr.mstatus;
-        if self.prv <= Priv::Supervisor && (deleg >> code) & 1 != 0 {
+        if to_s {
             self.csr.scause = cause;
             self.csr.sepc = self.pc;
             self.csr.stval = tval;
@@ -863,6 +872,9 @@ impl Hart {
             }
             if save_elp {
                 *s |= status::SPELP;
+            }
+            if dte {
+                *s |= status::SDT;
             }
             self.prv = Priv::Supervisor;
             self.pc = trap_vector(self.csr.stvec, code, interrupt);
@@ -1533,13 +1545,16 @@ impl Hart {
                 let s = self.csr.mstatus;
                 let mpp = Priv::from_bits(s >> status::MPP_SHIFT);
                 let mpelp = s & status::MPELP != 0;
-                let mut n = s & !(status::MIE | status::MPP | status::MPELP);
+                let mut n = s & !(status::MIE | status::MPP | status::MPELP | status::MDT);
                 if s & status::MPIE != 0 {
                     n |= status::MIE;
                 }
                 n |= status::MPIE;
                 if mpp != Priv::Machine {
                     n &= !status::MPRV;
+                    if mpp == Priv::User {
+                        n &= !status::SDT;
+                    }
                 }
                 self.csr.mstatus = n;
                 self.prv = mpp;
@@ -1562,7 +1577,8 @@ impl Hart {
                     Priv::User
                 };
                 let spelp = s & status::SPELP != 0;
-                let mut n = s & !(status::SIE | status::SPP | status::MPRV | status::SPELP);
+                let mut n =
+                    s & !(status::SIE | status::SPP | status::MPRV | status::SPELP | status::SDT);
                 if s & status::SPIE != 0 {
                     n |= status::SIE;
                 }
@@ -2178,8 +2194,15 @@ impl Hart {
                 }
             }
             csr::SSTATUS => {
-                let m = status::S_WRITABLE;
-                self.csr.mstatus = (self.csr.mstatus & !m) | (v & m);
+                let mut m = status::S_WRITABLE;
+                if self.csr.menvcfg & envcfg::DTE == 0 {
+                    m &= !status::SDT;
+                }
+                let mut n = (self.csr.mstatus & !m) | (v & m);
+                if v & m & status::SDT != 0 {
+                    n &= !status::SIE;
+                }
+                self.csr.mstatus = n;
             }
             csr::SIE => {
                 let m = self.csr.mideleg & irq::S_MASK;
@@ -2249,8 +2272,17 @@ impl Hart {
                 return None;
             }
             csr::MSTATUS => {
-                let m = status::M_WRITABLE;
+                let mut m = status::M_WRITABLE;
+                if self.csr.menvcfg & envcfg::DTE == 0 {
+                    m &= !status::SDT;
+                }
                 let mut n = (self.csr.mstatus & !m) | (v & m);
+                if v & m & status::SDT != 0 {
+                    n &= !status::SIE;
+                }
+                if v & m & status::MDT != 0 {
+                    n &= !status::MIE;
+                }
                 if (n >> status::MPP_SHIFT) & 3 == 2 {
                     // Reserved MPP value: keep the old one (WARL).
                     n = (n & !status::MPP) | (self.csr.mstatus & status::MPP);
@@ -2271,6 +2303,9 @@ impl Hart {
                 self.csr.menvcfg = envcfg::sanitize(v, self.csr.menvcfg, envcfg::M_MASK);
                 if self.csr.menvcfg & envcfg::SSE == 0 {
                     self.csr.senvcfg &= !envcfg::SSE;
+                }
+                if self.csr.menvcfg & envcfg::DTE == 0 {
+                    self.csr.mstatus &= !status::SDT;
                 }
                 self.flush_tlb();
             }

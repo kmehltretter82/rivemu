@@ -2517,7 +2517,103 @@ fn svrsw60t59b_smmpm_ssqosid_and_zicbop_semantics() {
     assert_eq!(h.x[11], 0x1122_3344_5566_7788);
 }
 
+#[test]
+fn ssdbltrp_and_smdbltrp_double_trap_semantics() {
+    use rivemu_cpu_riscv::csr::{self, envcfg, status};
+    use rivemu_cpu_riscv::{Priv, cause};
 
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    const CODE: u64 = 0x8000_0000;
+    const STVEC: u64 = 0x8000_1000;
+    const MTVEC: u64 = 0x8000_2000;
 
+    // CODE + 0: ecall  (0x0000_0073)
+    // CODE + 4: sret   (0x1020_0073)
+    // CODE + 8: mret   (0x3020_0073)
+    // STVEC + 0: ebreak (0x0010_0073)
+    bus.write(CODE, AccessSize::Word, 0x0000_0073).unwrap();
+    bus.write(CODE + 4, AccessSize::Word, 0x1020_0073).unwrap();
+    bus.write(CODE + 8, AccessSize::Word, 0x3020_0073).unwrap();
+    bus.write(STVEC, AccessSize::Word, 0x0010_0073).unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr_write(csr::STVEC, STVEC).unwrap();
+    h.csr_write(csr::MTVEC, MTVEC).unwrap();
+    h.csr_write(
+        csr::MEDELEG,
+        (1 << cause::ECALL_U) | (1 << cause::BREAKPOINT),
+    )
+    .unwrap();
+
+    // 1. When menvcfg.DTE == 0, SDT is read-only 0:
+    h.csr_write(csr::MSTATUS, status::SDT | status::SIE)
+        .unwrap();
+    assert_eq!(h.csr_read(csr::MSTATUS).unwrap() & status::SDT, 0);
+    assert_ne!(h.csr_read(csr::MSTATUS).unwrap() & status::SIE, 0);
+
+    // 2. Writing mstatus.MDT = 1 automatically clears MIE:
+    h.csr_write(csr::MSTATUS, status::MIE).unwrap();
+    assert_ne!(h.csr_read(csr::MSTATUS).unwrap() & status::MIE, 0);
+    h.csr_write(csr::MSTATUS, status::MDT | status::MIE)
+        .unwrap();
+    assert_eq!(
+        h.csr_read(csr::MSTATUS).unwrap() & (status::MDT | status::MIE),
+        status::MDT
+    );
+
+    // 3. Enabling menvcfg.DTE = 1 allows writing SDT = 1, which auto-clears SIE:
+    h.csr_write(csr::MENVCFG, envcfg::DTE).unwrap();
+    h.csr_write(csr::SSTATUS, status::SIE).unwrap();
+    assert_ne!(h.csr_read(csr::SSTATUS).unwrap() & status::SIE, 0);
+    h.csr_write(csr::SSTATUS, status::SDT | status::SIE)
+        .unwrap();
+    assert_eq!(
+        h.csr_read(csr::SSTATUS).unwrap() & (status::SDT | status::SIE),
+        status::SDT
+    );
+
+    // Clearing menvcfg.DTE = 0 clears SDT:
+    h.csr_write(csr::MENVCFG, 0).unwrap();
+    assert_eq!(h.csr_read(csr::MSTATUS).unwrap() & status::SDT, 0);
+
+    // 4. S-mode trap entry with DTE=1 sets SDT=1; second S-mode trap escalates to M-mode (cause 16):
+    h.csr_write(csr::MENVCFG, envcfg::DTE).unwrap();
+    h.csr_write(csr::MSTATUS, 0).unwrap();
+    h.prv = Priv::User;
+    h.pc = CODE; // ecall -> delegated to S-mode
+    h.step(&bus);
+    assert_eq!(h.prv, Priv::Supervisor);
+    assert_eq!(h.pc, STVEC);
+    assert_eq!(h.csr.scause, cause::ECALL_U);
+    assert_ne!(h.csr.mstatus & status::SDT, 0);
+
+    // At STVEC: ebreak (delegated in medeleg) while SDT=1 -> escalates to M-mode with DOUBLE_TRAP (16)!
+    h.step(&bus);
+    assert_eq!(h.prv, Priv::Machine);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr.mcause, cause::DOUBLE_TRAP);
+    assert_eq!(h.csr.mepc, STVEC);
+    assert_ne!(h.csr.mstatus & status::SDT, 0);
+
+    // 5. MRET to S-mode (MPP=Supervisor) clears MDT, preserves SDT:
+    h.csr.mstatus |= status::MDT;
+    h.csr.mepc = CODE + 4; // sret
+    h.pc = CODE + 8; // mret
+    h.step(&bus);
+    assert_eq!(h.prv, Priv::Supervisor);
+    assert_eq!(h.pc, CODE + 4);
+    assert_eq!(h.csr.mstatus & status::MDT, 0);
+    assert_ne!(h.csr.mstatus & status::SDT, 0);
+
+    // 6. SRET clears SDT:
+    h.csr.sepc = CODE;
+    h.step(&bus);
+    assert_eq!(h.prv, Priv::User);
+    assert_eq!(h.pc, CODE);
+    assert_eq!(h.csr.mstatus & status::SDT, 0);
+}
 
 
