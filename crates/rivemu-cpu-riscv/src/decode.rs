@@ -203,6 +203,30 @@ pub enum Op {
     // Zawrs
     WrsNto,
     WrsSto,
+    // Zbkb / Zbkx (cryptography bitmanip & crossbar permutation)
+    Pack,
+    Packh,
+    Packw,
+    Brev8,
+    Xperm4,
+    Xperm8,
+    // Zknd / Zkne (AES64 scalar cryptography)
+    Aes64es,
+    Aes64esm,
+    Aes64ds,
+    Aes64dsm,
+    Aes64im,
+    Aes64ks1i,
+    Aes64ks2,
+    // Zknh (SHA-256 / SHA-512 scalar cryptography)
+    Sha256sum0,
+    Sha256sum1,
+    Sha256sig0,
+    Sha256sig1,
+    Sha512sum0,
+    Sha512sum1,
+    Sha512sig0,
+    Sha512sig1,
 }
 
 /// AMO operation codes (instruction bits 31:27).
@@ -369,7 +393,22 @@ pub fn decode(raw: u32) -> Insn {
                 7 => (Op::Andi, imm_i(raw)),
                 1 => match top6 {
                     0x00 => (Op::Slli, shamt),
+                    0x04 if (raw >> 25) & 1 == 0 => match rs2 {
+                        0 => (Op::Sha256sum0, 0),
+                        1 => (Op::Sha256sum1, 0),
+                        2 => (Op::Sha256sig0, 0),
+                        3 => (Op::Sha256sig1, 0),
+                        4 => (Op::Sha512sum0, 0),
+                        5 => (Op::Sha512sum1, 0),
+                        6 => (Op::Sha512sig0, 0),
+                        7 => (Op::Sha512sig1, 0),
+                        _ => (Op::Illegal, 0),
+                    },
                     0x0a => (Op::Bseti, shamt),
+                    0x0c if imm12 == 0x300 => (Op::Aes64im, 0),
+                    0x0c if (0x310..=0x31a).contains(&imm12) => {
+                        (Op::Aes64ks1i, (imm12 & 0xf) as i32)
+                    }
                     0x12 => (Op::Bclri, shamt),
                     0x1a => (Op::Binvi, shamt),
                     0x18 => match rs2 {
@@ -388,6 +427,7 @@ pub fn decode(raw: u32) -> Insn {
                     0x12 => (Op::Bexti, shamt),
                     0x18 => (Op::Rori, shamt),
                     _ if imm12 == 0x287 => (Op::OrcB, 0),
+                    _ if imm12 == 0x687 => (Op::Brev8, 0),
                     _ if imm12 == 0x6b8 => (Op::Rev8, 0),
                     _ => (Op::Illegal, 0),
                 },
@@ -437,6 +477,9 @@ pub fn decode(raw: u32) -> Insn {
                 (0x10, 2) => Op::Sh1add,
                 (0x10, 4) => Op::Sh2add,
                 (0x10, 6) => Op::Sh3add,
+                // Zbkb
+                (0x04, 4) => Op::Pack,
+                (0x04, 7) => Op::Packh,
                 // Zbb / Zbc (f7 == 0x05)
                 (0x05, 1) => Op::Clmul,
                 (0x05, 2) => Op::Clmulr,
@@ -451,11 +494,19 @@ pub fn decode(raw: u32) -> Insn {
                 (0x20, 7) => Op::Andn,
                 (0x30, 1) => Op::Rol,
                 (0x30, 5) => Op::Ror,
-                // Zbs
+                // Zbs / Zbkx
                 (0x14, 1) => Op::Bset,
+                (0x14, 2) => Op::Xperm4,
+                (0x14, 4) => Op::Xperm8,
                 (0x24, 1) => Op::Bclr,
                 (0x24, 5) => Op::Bext,
                 (0x34, 1) => Op::Binv,
+                // Zknd / Zkne
+                (0x19, 0) => Op::Aes64es,
+                (0x1b, 0) => Op::Aes64esm,
+                (0x1d, 0) => Op::Aes64ds,
+                (0x1f, 0) => Op::Aes64dsm,
+                (0x3f, 0) => Op::Aes64ks2,
                 // Zicond
                 (0x07, 5) => Op::CzeroEqz,
                 (0x07, 7) => Op::CzeroNez,
@@ -475,9 +526,10 @@ pub fn decode(raw: u32) -> Insn {
                 (1, 5) => Op::Divuw,
                 (1, 6) => Op::Remw,
                 (1, 7) => Op::Remuw,
-                // Zba (.uw) & Zbb (zext.h, rolw, rorw)
+                // Zba (.uw) & Zbb/Zbkb (zext.h, packw, rolw, rorw)
                 (0x04, 0) => Op::AddUw,
                 (0x04, 4) if rs2 == 0 => Op::ZextH,
+                (0x04, 4) => Op::Packw,
                 (0x10, 2) => Op::Sh1addUw,
                 (0x10, 4) => Op::Sh2addUw,
                 (0x10, 6) => Op::Sh3addUw,

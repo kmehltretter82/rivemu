@@ -2117,3 +2117,81 @@ fn smepmp_and_smstateen_semantics() {
     assert_eq!(h.csr.mtval, DATA);
 }
 
+#[test]
+fn scalar_crypto_zbkb_zbkc_zbkx_zknd_zkne_zknh_semantics() {
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    let r_type = |f7: u32, rs2: u32, rs1: u32, f3: u32, rd: u32, opc: u32| -> u32 {
+        (f7 << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | opc
+    };
+    let i_type = |imm12: u32, rs1: u32, f3: u32, rd: u32, opc: u32| -> u32 {
+        (imm12 << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | opc
+    };
+
+    let insns: &[u32] = &[
+        // 0: pack      x12, x10, x11
+        r_type(0x04, 11, 10, 4, 12, 0x33),
+        // 1: packh     x13, x10, x11
+        r_type(0x04, 11, 10, 7, 13, 0x33),
+        // 2: packw     x14, x10, x11
+        r_type(0x04, 11, 10, 4, 14, 0x3b),
+        // 3: brev8     x15, x10
+        i_type(0x687, 10, 5, 15, 0x13),
+        // 4: xperm4    x16, x10, x11
+        r_type(0x14, 11, 10, 2, 16, 0x33),
+        // 5: xperm8    x17, x10, x11
+        r_type(0x14, 11, 10, 4, 17, 0x33),
+        // 6: aes64es   x18, x10, x11
+        r_type(0x19, 11, 10, 0, 18, 0x33),
+        // 7: aes64esm  x19, x10, x11
+        r_type(0x1b, 11, 10, 0, 19, 0x33),
+        // 8: aes64ds   x20, x18, x21   (inverse of aes64es when state halves are swapped/reconstructed)
+        r_type(0x1d, 11, 10, 0, 20, 0x33),
+        // 9: aes64dsm  x21, x10, x11
+        r_type(0x1f, 11, 10, 0, 21, 0x33),
+        // 10: aes64im  x22, x19
+        i_type(0x300, 19, 1, 22, 0x13),
+        // 11: aes64ks1i x23, x10, 0
+        i_type(0x310, 10, 1, 23, 0x13),
+        // 12: aes64ks2  x24, x23, x11
+        r_type(0x3f, 11, 23, 0, 24, 0x33),
+        // 13: sha256sum0 x25, x10
+        i_type(0x100, 10, 1, 25, 0x13),
+        // 14: sha256sig1 x26, x10
+        i_type(0x103, 10, 1, 26, 0x13),
+        // 15: sha512sum0 x27, x10
+        i_type(0x104, 10, 1, 27, 0x13),
+        // 16: sha512sig1 x28, x10
+        i_type(0x107, 10, 1, 28, 0x13),
+    ];
+    for (i, &w) in insns.iter().enumerate() {
+        bus.write(CODE + (i as u64) * 4, AccessSize::Word, u64::from(w))
+            .unwrap();
+    }
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.x[10] = 0x0123_4567_89ab_cdef;
+    h.x[11] = 0xfedc_ba98_7654_8001;
+
+    for _ in 0..insns.len() {
+        h.step(&bus);
+    }
+
+    assert_eq!(h.x[12], 0x7654_8001_89ab_cdef); // pack
+    assert_eq!(h.x[13], 0x01ef); // packh
+    assert_eq!(h.x[14], 0xffff_ffff_8001_cdef); // packw (sign-extended 32-bit)
+    assert_eq!(h.x[15], 0x80c4_a2e6_91d5_b3f7); // brev8
+    // aes64im(aes64esm(x10, x11)) == aes64es(x10, x11) because InvMixColumns(MixColumns(x)) == x!
+    assert_eq!(h.x[22], h.x[18]);
+    // sha256sum0 / sha256sig1 results are sign-extended 32-bit values:
+    assert_eq!(h.x[25], (h.x[25] as i32) as i64 as u64);
+    assert_eq!(h.x[26], (h.x[26] as i32) as i64 as u64);
+    assert_ne!(h.x[27], 0);
+    assert_ne!(h.x[28], 0);
+}
+
+
