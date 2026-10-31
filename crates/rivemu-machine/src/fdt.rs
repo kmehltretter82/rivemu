@@ -16,7 +16,7 @@ pub(crate) struct FdtParams<'a> {
     pub(crate) virtio: Vec<(u64, u32)>,
 }
 
-const ISA: &str = "rv64imafdc_zabha_zacas_zalasr_zawrs_zba_zbb_zbc_zbkb_zbkc_zbkx_zbs_zca_zcb_zcd_zcmop_zfa_zfbfmin_zfh_zfhmin_zicbom_zicboz_zicfilp_zicfiss_zicntr_zicond_zicsr_zifencei_zihintpause_zimop_zknd_zkne_zknh_zkr_zksed_zksh_zkt_smcntrpmf_smepmp_smnpm_smstateen_sscofpmf_ssnpm_ssstateen_sstc_svinval_svnapot_svpbmt_svukte";
+const ISA: &str = "rv64imafdc_zabha_zacas_zalasr_zawrs_zba_zbb_zbc_zbkb_zbkc_zbkx_zbs_zca_zcb_zcd_zcmop_zfa_zfbfmin_zfh_zfhmin_zicbom_zicbop_zicboz_zicfilp_zicfiss_zicntr_zicond_zicsr_zifencei_zihintpause_zimop_zknd_zkne_zknh_zkr_zksed_zksh_zkt_smcntrpmf_smepmp_smmpm_smnpm_smstateen_sscofpmf_ssnpm_ssqosid_ssstateen_sstc_svinval_svnapot_svpbmt_svrsw60t59b_svukte_svvptc";
 const ISA_EXTENSIONS: &[&str] = &[
     "i",
     "m",
@@ -44,6 +44,7 @@ const ISA_EXTENSIONS: &[&str] = &[
     "zfh",
     "zfhmin",
     "zicbom",
+    "zicbop",
     "zicboz",
     "zicfilp",
     "zicfiss",
@@ -62,16 +63,20 @@ const ISA_EXTENSIONS: &[&str] = &[
     "zkt",
     "smcntrpmf",
     "smepmp",
+    "smmpm",
     "smnpm",
     "smstateen",
     "sscofpmf",
     "ssnpm",
+    "ssqosid",
     "ssstateen",
     "sstc",
     "svinval",
     "svnapot",
     "svpbmt",
+    "svrsw60t59b",
     "svukte",
+    "svvptc",
 ];
 
 pub(crate) fn build(p: &FdtParams<'_>) -> Vec<u8> {
@@ -118,6 +123,7 @@ pub(crate) fn build(p: &FdtParams<'_>) -> Vec<u8> {
         f.prop_str("riscv,isa-base", "rv64i");
         f.prop_strs("riscv,isa-extensions", ISA_EXTENSIONS);
         f.prop_u32("riscv,cbom-block-size", 64);
+        f.prop_u32("riscv,cbop-block-size", 64);
         f.prop_u32("riscv,cboz-block-size", 64);
         f.prop_str("mmu-type", "riscv,sv57");
         f.begin_node("interrupt-controller");

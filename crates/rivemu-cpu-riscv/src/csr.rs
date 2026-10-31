@@ -29,7 +29,11 @@ pub const STVAL: u16 = 0x143;
 pub const SIP: u16 = 0x144;
 pub const STIMECMP: u16 = 0x14d;
 pub const SATP: u16 = 0x180;
+pub const SRMCFG: u16 = 0x181;
 pub const SCOUNTOVF: u16 = 0xda0;
+
+/// Mask of writable bits in `srmcfg` (`Ssqosid`: 12-bit `RCID` in `[11:0]`, 12-bit `MCID` in `[27:16]`).
+pub const SRMCFG_MASK: u64 = 0x0fff_0fff;
 
 // Machine.
 pub const MVENDORID: u16 = 0xf11;
@@ -205,9 +209,11 @@ pub mod mseccfg {
 
 /// `mstateen0..3` / `sstateen0..3` bits (`Smstateen` / `Ssstateen`).
 pub mod stateen {
+    pub const SRMCFG: u64 = 1 << 55;
+    pub const CONTEXT: u64 = 1 << 57;
     pub const ENVCFG: u64 = 1 << 62;
     pub const SE: u64 = 1 << 63;
-    pub const M0_MASK: u64 = SE | ENVCFG;
+    pub const M0_MASK: u64 = SE | ENVCFG | CONTEXT | SRMCFG;
     pub const M1_3_MASK: u64 = SE;
 }
 
@@ -262,6 +268,7 @@ pub struct Csrs {
     pub stval: u64,
     pub stimecmp: u64,
     pub satp: u64,
+    pub srmcfg: u64,
     pub fflags: u64,
     pub frm: u64,
     pub ssp: u64,
@@ -361,6 +368,7 @@ impl Default for Csrs {
             stval: 0,
             stimecmp: u64::MAX,
             satp: 0,
+            srmcfg: 0,
             fflags: 0,
             frm: 0,
             ssp: 0,

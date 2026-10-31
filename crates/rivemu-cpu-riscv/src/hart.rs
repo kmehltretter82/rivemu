@@ -2069,6 +2069,12 @@ impl Hart {
                 }
                 c.satp
             }
+            csr::SRMCFG => {
+                if self.prv != Priv::Machine && (c.mstateen[0] & csr::stateen::SRMCFG) == 0 {
+                    return None;
+                }
+                c.srmcfg
+            }
             csr::MVENDORID | csr::MARCHID | csr::MIMPID | csr::MCONFIGPTR => 0,
             csr::MHARTID => self.id,
             csr::MSTATUS => self.read_mstatus(),
@@ -2232,6 +2238,12 @@ impl Hart {
                         self.fetch_vpn = 0;
                     }
                 }
+            }
+            csr::SRMCFG => {
+                if self.prv != Priv::Machine && (self.csr.mstateen[0] & csr::stateen::SRMCFG) == 0 {
+                    return None;
+                }
+                self.csr.srmcfg = v & csr::SRMCFG_MASK;
             }
             csr::MVENDORID | csr::MARCHID | csr::MIMPID | csr::MHARTID | csr::MCONFIGPTR => {
                 return None;

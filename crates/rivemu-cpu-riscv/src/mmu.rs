@@ -58,10 +58,12 @@ mod pte {
     pub(super) const A: u64 = 1 << 6;
     pub(super) const D: u64 = 1 << 7;
     pub(super) const PPN_MASK: u64 = (1 << 44) - 1;
+    pub(super) const RSW60T59B_MASK: u64 = 3 << 59;
     pub(super) const PBMT_SHIFT: u32 = 61;
     pub(super) const PBMT_MASK: u64 = 3 << PBMT_SHIFT;
     pub(super) const N: u64 = 1 << 63;
-    pub(super) const RESERVED_HIGH_MASK: u64 = !((1u64 << 54) - 1) & !(PBMT_MASK | N);
+    pub(super) const RESERVED_HIGH_MASK: u64 =
+        !((1u64 << 54) - 1) & !(RSW60T59B_MASK | PBMT_MASK | N);
 }
 
 const TLB_SIZE: usize = 1024;

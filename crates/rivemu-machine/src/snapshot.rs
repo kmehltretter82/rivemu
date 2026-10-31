@@ -67,6 +67,7 @@ impl Machine {
                 h.csr.senvcfg,
                 h.csr.ssp,
                 h.csr.mseccfg,
+                h.csr.srmcfg,
             ] {
                 write_u64(&mut w, v)?;
             }
@@ -269,6 +270,7 @@ impl Machine {
             h.csr.senvcfg = read_u64(&mut r)?;
             h.csr.ssp = read_u64(&mut r)?;
             h.csr.mseccfg = read_u64(&mut r)?;
+            h.csr.srmcfg = read_u64(&mut r)?;
             for se in &mut h.csr.mstateen {
                 *se = read_u64(&mut r)?;
             }

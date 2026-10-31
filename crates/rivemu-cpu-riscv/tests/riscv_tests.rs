@@ -2001,10 +2001,10 @@ fn smepmp_and_smstateen_semantics() {
     h.csr.mtvec = 0x8000_0100;
 
     // 1. Smstateen / Ssstateen:
-    // By default, mstateen0 has SE (bit 63) and ENVCFG (bit 62) enabled:
+    // By default, mstateen0 has M0_MASK (SE | ENVCFG | CONTEXT | SRMCFG) enabled:
     assert_eq!(
         h.csr_read(csr::MSTATEEN0).unwrap(),
-        csr::stateen::SE | csr::stateen::ENVCFG
+        csr::stateen::M0_MASK
     );
     h.prv = Priv::Supervisor;
     assert!(h.csr_read(csr::SENVCFG).is_some());
@@ -2437,6 +2437,86 @@ fn zksed_zksh_and_zkr_seed_semantics() {
     assert_eq!(h.pc, CODE + 5 * 4);
     assert_eq!(h.x[16] & 0xffff_0000, 0x8000_0000);
 }
+
+#[test]
+fn svrsw60t59b_smmpm_ssqosid_and_zicbop_semantics() {
+    use rivemu_cpu_riscv::csr::{self, mseccfg, stateen};
+    use rivemu_cpu_riscv::{Priv, cause};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    const MTVEC: u64 = 0x8000_1000;
+    const PT_ROOT: u64 = 0x8001_0000;
+    const DATA_PA: u64 = 0x8002_0000;
+
+    // 1. Svrsw60t59b: Sv39 1 GiB megapage at VA 0x0000_0000_8000_0000 with bits [60:59] = 0b11.
+    // Non-leaf or leaf PTEs with bits [60:59] set must not raise a reserved-bit page fault.
+    let pte_flags = 0xefu64; // V | R | W | X | A | D
+    let pte_rsw60t59b = (3u64 << 59) | ((0x8000_0000u64 >> 12) << 10) | pte_flags;
+    bus.write(PT_ROOT + 2 * 8, AccessSize::Double, pte_rsw60t59b)
+        .unwrap();
+    bus.write(DATA_PA, AccessSize::Double, 0x1122_3344_5566_7788)
+        .unwrap();
+
+    // 0: ld x11, 0(x10)           (0x0005_3583)
+    // 1: prefetch.i 0(x10)        (0x0005_6013)
+    // 2: prefetch.r 32(x10)       (0x0215_6013)
+    // 3: prefetch.w 64(x10)       (0x0435_6013)
+    // 4: csrrw x12, srmcfg, x13   (0x1816_9673)
+    let insns: &[u32] = &[
+        0x0005_3583,
+        0x0005_6013,
+        0x0215_6013,
+        0x0435_6013,
+        0x1816_9673,
+    ];
+    for (i, &w) in insns.iter().enumerate() {
+        bus.write(CODE + (i as u64) * 4, AccessSize::Word, u64::from(w))
+            .unwrap();
+    }
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr_write(csr::MTVEC, MTVEC).unwrap();
+    h.csr_write(csr::SATP, (8u64 << 60) | (PT_ROOT >> 12))
+        .unwrap();
+
+    // Execute in S-mode with Svrsw60t59b leaf PTE + Zicbop prefetches + Ssqosid srmcfg:
+    h.prv = Priv::Supervisor;
+    h.x[10] = DATA_PA;
+    h.x[13] = 0xffff_ffff_ffff_ffff;
+    for _ in 0..5 {
+        h.step(&bus);
+    }
+    assert_eq!(h.pc, CODE + 5 * 4);
+    assert_eq!(h.x[11], 0x1122_3344_5566_7788);
+    assert_eq!(h.csr_read(csr::SRMCFG), Some(csr::SRMCFG_MASK));
+
+    // Clearing mstateen0.SRMCFG blocks S-mode access to srmcfg:
+    h.prv = Priv::Machine;
+    h.csr_write(csr::MSTATEEN0, stateen::M0_MASK & !stateen::SRMCFG)
+        .unwrap();
+    h.prv = Priv::Supervisor;
+    h.pc = CODE + 4 * 4;
+    h.step(&bus);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr.mcause, cause::ILLEGAL_INSN);
+
+    // 2. Smmpm: M-mode pointer masking (MPRV=0) with mseccfg.PMM = PMLEN_7 (2 << 32):
+    h.prv = Priv::Machine;
+    h.csr_write(csr::MSECCFG, 2u64 << mseccfg::PMM_SHIFT)
+        .unwrap();
+    h.pc = CODE; // ld x11, 0(x10)
+    h.x[10] = (0x5au64 << 57) | DATA_PA; // non-canonical top 7 bits masked to 0 in M-mode
+    h.x[11] = 0;
+    h.step(&bus);
+    assert_eq!(h.pc, CODE + 4);
+    assert_eq!(h.x[11], 0x1122_3344_5566_7788);
+}
+
 
 
 
