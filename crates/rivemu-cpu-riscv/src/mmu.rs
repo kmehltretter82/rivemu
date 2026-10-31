@@ -267,7 +267,7 @@ impl Hart {
     /// Privileged Spec Section 3.7.
     #[cold]
     pub(crate) fn pmp_check(&self, pa: u64, size: u64, prv: Priv, acc: Access) -> bool {
-        if prv == Priv::Machine && !self.pmp_any_locked {
+        if prv == Priv::Machine && !self.pmp_any_locked && (!self.pmp_subpage || size <= 1) {
             return true;
         }
         let last = pa.saturating_add(size.saturating_sub(1));

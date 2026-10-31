@@ -976,5 +976,50 @@ fn sv48_four_level_walk_superpages_and_canonical_check() {
     }
 }
 
+#[test]
+fn pmp_m_mode_straddle_of_unlocked_subpage_entry_faults() {
+    use rivemu_cpu_riscv::csr;
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(2 * MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    const MTVEC: u64 = 0x8000_1000;
+    const DATA: u64 = 0x8000_3000;
+
+    // 0x00: ld x1, 8(x10)  (8-byte load at [DATA + 8, DATA + 15])
+    // 0x04: lw x2, 12(x10) (4-byte load at [DATA + 12, DATA + 15], wholly inside unlocked NA4 pmp0)
+    bus.write(CODE, AccessSize::Word, 0x0085_3083).unwrap();
+    bus.write(CODE + 4, AccessSize::Word, 0x00c5_2103).unwrap();
+    bus.write(DATA + 8, AccessSize::Double, 0x1122_3344_5566_7788)
+        .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr_write(csr::MTVEC, MTVEC).unwrap();
+    // Configure pmp0 as an UNLOCKED (L=0) 4-byte NA4 entry at [DATA + 12, DATA + 15],
+    // and pmp1 as a catch-all NAPOT R|W|X entry.
+    h.csr_write(csr::PMPADDR0, (DATA + 12) >> 2).unwrap();
+    h.csr_write(csr::PMPADDR0 + 1, 0x003f_ffff_ffff_ffff).unwrap();
+    h.csr_write(csr::PMPCFG0, (0x1fu64 << 8) | 0x10).unwrap();
+
+    // 1. 8-byte M-mode load at DATA + 8 straddles unlocked pmp0 [DATA + 12, DATA + 15]:
+    // Per RISC-V Privileged Spec Section 3.7.1, a partial match fails irrespective of L/R/W/X.
+    h.x[10] = DATA;
+    h.step(&bus);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE).unwrap(), 5);
+    assert_eq!(h.csr_read(csr::MTVAL).unwrap(), DATA + 8);
+
+    // 2. 4-byte M-mode load at DATA + 12 is wholly inside unlocked pmp0 (L=0, R=0):
+    // M-mode bypasses permission checks on unlocked PMP entries when all bytes match.
+    h.pc = CODE + 4;
+    h.step(&bus);
+    assert_eq!(h.pc, CODE + 8);
+    assert_eq!(h.x[2], 0x1122_3344);
+}
+
+
 
 
