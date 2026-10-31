@@ -2616,4 +2616,167 @@ fn ssdbltrp_and_smdbltrp_double_trap_semantics() {
     assert_eq!(h.csr.mstatus & status::SDT, 0);
 }
 
+#[test]
+fn sdtrig_mcontrol6_and_icount_semantics() {
+    use rivemu_cpu_riscv::csr::{self, stateen, trig};
+    use rivemu_cpu_riscv::{Priv, cause};
+
+    const CODE: u64 = 0x8000_0000;
+    const DATA: u64 = 0x8000_0100;
+    const MTVEC: u64 = 0x8000_0200;
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    // CODE+0: addi a0, zero, 1     (0x0010_0513)
+    // CODE+4: lw   a1, 0(s0)       (0x0004_2583)
+    // CODE+8: sw   a0, 4(s0)       (0x00a4_2223)
+    // CODE+12: addi a0, a0, 1      (0x0015_0513)
+    bus.write(CODE, AccessSize::Word, 0x0010_0513).unwrap();
+    bus.write(CODE + 4, AccessSize::Word, 0x0004_2583).unwrap();
+    bus.write(CODE + 8, AccessSize::Word, 0x00a4_2223).unwrap();
+    bus.write(CODE + 12, AccessSize::Word, 0x0015_0513).unwrap();
+    bus.write(DATA, AccessSize::Word, 0x1234_5678).unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr_write(csr::MTVEC, MTVEC).unwrap();
+    h.x[8] = DATA; // s0 = DATA
+
+    // 1. tselect bounds & tinfo read:
+    h.csr_write(csr::TSELECT, 3).unwrap();
+    assert_eq!(h.csr_read(csr::TSELECT).unwrap(), 3);
+    h.csr_write(csr::TSELECT, 4).unwrap(); // out of range (4 triggers: 0..3)
+    assert_eq!(h.csr_read(csr::TSELECT).unwrap(), 3);
+    assert_eq!(h.csr_read(csr::TINFO).unwrap(), trig::TINFO_VAL);
+
+    // 2. scontext (0x5a8) gated by mstateen0.CONTEXT and mcontext (0x7a8) 13-bit mask:
+    h.csr_write(csr::MSTATEEN0, 0).unwrap();
+    h.prv = Priv::Supervisor;
+    assert!(h.csr_read(csr::SCONTEXT).is_none());
+    h.prv = Priv::Machine;
+    h.csr_write(csr::MSTATEEN0, stateen::CONTEXT).unwrap();
+    h.prv = Priv::Supervisor;
+    h.csr_write(csr::SCONTEXT, 0xdead_beef_cafe_1234).unwrap();
+    assert_eq!(h.csr_read(csr::SCONTEXT).unwrap(), 0xcafe_1234);
+    h.prv = Priv::Machine;
+    h.csr_write(csr::MCONTEXT, 0xffff_ffff).unwrap();
+    assert_eq!(h.csr_read(csr::MCONTEXT).unwrap(), 0x1fff);
+
+    // 3. mcontrol6 execute trigger in U-mode with tdata3 (textra64) scontext filter:
+    h.csr_write(csr::TSELECT, 0).unwrap();
+    h.csr_write(csr::SCONTEXT, 0x42).unwrap();
+    // Require scontext == 0x99 (sselect=1, svalue=0x99 -> bits [33:2] = 0x99, bits [1:0] = 1):
+    h.csr_write(csr::TDATA3, (0x99 << 2) | 1).unwrap();
+    h.csr_write(csr::TDATA2, CODE).unwrap();
+    h.csr_write(
+        csr::TDATA1,
+        (trig::TYPE_MCONTROL6 << trig::TYPE_SHIFT) | trig::U | trig::EXECUTE,
+    )
+    .unwrap();
+    h.prv = Priv::User;
+    h.pc = CODE;
+    h.step(&bus);
+    // Should NOT fire because scontext (0x42) != 0x99:
+    assert_eq!(h.pc, CODE + 4);
+    assert_eq!(h.x[10], 1);
+
+    // Now set scontext = 0x99 and re-execute at CODE -> trigger fires!
+    h.prv = Priv::Machine;
+    h.csr_write(csr::SCONTEXT, 0x99).unwrap();
+    h.prv = Priv::User;
+    h.pc = CODE;
+    h.step(&bus);
+    assert_eq!(h.prv, Priv::Machine);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr.mcause, cause::BREAKPOINT);
+    assert_eq!(h.csr.mepc, CODE);
+    assert_eq!(h.csr.mtval, CODE);
+
+    // Disable trigger 0 and clear tdata3:
+    h.csr_write(csr::TDATA1, trig::TYPE_DISABLED << trig::TYPE_SHIFT)
+        .unwrap();
+    h.csr_write(csr::TDATA3, 0).unwrap();
+
+    // 4. mcontrol6 NAPOT load trigger (8-byte NAPOT region [DATA, DATA+7]):
+    // NAPOT encoding for 8-byte block: low 3 bits = 0b011 (3).
+    h.csr_write(csr::TDATA2, DATA | 0b011).unwrap();
+    h.csr_write(
+        csr::TDATA1,
+        (trig::TYPE_MCONTROL6 << trig::TYPE_SHIFT)
+            | trig::U
+            | trig::LOAD
+            | (1 << trig::MATCH_SHIFT),
+    )
+    .unwrap();
+    h.prv = Priv::User;
+    h.pc = CODE + 4; // lw a1, 0(s0)
+    h.step(&bus);
+    assert_eq!(h.prv, Priv::Machine);
+    assert_eq!(h.csr.mcause, cause::BREAKPOINT);
+    assert_eq!(h.csr.mepc, CODE + 4);
+    assert_eq!(h.csr.mtval, DATA);
+
+    // 5. Chained store range trigger [DATA+4, DATA+8) using triggers 0 (>= DATA+4, CHAIN) and 1 (< DATA+8):
+    h.csr_write(csr::TSELECT, 0).unwrap();
+    h.csr_write(csr::TDATA2, DATA + 4).unwrap();
+    h.csr_write(
+        csr::TDATA1,
+        (trig::TYPE_MCONTROL6 << trig::TYPE_SHIFT)
+            | trig::U
+            | trig::STORE
+            | trig::CHAIN
+            | (2 << trig::MATCH_SHIFT), // >=
+    )
+    .unwrap();
+    h.csr_write(csr::TSELECT, 1).unwrap();
+    h.csr_write(csr::TDATA2, DATA + 8).unwrap();
+    h.csr_write(
+        csr::TDATA1,
+        (trig::TYPE_MCONTROL6 << trig::TYPE_SHIFT)
+            | trig::U
+            | trig::STORE
+            | (3 << trig::MATCH_SHIFT), // <
+    )
+    .unwrap();
+    h.prv = Priv::User;
+    h.pc = CODE + 8; // sw a0, 4(s0) -> stores to DATA+4
+    h.step(&bus);
+    assert_eq!(h.prv, Priv::Machine);
+    assert_eq!(h.csr.mcause, cause::BREAKPOINT);
+    assert_eq!(h.csr.mepc, CODE + 8);
+    assert_eq!(h.csr.mtval, DATA + 4);
+
+    // Disable triggers 0 and 1:
+    for idx in 0..=1 {
+        h.csr_write(csr::TSELECT, idx).unwrap();
+        h.csr_write(csr::TDATA1, trig::TYPE_DISABLED << trig::TYPE_SHIFT)
+            .unwrap();
+    }
+
+    // 6. icount trigger (type = 3, count = 1, U = 1):
+    // Retiring one U-mode instruction sets PENDING; the next instruction traps before execution.
+    h.csr_write(csr::TSELECT, 2).unwrap();
+    h.csr_write(
+        csr::TDATA1,
+        (trig::TYPE_ICOUNT << trig::TYPE_SHIFT) | (1 << trig::ICOUNT_COUNT_SHIFT) | trig::ICOUNT_U,
+    )
+    .unwrap();
+    h.prv = Priv::User;
+    h.pc = CODE;
+    h.x[10] = 0;
+    // Step 1 retires CODE+0 (addi a0, zero, 1) and arms PENDING:
+    h.step(&bus);
+    assert_eq!(h.prv, Priv::User);
+    assert_eq!(h.pc, CODE + 4);
+    assert_eq!(h.x[10], 1);
+    // Step 2 traps with BREAKPOINT before executing CODE+4:
+    h.step(&bus);
+    assert_eq!(h.prv, Priv::Machine);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr.mcause, cause::BREAKPOINT);
+    assert_eq!(h.csr.mepc, CODE + 4);
+}
+
+
 

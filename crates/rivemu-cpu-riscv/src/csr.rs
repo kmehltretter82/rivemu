@@ -30,6 +30,7 @@ pub const SIP: u16 = 0x144;
 pub const STIMECMP: u16 = 0x14d;
 pub const SATP: u16 = 0x180;
 pub const SRMCFG: u16 = 0x181;
+pub const SCONTEXT: u16 = 0x5a8;
 pub const SCOUNTOVF: u16 = 0xda0;
 
 /// Mask of writable bits in `srmcfg` (`Ssqosid`: 12-bit `RCID` in `[11:0]`, 12-bit `MCID` in `[27:16]`).
@@ -68,8 +69,11 @@ pub const PMPADDR63: u16 = 0x3ef;
 pub const MSECCFG: u16 = 0x747;
 pub const TSELECT: u16 = 0x7a0;
 pub const TDATA1: u16 = 0x7a1;
+pub const TDATA2: u16 = 0x7a2;
 pub const TDATA3: u16 = 0x7a3;
 pub const TINFO: u16 = 0x7a4;
+pub const TCONTROL: u16 = 0x7a5;
+pub const MCONTEXT: u16 = 0x7a8;
 pub const MCYCLE: u16 = 0xb00;
 pub const MINSTRET: u16 = 0xb02;
 pub const MHPMCOUNTER3: u16 = 0xb03;
@@ -239,6 +243,46 @@ pub const MEDELEG_MASK: u64 = 0x4b3ff;
 /// Number of implemented PMP entries.
 pub const PMP_ENTRIES: usize = 16;
 
+/// Number of implemented `Sdtrig` hardware debug triggers (`tselect = 0..3`).
+pub const TRIGGER_COUNT: usize = 4;
+
+/// `Sdtrig` Debug Trigger Module (`tdata1`, `tdata3`, `tinfo`) bit definitions.
+pub mod trig {
+    pub const TYPE_SHIFT: u32 = 60;
+    pub const TYPE_MCONTROL: u64 = 2;
+    pub const TYPE_ICOUNT: u64 = 3;
+    pub const TYPE_MCONTROL6: u64 = 6;
+    pub const TYPE_DISABLED: u64 = 15;
+
+    pub const LOAD: u64 = 1 << 0;
+    pub const STORE: u64 = 1 << 1;
+    pub const EXECUTE: u64 = 1 << 2;
+    pub const U: u64 = 1 << 3;
+    pub const S: u64 = 1 << 4;
+    pub const M: u64 = 1 << 6;
+    pub const MATCH_SHIFT: u32 = 7;
+    pub const MATCH_MASK: u64 = 0xf << 7;
+    pub const CHAIN: u64 = 1 << 11;
+    pub const ACTION_SHIFT: u32 = 12;
+    pub const ACTION_MASK: u64 = 0xf << 12;
+    pub const SIZE_SHIFT: u32 = 16;
+    pub const SIZE_MASK: u64 = 0xf << 16;
+    pub const HIT0: u64 = 1 << 22;
+    pub const DMODE: u64 = 1 << 59;
+
+    pub const ICOUNT_ACTION_MASK: u64 = 0x3f;
+    pub const ICOUNT_U: u64 = 1 << 6;
+    pub const ICOUNT_S: u64 = 1 << 7;
+    pub const ICOUNT_PENDING: u64 = 1 << 8;
+    pub const ICOUNT_M: u64 = 1 << 9;
+    pub const ICOUNT_COUNT_SHIFT: u32 = 10;
+    pub const ICOUNT_COUNT_MASK: u64 = 0x3fff << 10;
+    pub const ICOUNT_HIT: u64 = 1 << 24;
+
+    /// `tinfo`: version = 1 (`[31:24]`), supported types = 2 (`mcontrol`), 3 (`icount`), 6 (`mcontrol6`).
+    pub const TINFO_VAL: u64 = 0x0100_004c;
+}
+
 /// Number of programmable HPM counters (`mhpmcounter3..31`).
 pub const HPM_COUNTERS: usize = 29;
 
@@ -282,6 +326,13 @@ pub struct Csrs {
     pub sstateen: [u64; 4],
     pub pmpcfg: [u8; PMP_ENTRIES],
     pub pmpaddr: [u64; PMP_ENTRIES],
+    pub tselect: u64,
+    pub tdata1: [u64; TRIGGER_COUNT],
+    pub tdata2: [u64; TRIGGER_COUNT],
+    pub tdata3: [u64; TRIGGER_COUNT],
+    pub scontext: u64,
+    pub mcontext: u64,
+    pub active_trigger_mask: u8,
     pub minstret: u64,
 }
 
@@ -340,6 +391,30 @@ impl Csrs {
         }
         self.active_hpm_mask = mask;
     }
+
+    /// Recomputes [`Self::active_trigger_mask`] from `tdata1`.
+    pub fn update_active_trigger_mask(&mut self) {
+        let mut mask = 0u8;
+        for i in 0..TRIGGER_COUNT {
+            let t1 = self.tdata1[i];
+            let ty = t1 >> trig::TYPE_SHIFT;
+            let active = match ty {
+                trig::TYPE_MCONTROL | trig::TYPE_MCONTROL6 => {
+                    (t1 & (trig::M | trig::S | trig::U)) != 0
+                        && (t1 & (trig::LOAD | trig::STORE | trig::EXECUTE)) != 0
+                }
+                trig::TYPE_ICOUNT => {
+                    (t1 & (trig::ICOUNT_M | trig::ICOUNT_S | trig::ICOUNT_U)) != 0
+                        && (t1 & (trig::ICOUNT_COUNT_MASK | trig::ICOUNT_PENDING)) != 0
+                }
+                _ => false,
+            };
+            if active {
+                mask |= 1 << i;
+            }
+        }
+        self.active_trigger_mask = mask;
+    }
 }
 
 impl Default for Csrs {
@@ -387,6 +462,13 @@ impl Default for Csrs {
             sstateen: [0; 4],
             pmpcfg: [0; PMP_ENTRIES],
             pmpaddr: [0; PMP_ENTRIES],
+            tselect: 0,
+            tdata1: [trig::TYPE_MCONTROL << trig::TYPE_SHIFT; TRIGGER_COUNT],
+            tdata2: [0; TRIGGER_COUNT],
+            tdata3: [0; TRIGGER_COUNT],
+            scontext: 0,
+            mcontext: 0,
+            active_trigger_mask: 0,
             minstret: 0,
         }
     }

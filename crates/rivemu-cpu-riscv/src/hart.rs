@@ -289,6 +289,8 @@ pub struct Hart {
     yield_slice: bool,
     /// The current instruction wrote `minstret` (suppresses its increment).
     instret_written: bool,
+    /// The current instruction wrote an `icount` trigger in `tdata1`.
+    icount_written: bool,
     /// Bitmask of `mhpmcounter3..31` written by the current instruction.
     hpm_written_mask: u32,
     /// Active `-d` flags (`0` when logging is disabled).
@@ -296,7 +298,9 @@ pub struct Hart {
     pub(crate) logger: Option<Arc<Logger>>,
     /// Active debugger PC breakpoints.
     pub breakpoints: Vec<u64>,
-    /// Set by [`Self::run`] when execution stops on a breakpoint.
+    /// Active debugger data watchpoints: `(addr, len, kind)` where `kind` is `1` (read), `2` (write), `3` (access).
+    pub watchpoints: Vec<(u64, u64, u8)>,
+    /// Set by [`Self::run`] when execution stops on a breakpoint or watchpoint.
     pub hit_breakpoint: bool,
     /// Intercept S-mode `ecall` instructions with the built-in Rust SBI handler.
     pub handle_sbi: bool,
@@ -364,10 +368,12 @@ impl Hart {
             check_irq: true,
             yield_slice: false,
             instret_written: false,
+            icount_written: false,
             hpm_written_mask: 0,
             log_flags: LogFlags::default(),
             logger: None,
             breakpoints: Vec::new(),
+            watchpoints: Vec::new(),
             hit_breakpoint: false,
             handle_sbi: false,
             pending_sbi: false,
@@ -521,6 +527,8 @@ impl Hart {
                 && !self.pmp_subpage
                 && self.log_flags.is_empty()
                 && self.csr.active_hpm_mask == 0
+                && self.csr.active_trigger_mask == 0
+                && self.watchpoints.is_empty()
             {
                 if self.try_step_fused(bus) {
                     n += 2;
@@ -540,7 +548,7 @@ impl Hart {
             if self.check_irq {
                 self.take_pending_interrupt();
             }
-            if self.wfi || self.yield_slice {
+            if self.wfi || self.yield_slice || self.hit_breakpoint {
                 break;
             }
         }
@@ -736,8 +744,16 @@ impl Hart {
             self.log_exec_cpu();
         }
         self.instret_written = false;
+        self.icount_written = false;
         self.hpm_written_mask = 0;
-        let result = self.fetch(bus).and_then(|insn| self.execute(bus, &insn));
+        let step_prv = self.prv;
+        let result = if self.csr.active_trigger_mask != 0 {
+            self.check_exec_triggers()
+                .and_then(|()| self.fetch(bus))
+                .and_then(|insn| self.execute(bus, &insn))
+        } else {
+            self.fetch(bus).and_then(|insn| self.execute(bus, &insn))
+        };
         match result {
             Ok(()) => {
                 // An explicit write to minstret suppresses that instruction's increment.
@@ -752,13 +768,216 @@ impl Hart {
                 } else {
                     self.hpm_written_mask = 0;
                 }
+                if self.csr.active_trigger_mask != 0 && !self.icount_written {
+                    self.step_icount_triggers(step_prv);
+                }
             }
             Err(e) => {
                 self.instret_written = false;
+                self.icount_written = false;
                 self.hpm_written_mask = 0;
                 self.trap(e.cause, false, e.tval);
             }
         }
+    }
+
+    #[cold]
+    fn check_exec_triggers(&mut self) -> Result<(), Exception> {
+        let pc = self.pc;
+        let prv = self.prv;
+        for i in 0..csr::TRIGGER_COUNT {
+            let t1 = self.csr.tdata1[i];
+            if (t1 >> csr::trig::TYPE_SHIFT) == csr::trig::TYPE_ICOUNT
+                && (t1 & csr::trig::ICOUNT_PENDING) != 0
+                && self.trigger_reentrancy_ok(prv)
+            {
+                self.csr.tdata1[i] = (t1 & !csr::trig::ICOUNT_PENDING) | csr::trig::ICOUNT_HIT;
+                self.csr.update_active_trigger_mask();
+                return Err(Exception::new(cause::BREAKPOINT, pc));
+            }
+        }
+        let mut chain_ok = true;
+        for i in 0..csr::TRIGGER_COUNT {
+            let t1 = self.csr.tdata1[i];
+            let ty = t1 >> csr::trig::TYPE_SHIFT;
+            if !matches!(ty, csr::trig::TYPE_MCONTROL | csr::trig::TYPE_MCONTROL6) {
+                chain_ok = true;
+                continue;
+            }
+            let chain = (t1 & csr::trig::CHAIN) != 0;
+            let matched = chain_ok
+                && (t1 & csr::trig::EXECUTE) != 0
+                && self.trigger_mode_and_context_match(t1, self.csr.tdata3[i], prv)
+                && Self::trigger_addr_match(t1, self.csr.tdata2[i], pc);
+            if chain {
+                chain_ok = matched;
+            } else {
+                chain_ok = true;
+                if matched && self.trigger_reentrancy_ok(prv) {
+                    return Err(Exception::new(cause::BREAKPOINT, pc));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cold]
+    fn step_icount_triggers(&mut self, prv: Priv) {
+        let mode_bit = match prv {
+            Priv::Machine => csr::trig::ICOUNT_M,
+            Priv::Supervisor => csr::trig::ICOUNT_S,
+            Priv::User => csr::trig::ICOUNT_U,
+        };
+        for i in 0..csr::TRIGGER_COUNT {
+            let t1 = self.csr.tdata1[i];
+            if (t1 >> csr::trig::TYPE_SHIFT) != csr::trig::TYPE_ICOUNT {
+                continue;
+            }
+            if (t1 & mode_bit) == 0 || !self.trigger_context_match(self.csr.tdata3[i]) {
+                continue;
+            }
+            let count = (t1 & csr::trig::ICOUNT_COUNT_MASK) >> csr::trig::ICOUNT_COUNT_SHIFT;
+            if count > 0 {
+                let next_count = count - 1;
+                let mut next_t1 =
+                    (t1 & !csr::trig::ICOUNT_COUNT_MASK) | (next_count << csr::trig::ICOUNT_COUNT_SHIFT);
+                if next_count == 0 {
+                    next_t1 |= csr::trig::ICOUNT_PENDING;
+                }
+                self.csr.tdata1[i] = next_t1;
+                self.csr.update_active_trigger_mask();
+            }
+        }
+    }
+
+    #[inline]
+    fn trigger_reentrancy_ok(&self, prv: Priv) -> bool {
+        match prv {
+            Priv::Machine => (self.csr.mstatus & status::MIE) != 0,
+            Priv::Supervisor if (self.csr.medeleg >> cause::BREAKPOINT) & 1 != 0 => {
+                (self.csr.mstatus & status::SIE) != 0
+            }
+            _ => true,
+        }
+    }
+
+    #[inline]
+    fn trigger_context_match(&self, t3: u64) -> bool {
+        let sselect = t3 & 3;
+        if sselect == 1 && self.csr.scontext != ((t3 >> 2) & 0xffff_ffff) {
+            return false;
+        }
+        let mhselect = (t3 >> 48) & 7;
+        if matches!(mhselect, 1 | 4) && self.csr.mcontext != (t3 >> 51) {
+            return false;
+        }
+        true
+    }
+
+    #[inline]
+    fn trigger_mode_and_context_match(&self, t1: u64, t3: u64, prv: Priv) -> bool {
+        let mode_bit = match prv {
+            Priv::Machine => csr::trig::M,
+            Priv::Supervisor => csr::trig::S,
+            Priv::User => csr::trig::U,
+        };
+        (t1 & mode_bit) != 0 && self.trigger_context_match(t3)
+    }
+
+    #[inline]
+    fn trigger_addr_match(t1: u64, t2: u64, addr: u64) -> bool {
+        let m = (t1 & csr::trig::MATCH_MASK) >> csr::trig::MATCH_SHIFT;
+        let invert = (m & 8) != 0;
+        let base = match m & 7 {
+            0 => addr == t2,
+            1 => {
+                let ones = t2.trailing_ones();
+                if ones >= 63 {
+                    true
+                } else {
+                    let mask = !((1u64 << (ones + 1)) - 1);
+                    (addr & mask) == (t2 & mask)
+                }
+            }
+            2 => addr >= t2,
+            3 => addr < t2,
+            4 => {
+                let mask = t2 >> 32;
+                (addr & 0xffff_ffff & mask) == (t2 & 0xffff_ffff & mask)
+            }
+            5 => {
+                let mask = t2 >> 32;
+                ((addr >> 32) & mask) == (t2 & 0xffff_ffff & mask)
+            }
+            _ => false,
+        };
+        base ^ invert
+    }
+
+    #[inline]
+    pub(crate) fn check_data_triggers(
+        &mut self,
+        va: u64,
+        len: u64,
+        is_load: bool,
+        is_store: bool,
+    ) -> Result<(), Exception> {
+        if self.csr.active_trigger_mask == 0 && self.watchpoints.is_empty() {
+            return Ok(());
+        }
+        self.check_data_triggers_slow(va, len, is_load, is_store)
+    }
+
+    #[cold]
+    fn check_data_triggers_slow(
+        &mut self,
+        va: u64,
+        len: u64,
+        is_load: bool,
+        is_store: bool,
+    ) -> Result<(), Exception> {
+        if self.csr.active_trigger_mask != 0 {
+            let access_mask = (if is_load { csr::trig::LOAD } else { 0 })
+                | (if is_store { csr::trig::STORE } else { 0 });
+            let prv = self.prv;
+            let mut chain_ok = true;
+            for i in 0..csr::TRIGGER_COUNT {
+                let t1 = self.csr.tdata1[i];
+                let ty = t1 >> csr::trig::TYPE_SHIFT;
+                if !matches!(ty, csr::trig::TYPE_MCONTROL | csr::trig::TYPE_MCONTROL6) {
+                    chain_ok = true;
+                    continue;
+                }
+                let chain = (t1 & csr::trig::CHAIN) != 0;
+                let matched = chain_ok
+                    && (t1 & access_mask) != 0
+                    && self.trigger_mode_and_context_match(t1, self.csr.tdata3[i], prv)
+                    && Self::trigger_addr_match(t1, self.csr.tdata2[i], va);
+                if chain {
+                    chain_ok = matched;
+                } else {
+                    chain_ok = true;
+                    if matched && self.trigger_reentrancy_ok(prv) {
+                        return Err(Exception::new(cause::BREAKPOINT, va));
+                    }
+                }
+            }
+        }
+        if !self.watchpoints.is_empty() {
+            let req_kind = (if is_load { 1u8 } else { 0 }) | (if is_store { 2u8 } else { 0 });
+            let va_end = va.saturating_add(len.max(1) - 1);
+            for &(wp_addr, wp_len, wp_kind) in &self.watchpoints {
+                if (wp_kind & req_kind) != 0 {
+                    let wp_end = wp_addr.saturating_add(wp_len.max(1) - 1);
+                    if va <= wp_end && va_end >= wp_addr {
+                        self.hit_breakpoint = true;
+                        self.yield_slice = true;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[inline]
@@ -1023,6 +1242,7 @@ impl Hart {
     ) -> Result<u64, Exception> {
         let va = self.mask_data_addr(va);
         let n = size.bytes();
+        self.check_data_triggers(va, n, true, false)?;
         if self.strict_align && va & (n - 1) != 0 {
             return Err(Exception::new(cause::LOAD_MISALIGNED, va));
         }
@@ -1064,6 +1284,7 @@ impl Hart {
     ) -> Result<(), Exception> {
         let va = self.mask_data_addr(va);
         let n = size.bytes();
+        self.check_data_triggers(va, n, false, true)?;
         if self.strict_align && va & (n - 1) != 0 {
             return Err(Exception::new(cause::STORE_MISALIGNED, va));
         }
@@ -1784,6 +2005,7 @@ impl Hart {
     ) -> Result<(), Exception> {
         let addr = self.mask_data_addr(addr);
         if insn.op == Op::AmoCas && insn.imm == 4 {
+            self.check_data_triggers(addr, 16, true, true)?;
             if addr & 15 != 0 {
                 return Err(Exception::new(cause::STORE_MISALIGNED, addr));
             }
@@ -1835,6 +2057,12 @@ impl Hart {
             AccessSize::Word => u64::from(v as u32),
             AccessSize::Double => v,
         };
+        let (is_load, is_store) = match insn.op {
+            Op::Lr | Op::LoadAq => (true, false),
+            Op::Sc | Op::StoreRl => (false, true),
+            _ => (true, true),
+        };
+        self.check_data_triggers(addr, size.bytes(), is_load, is_store)?;
         if addr & (size.bytes() - 1) != 0 {
             let c = if matches!(insn.op, Op::Lr | Op::LoadAq) {
                 cause::LOAD_MISALIGNED
@@ -2091,6 +2319,12 @@ impl Hart {
                 }
                 c.srmcfg
             }
+            csr::SCONTEXT => {
+                if self.prv != Priv::Machine && (c.mstateen[0] & csr::stateen::CONTEXT) == 0 {
+                    return None;
+                }
+                c.scontext
+            }
             csr::MVENDORID | csr::MARCHID | csr::MIMPID | csr::MCONFIGPTR => 0,
             csr::MHARTID => self.id,
             csr::MSTATUS => self.read_mstatus(),
@@ -2132,7 +2366,12 @@ impl Hart {
                 c.pmpaddr.get(n).copied().unwrap_or(0)
             }
             csr::MSECCFG => c.mseccfg,
-            csr::TSELECT..=csr::TDATA3 | csr::TINFO => 0,
+            csr::TSELECT => c.tselect,
+            csr::TDATA1 => c.tdata1[c.tselect as usize],
+            csr::TDATA2 => c.tdata2[c.tselect as usize],
+            csr::TDATA3 => c.tdata3[c.tselect as usize],
+            csr::TINFO => csr::trig::TINFO_VAL,
+            csr::MCONTEXT => c.mcontext,
             csr::MCYCLE | csr::MINSTRET => c.minstret,
             csr::MHPMCOUNTER3..=csr::MHPMCOUNTER31 => {
                 c.mhpmcounter[(num - csr::MHPMCOUNTER3) as usize]
@@ -2267,6 +2506,12 @@ impl Hart {
                     return None;
                 }
                 self.csr.srmcfg = v & csr::SRMCFG_MASK;
+            }
+            csr::SCONTEXT => {
+                if self.prv != Priv::Machine && (self.csr.mstateen[0] & csr::stateen::CONTEXT) == 0 {
+                    return None;
+                }
+                self.csr.scontext = v & 0xffff_ffff;
             }
             csr::MVENDORID | csr::MARCHID | csr::MIMPID | csr::MHARTID | csr::MCONFIGPTR => {
                 return None;
@@ -2405,7 +2650,58 @@ impl Hart {
                 self.update_pmp_state();
                 self.flush_tlb();
             }
-            csr::TSELECT..=csr::TDATA3 | csr::TINFO => {}
+            csr::TSELECT => {
+                if (v as usize) < csr::TRIGGER_COUNT {
+                    self.csr.tselect = v;
+                }
+            }
+            csr::TDATA1 => {
+                let idx = self.csr.tselect as usize;
+                let ty = v >> csr::trig::TYPE_SHIFT;
+                match ty {
+                    0 => {
+                        let prev_ty = self.csr.tdata1[idx] >> csr::trig::TYPE_SHIFT;
+                        self.csr.tdata1[idx] = prev_ty << csr::trig::TYPE_SHIFT;
+                    }
+                    csr::trig::TYPE_MCONTROL | csr::trig::TYPE_MCONTROL6 => {
+                        let rw_mask = csr::trig::LOAD
+                            | csr::trig::STORE
+                            | csr::trig::EXECUTE
+                            | csr::trig::U
+                            | csr::trig::S
+                            | csr::trig::M
+                            | csr::trig::MATCH_MASK
+                            | csr::trig::CHAIN
+                            | csr::trig::SIZE_MASK;
+                        self.csr.tdata1[idx] = (ty << csr::trig::TYPE_SHIFT) | (v & rw_mask);
+                    }
+                    csr::trig::TYPE_ICOUNT => {
+                        let rw_mask = csr::trig::ICOUNT_U
+                            | csr::trig::ICOUNT_S
+                            | csr::trig::ICOUNT_PENDING
+                            | csr::trig::ICOUNT_M
+                            | csr::trig::ICOUNT_COUNT_MASK
+                            | csr::trig::ICOUNT_HIT;
+                        self.csr.tdata1[idx] = (ty << csr::trig::TYPE_SHIFT) | (v & rw_mask);
+                        self.icount_written = true;
+                    }
+                    csr::trig::TYPE_DISABLED => {
+                        self.csr.tdata1[idx] = csr::trig::TYPE_DISABLED << csr::trig::TYPE_SHIFT;
+                    }
+                    _ => {}
+                }
+                self.csr.update_active_trigger_mask();
+            }
+            csr::TDATA2 => {
+                self.csr.tdata2[self.csr.tselect as usize] = v;
+            }
+            csr::TDATA3 => {
+                self.csr.tdata3[self.csr.tselect as usize] = v;
+            }
+            csr::TINFO => {}
+            csr::MCONTEXT => {
+                self.csr.mcontext = v & 0x1fff;
+            }
             csr::MCYCLE | csr::MINSTRET => {
                 self.csr.minstret = v;
                 self.instret_written = true;

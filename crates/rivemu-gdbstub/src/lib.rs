@@ -222,6 +222,7 @@ impl GdbServer {
                     if action == GdbAction::Detach {
                         for h in &mut machine.harts {
                             h.breakpoints.clear();
+                            h.watchpoints.clear();
                         }
                         self.client = None;
                     }
@@ -478,6 +479,38 @@ impl GdbConn {
             } else {
                 self.send_packet("E01")?;
             }
+        } else if let Some((kind, rest)) = pkt
+            .strip_prefix("Z2,")
+            .map(|r| (2u8, r))
+            .or_else(|| pkt.strip_prefix("Z3,").map(|r| (1u8, r)))
+            .or_else(|| pkt.strip_prefix("Z4,").map(|r| (3u8, r)))
+        {
+            if let Some((addr, len)) = parse_pair(rest) {
+                let entry = (addr, len.max(1), kind);
+                for h in &mut machine.harts {
+                    if !h.watchpoints.contains(&entry) {
+                        h.watchpoints.push(entry);
+                    }
+                }
+                self.send_packet("OK")?;
+            } else {
+                self.send_packet("E01")?;
+            }
+        } else if let Some((kind, rest)) = pkt
+            .strip_prefix("z2,")
+            .map(|r| (2u8, r))
+            .or_else(|| pkt.strip_prefix("z3,").map(|r| (1u8, r)))
+            .or_else(|| pkt.strip_prefix("z4,").map(|r| (3u8, r)))
+        {
+            if let Some((addr, len)) = parse_pair(rest) {
+                let entry = (addr, len.max(1), kind);
+                for h in &mut machine.harts {
+                    h.watchpoints.retain(|&wp| wp != entry);
+                }
+                self.send_packet("OK")?;
+            } else {
+                self.send_packet("E01")?;
+            }
         } else if let Some(rest) = pkt.strip_prefix('s') {
             if !rest.is_empty() {
                 if let Ok(pc) = u64::from_str_radix(rest, 16) {
@@ -670,6 +703,55 @@ mod tests {
             let mut b = [0u8; 7];
             client.read_exact(&mut b).unwrap();
             assert_eq!(&b, b"$S05#b8");
+            assert_eq!(send_and_recv(&mut client, "D"), "OK");
+        });
+        assert_eq!(
+            server.handle_paused(&mut machine).unwrap(),
+            GdbAction::Detach
+        );
+        handle2.join().unwrap();
+    }
+
+    #[test]
+    fn rsp_watchpoint_stops_on_write() {
+        let mut machine = Machine::new(MachineConfig::default()).unwrap();
+        // Place three instructions at DRAM_BASE (0x8000_0000):
+        //   auipc t0, 1            (0x0000_1297) -> t0 = 0x8000_1000
+        //   addi  a0, zero, 7      (0x0070_0513) -> a0 = 7
+        //   sw    a0, 0(t0)        (0x00a2_a023) -> store to 0x8000_1000
+        let code: [u8; 12] = [
+            0x97, 0x12, 0x00, 0x00, 0x13, 0x05, 0x70, 0x00, 0x23, 0xa0, 0xa2, 0x00,
+        ];
+        machine.bus.load_bytes(0x8000_0000, &code).unwrap();
+        machine.harts[0].reset(0x8000_0000);
+
+        let mut server = GdbServer::bind("tcp::0").unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            assert_eq!(send_and_recv(&mut client, "QStartNoAckMode"), "OK");
+            assert_eq!(send_and_recv(&mut client, "Z2,80001000,4"), "OK");
+            write!(client, "$c#63").unwrap();
+            client.flush().unwrap();
+            client
+        });
+
+        assert_eq!(
+            server.handle_paused(&mut machine).unwrap(),
+            GdbAction::Continue
+        );
+        machine.run_slice();
+        assert!(machine.harts[0].hit_breakpoint);
+        assert_eq!(machine.harts[0].pc, 0x8000_000c);
+
+        let mut client = handle.join().unwrap();
+        server.notify_stop().unwrap();
+        let handle2 = std::thread::spawn(move || {
+            let mut b = [0u8; 7];
+            client.read_exact(&mut b).unwrap();
+            assert_eq!(&b, b"$S05#b8");
+            assert_eq!(send_and_recv(&mut client, "z2,80001000,4"), "OK");
             assert_eq!(send_and_recv(&mut client, "D"), "OK");
         });
         assert_eq!(

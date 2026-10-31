@@ -68,8 +68,20 @@ impl Machine {
                 h.csr.ssp,
                 h.csr.mseccfg,
                 h.csr.srmcfg,
+                h.csr.tselect,
+                h.csr.scontext,
+                h.csr.mcontext,
             ] {
                 write_u64(&mut w, v)?;
+            }
+            for &t in &h.csr.tdata1 {
+                write_u64(&mut w, t)?;
+            }
+            for &t in &h.csr.tdata2 {
+                write_u64(&mut w, t)?;
+            }
+            for &t in &h.csr.tdata3 {
+                write_u64(&mut w, t)?;
             }
             for &se in &h.csr.mstateen {
                 write_u64(&mut w, se)?;
@@ -271,6 +283,19 @@ impl Machine {
             h.csr.ssp = read_u64(&mut r)?;
             h.csr.mseccfg = read_u64(&mut r)?;
             h.csr.srmcfg = read_u64(&mut r)?;
+            h.csr.tselect = read_u64(&mut r)?;
+            h.csr.scontext = read_u64(&mut r)?;
+            h.csr.mcontext = read_u64(&mut r)?;
+            for t in &mut h.csr.tdata1 {
+                *t = read_u64(&mut r)?;
+            }
+            for t in &mut h.csr.tdata2 {
+                *t = read_u64(&mut r)?;
+            }
+            for t in &mut h.csr.tdata3 {
+                *t = read_u64(&mut r)?;
+            }
+            h.csr.update_active_trigger_mask();
             for se in &mut h.csr.mstateen {
                 *se = read_u64(&mut r)?;
             }
