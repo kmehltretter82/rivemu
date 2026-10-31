@@ -525,6 +525,50 @@ pub(crate) fn min_max<F: Format>(a: u64, b: u64, fl: &mut Flags, max: bool) -> u
     }
 }
 
+/// Zfa `fminm` / `fmaxm` (IEEE 754-2019 `minimum` / `maximum`): propagates
+/// canonical NaN if either operand is NaN.
+pub(crate) fn min_max_m<F: Format>(a: u64, b: u64, fl: &mut Flags, max: bool) -> u64 {
+    let x = unpack::<F>(a);
+    let y = unpack::<F>(b);
+    if x.is_nan() || y.is_nan() {
+        return propagate_nan::<F>(x.is_snan() || y.is_snan(), fl);
+    }
+    if total_lt::<F>(a, b) != max {
+        a
+    } else {
+        b
+    }
+}
+
+/// Zfa `fround` (`exact = false`) and `froundnx` (`exact = true`).
+pub(crate) fn round_to_int<F: Format>(
+    a: u64,
+    rm: RoundingMode,
+    exact: bool,
+    fl: &mut Flags,
+) -> u64 {
+    let x = unpack::<F>(a);
+    match x.kind {
+        Kind::QNaN | Kind::SNaN => propagate_nan::<F>(x.is_snan(), fl),
+        Kind::Zero | Kind::Inf => a,
+        Kind::Finite => {
+            if x.exp >= 0 {
+                return a;
+            }
+            let (m, inexact) = round_shift(x.sig as u128, -x.exp, x.sign, rm);
+            if exact && inexact {
+                fl.0 |= Flags::INEXACT;
+            }
+            if m == 0 {
+                sign_bit::<F>(x.sign)
+            } else {
+                let mut dummy = Flags::default();
+                round_pack::<F>(x.sign, 0, m, RoundingMode::NearestEven, &mut dummy)
+            }
+        }
+    }
+}
+
 #[inline]
 fn both_zero<F: Format>(a: u64, b: u64) -> bool {
     (a | b) & !F::SIGN == 0
@@ -553,6 +597,32 @@ pub(crate) fn lt<F: Format>(a: u64, b: u64, fl: &mut Flags) -> bool {
 pub(crate) fn le<F: Format>(a: u64, b: u64, fl: &mut Flags) -> bool {
     if unpack::<F>(a).is_nan() || unpack::<F>(b).is_nan() {
         fl.0 |= Flags::INVALID;
+        return false;
+    }
+    a == b || both_zero::<F>(a, b) || total_lt::<F>(a, b)
+}
+
+/// Zfa `fltq` (quiet less-than: only signaling NaNs raise `INVALID`).
+pub(crate) fn ltq<F: Format>(a: u64, b: u64, fl: &mut Flags) -> bool {
+    let x = unpack::<F>(a);
+    let y = unpack::<F>(b);
+    if x.is_nan() || y.is_nan() {
+        if x.is_snan() || y.is_snan() {
+            fl.0 |= Flags::INVALID;
+        }
+        return false;
+    }
+    !both_zero::<F>(a, b) && total_lt::<F>(a, b)
+}
+
+/// Zfa `fleq` (quiet less-or-equal: only signaling NaNs raise `INVALID`).
+pub(crate) fn leq<F: Format>(a: u64, b: u64, fl: &mut Flags) -> bool {
+    let x = unpack::<F>(a);
+    let y = unpack::<F>(b);
+    if x.is_nan() || y.is_nan() {
+        if x.is_snan() || y.is_snan() {
+            fl.0 |= Flags::INVALID;
+        }
         return false;
     }
     a == b || both_zero::<F>(a, b) || total_lt::<F>(a, b)
@@ -638,5 +708,52 @@ pub(crate) fn convert<F: Format, G: Format>(a: u64, rm: RoundingMode, fl: &mut F
         Kind::Inf => sign_bit::<G>(x.sign) | G::INF,
         Kind::Zero => sign_bit::<G>(x.sign),
         Kind::Finite => round_pack::<G>(x.sign, x.exp, x.sig as u128, rm, fl),
+    }
+}
+
+/// Zfa `fcvtmod.w.d`: converts binary64 to signed 32-bit integer modulo 2^32,
+/// rounding towards zero (`RTZ`).
+pub(crate) fn to_i32_mod_f64(a: u64, fl: &mut Flags) -> i32 {
+    let x = unpack::<F64>(a);
+    match x.kind {
+        Kind::QNaN | Kind::SNaN | Kind::Inf => {
+            fl.0 |= Flags::INVALID;
+            0
+        }
+        Kind::Zero => 0,
+        Kind::Finite => {
+            if x.exp >= 0 {
+                // Since x.sig >= 2^52 for normal numbers with x.exp >= 0,
+                // magnitude is >= 2^52 > 2^31, so this always overflows i32.
+                fl.0 |= Flags::INVALID;
+                let low = if x.exp >= 32 {
+                    0u32
+                } else {
+                    (x.sig as u32) << (x.exp as u32)
+                };
+                let signed = if x.sign { low.wrapping_neg() } else { low };
+                signed as i32
+            } else {
+                let s = (-x.exp) as u32;
+                if s >= 64 {
+                    fl.0 |= Flags::INEXACT;
+                    0
+                } else {
+                    let m = x.sig >> s;
+                    let inexact = (x.sig & ((1u64 << s) - 1)) != 0;
+                    let fits = (!x.sign && m <= 0x7fff_ffff) || (x.sign && m <= 0x8000_0000);
+                    if fits {
+                        if inexact {
+                            fl.0 |= Flags::INEXACT;
+                        }
+                    } else {
+                        fl.0 |= Flags::INVALID;
+                    }
+                    let low = m as u32;
+                    let signed = if x.sign { low.wrapping_neg() } else { low };
+                    signed as i32
+                }
+            }
+        }
     }
 }

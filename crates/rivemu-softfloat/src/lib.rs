@@ -83,7 +83,9 @@ macro_rules! define_format {
     (
         $t:ty, $F:ty, $name:literal,
         $add:ident, $sub:ident, $mul:ident, $div:ident, $sqrt:ident, $fma:ident,
-        $min:ident, $max:ident, $eq:ident, $lt:ident, $le:ident, $classify:ident,
+        $min:ident, $max:ident, $minm:ident, $maxm:ident,
+        $round:ident, $roundnx:ident,
+        $eq:ident, $lt:ident, $le:ident, $ltq:ident, $leq:ident, $classify:ident,
         $to_i32:ident, $to_u32:ident, $to_i64:ident, $to_u64:ident,
         $from_i32:ident, $from_u32:ident, $from_i64:ident, $from_u64:ident $(,)?
     ) => {
@@ -143,6 +145,30 @@ macro_rules! define_format {
             imp::min_max::<$F>(a as u64, b as u64, fl, true) as $t
         }
 
+        #[doc = concat!("Zfa `fminm` (IEEE 754-2019 `minimum`) for ", $name, ".")]
+        #[inline]
+        pub fn $minm(a: $t, b: $t, fl: &mut Flags) -> $t {
+            imp::min_max_m::<$F>(a as u64, b as u64, fl, false) as $t
+        }
+
+        #[doc = concat!("Zfa `fmaxm` (IEEE 754-2019 `maximum`) for ", $name, ".")]
+        #[inline]
+        pub fn $maxm(a: $t, b: $t, fl: &mut Flags) -> $t {
+            imp::min_max_m::<$F>(a as u64, b as u64, fl, true) as $t
+        }
+
+        #[doc = concat!("Zfa `fround` (`roundToIntegralTiesToEven` etc., without `NX`) for ", $name, ".")]
+        #[inline]
+        pub fn $round(a: $t, rm: RoundingMode, fl: &mut Flags) -> $t {
+            imp::round_to_int::<$F>(a as u64, rm, false, fl) as $t
+        }
+
+        #[doc = concat!("Zfa `froundnx` (`roundToIntegralExact`, raising `NX` when inexact) for ", $name, ".")]
+        #[inline]
+        pub fn $roundnx(a: $t, rm: RoundingMode, fl: &mut Flags) -> $t {
+            imp::round_to_int::<$F>(a as u64, rm, true, fl) as $t
+        }
+
         #[doc = concat!("Quiet equality (`feq`) for ", $name, ".")]
         ///
         /// Only signaling NaNs raise `INVALID`.
@@ -165,6 +191,18 @@ macro_rules! define_format {
         #[inline]
         pub fn $le(a: $t, b: $t, fl: &mut Flags) -> bool {
             imp::le::<$F>(a as u64, b as u64, fl)
+        }
+
+        #[doc = concat!("Zfa quiet less-than (`fltq`) for ", $name, ".")]
+        #[inline]
+        pub fn $ltq(a: $t, b: $t, fl: &mut Flags) -> bool {
+            imp::ltq::<$F>(a as u64, b as u64, fl)
+        }
+
+        #[doc = concat!("Zfa quiet less-or-equal (`fleq`) for ", $name, ".")]
+        #[inline]
+        pub fn $leq(a: $t, b: $t, fl: &mut Flags) -> bool {
+            imp::leq::<$F>(a as u64, b as u64, fl)
         }
 
         #[doc = concat!("RISC-V `fclass` 10-bit classification mask for ", $name, ".")]
@@ -235,9 +273,15 @@ define_format!(
     f32_mul_add,
     f32_min,
     f32_max,
+    f32_minm,
+    f32_maxm,
+    f32_round,
+    f32_roundnx,
     f32_eq,
     f32_lt,
     f32_le,
+    f32_ltq,
+    f32_leq,
     f32_classify,
     f32_to_i32,
     f32_to_u32,
@@ -261,9 +305,15 @@ define_format!(
     f64_mul_add,
     f64_min,
     f64_max,
+    f64_minm,
+    f64_maxm,
+    f64_round,
+    f64_roundnx,
     f64_eq,
     f64_lt,
     f64_le,
+    f64_ltq,
+    f64_leq,
     f64_classify,
     f64_to_i32,
     f64_to_u32,
@@ -274,6 +324,85 @@ define_format!(
     i64_to_f64,
     u64_to_f64,
 );
+
+/// Zfa `fcvtmod.w.d`: converts binary64 to signed 32-bit integer modulo `2^32`
+/// using `RTZ` rounding.
+#[inline]
+pub fn f64_to_i32_mod(a: u64, fl: &mut Flags) -> i32 {
+    imp::to_i32_mod_f64(a, fl)
+}
+
+/// Zfa `fli.s` constant table (indexed by `rs1` in `0..32`).
+pub const FLI_S_TABLE: [u32; 32] = [
+    0xbf80_0000, // 0: -1.0
+    0x0080_0000, // 1: minimum positive normal (2^-126)
+    0x3780_0000, // 2: 2^-16
+    0x3800_0000, // 3: 2^-15
+    0x3b80_0000, // 4: 2^-8
+    0x3c00_0000, // 5: 2^-7
+    0x3d80_0000, // 6: 2^-4
+    0x3e00_0000, // 7: 2^-3
+    0x3e80_0000, // 8: 0.25
+    0x3ea0_0000, // 9: 0.3125
+    0x3ec0_0000, // 10: 0.375
+    0x3ee0_0000, // 11: 0.4375
+    0x3f00_0000, // 12: 0.5
+    0x3f20_0000, // 13: 0.625
+    0x3f40_0000, // 14: 0.75
+    0x3f60_0000, // 15: 0.875
+    0x3f80_0000, // 16: 1.0
+    0x3fa0_0000, // 17: 1.25
+    0x3fc0_0000, // 18: 1.5
+    0x3fe0_0000, // 19: 1.75
+    0x4000_0000, // 20: 2.0
+    0x4020_0000, // 21: 2.5
+    0x4040_0000, // 22: 3.0
+    0x4080_0000, // 23: 4.0
+    0x4100_0000, // 24: 8.0
+    0x4180_0000, // 25: 16.0
+    0x4300_0000, // 26: 128.0
+    0x4380_0000, // 27: 256.0
+    0x4700_0000, // 28: 2^15
+    0x4780_0000, // 29: 2^16
+    0x7f80_0000, // 30: +inf
+    0x7fc0_0000, // 31: canonical NaN
+];
+
+/// Zfa `fli.d` constant table (indexed by `rs1` in `0..32`).
+pub const FLI_D_TABLE: [u64; 32] = [
+    0xbff0_0000_0000_0000, // 0: -1.0
+    0x0010_0000_0000_0000, // 1: minimum positive normal (2^-1022)
+    0x3ef0_0000_0000_0000, // 2: 2^-16
+    0x3f00_0000_0000_0000, // 3: 2^-15
+    0x3f70_0000_0000_0000, // 4: 2^-8
+    0x3f80_0000_0000_0000, // 5: 2^-7
+    0x3fb0_0000_0000_0000, // 6: 2^-4
+    0x3fc0_0000_0000_0000, // 7: 2^-3
+    0x3fd0_0000_0000_0000, // 8: 0.25
+    0x3fd4_0000_0000_0000, // 9: 0.3125
+    0x3fd8_0000_0000_0000, // 10: 0.375
+    0x3fdc_0000_0000_0000, // 11: 0.4375
+    0x3fe0_0000_0000_0000, // 12: 0.5
+    0x3fe4_0000_0000_0000, // 13: 0.625
+    0x3fe8_0000_0000_0000, // 14: 0.75
+    0x3fec_0000_0000_0000, // 15: 0.875
+    0x3ff0_0000_0000_0000, // 16: 1.0
+    0x3ff4_0000_0000_0000, // 17: 1.25
+    0x3ff8_0000_0000_0000, // 18: 1.5
+    0x3ffc_0000_0000_0000, // 19: 1.75
+    0x4000_0000_0000_0000, // 20: 2.0
+    0x4004_0000_0000_0000, // 21: 2.5
+    0x4008_0000_0000_0000, // 22: 3.0
+    0x4010_0000_0000_0000, // 23: 4.0
+    0x4020_0000_0000_0000, // 24: 8.0
+    0x4030_0000_0000_0000, // 25: 16.0
+    0x4060_0000_0000_0000, // 26: 128.0
+    0x4070_0000_0000_0000, // 27: 256.0
+    0x40e0_0000_0000_0000, // 28: 2^15
+    0x40f0_0000_0000_0000, // 29: 2^16
+    0x7ff0_0000_0000_0000, // 30: +inf
+    0x7ff8_0000_0000_0000, // 31: canonical NaN
+];
 
 /// Converts binary32 to binary64 (`fcvt.d.s`); always exact.
 ///

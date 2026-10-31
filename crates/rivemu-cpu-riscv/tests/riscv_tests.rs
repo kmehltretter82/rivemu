@@ -1110,6 +1110,86 @@ fn sscofpmf_and_smcntrpmf_filtering_overflow_scountovf_and_lcofi_interrupt() {
     assert_eq!(h.csr_read(csr::SIP).unwrap() & irq::LCOFIP, 0);
 }
 
+#[test]
+fn zfa_fli_fminm_fmaxm_fround_fcvtmod_and_quiet_compares() {
+    use rivemu_cpu_riscv::csr;
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(2 * MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+
+    // Program exercising Zfa instructions:
+    //   0x00: fli.s      f1, -1.0       (rs1=0:  0xf010_00d3)
+    //   0x04: fli.d      f2, 2.5        (rs1=21: 0xf21a_8153)
+    //   0x08: fli.d      f3, nan        (rs1=31: 0xf21f_81d3)
+    //   0x0c: fminm.d    f4, f2, f3     (0x2a31_2253) -> canonical NaN (unlike fmin.d)
+    //   0x10: fround.d   f5, f2, rne    (0x4241_02d3) -> 2.0, NX=0
+    //   0x14: froundnx.d f6, f2, rne    (0x4251_0353) -> 2.0, NX=1
+    //   0x18: fleq.d     x1, f2, f3     (0xa231_40d3) -> 0, NV=0 (quiet NaN)
+    //   0x1c: fltq.d     x2, f2, f3     (0xa231_5153) -> 0, NV=0 (quiet NaN)
+    //   0x20: fcvtmod.w.d x3, f7, rtz   (0xc283_91d3) -> modulo 2^32 conversion
+    let insns: &[u32] = &[
+        0xf010_00d3,
+        0xf21a_8153,
+        0xf21f_81d3,
+        0x2a31_2253,
+        0x4241_02d3,
+        0x4251_0353,
+        0xa231_40d3,
+        0xa231_5153,
+        0xc283_91d3,
+    ];
+    for (i, &w) in insns.iter().enumerate() {
+        bus.write(CODE + (i as u64) * 4, AccessSize::Word, u64::from(w))
+            .unwrap();
+    }
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    // Enable FPU (FS = Initial)
+    let mstatus = h.csr_read(csr::MSTATUS).unwrap();
+    h.csr_write(csr::MSTATUS, mstatus | (1 << 13)).unwrap();
+
+    // Step 0..4: fli.s, fli.d (2.5), fli.d (qNaN), fminm.d
+    for _ in 0..4 {
+        h.step(&bus);
+    }
+    assert_eq!(h.f[1], 0xffff_ffff_bf80_0000);
+    assert_eq!(h.f[2], 0x4004_0000_0000_0000);
+    assert_eq!(h.f[3], 0x7ff8_0000_0000_0000);
+    assert_eq!(h.f[4], 0x7ff8_0000_0000_0000);
+    assert_eq!(h.csr_read(csr::FFLAGS).unwrap(), 0);
+
+    // Step 4: fround.d f5, f2, rne -> 2.0 (0x4000_0000_0000_0000), fflags == 0 (no NX)
+    h.step(&bus);
+    assert_eq!(h.f[5], 0x4000_0000_0000_0000);
+    assert_eq!(h.csr_read(csr::FFLAGS).unwrap(), 0);
+
+    // Step 5: froundnx.d f6, f2, rne -> 2.0, fflags == NX (1)
+    h.step(&bus);
+    assert_eq!(h.f[6], 0x4000_0000_0000_0000);
+    assert_eq!(h.csr_read(csr::FFLAGS).unwrap(), 1);
+
+    // Clear fflags, then step 6 & 7: fleq.d / fltq.d with quiet NaN do not set NV!
+    h.csr_write(csr::FFLAGS, 0).unwrap();
+    h.step(&bus);
+    h.step(&bus);
+    assert_eq!(h.x[1], 0);
+    assert_eq!(h.x[2], 0);
+    assert_eq!(h.csr_read(csr::FFLAGS).unwrap(), 0);
+
+    // Step 8: fcvtmod.w.d on (2^32 + 0x8000_0005).75 = 4294967296.0 + 2147483653.75 = 6442450949.75
+    // Truncated integer is 0x1_8000_0005; modulo 2^32 sign-extended to 64 bits is 0xffff_ffff_8000_0005,
+    // and fflags is NV (16) without NX!
+    h.f[7] = (6442450949.75f64).to_bits();
+    h.step(&bus);
+    assert_eq!(h.x[3], 0xffff_ffff_8000_0005);
+    assert_eq!(h.csr_read(csr::FFLAGS).unwrap(), 16);
+}
+
+
 
 
 

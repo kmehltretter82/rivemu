@@ -68,6 +68,8 @@ impl Hart {
                 | Op::FcvtIntF
                 | Op::FcvtFInt
                 | Op::FcvtFF
+                | Op::Fround
+                | Op::Froundnx
         );
         let rm = match RoundingMode::from_bits(rm_bits) {
             Some(rm) => rm,
@@ -182,25 +184,59 @@ impl Hart {
                     self.set_f32(rd, (a & !SIGN32) | s);
                 }
             }
-            Op::Fmin | Op::Fmax => {
-                let max = insn.op == Op::Fmax;
+            Op::Fmin | Op::Fmax | Op::Fminm | Op::Fmaxm => {
+                let max = matches!(insn.op, Op::Fmax | Op::Fmaxm);
+                let minm = matches!(insn.op, Op::Fminm | Op::Fmaxm);
                 if insn.dbl {
                     let (a, b) = (self.f[rs1 as usize], self.f[rs2 as usize]);
-                    let v = if max {
-                        sf::f64_max(a, b, &mut fl)
-                    } else {
-                        sf::f64_min(a, b, &mut fl)
+                    let v = match (minm, max) {
+                        (false, false) => sf::f64_min(a, b, &mut fl),
+                        (false, true) => sf::f64_max(a, b, &mut fl),
+                        (true, false) => sf::f64_minm(a, b, &mut fl),
+                        (true, true) => sf::f64_maxm(a, b, &mut fl),
                     };
                     self.set_f64(rd, v);
                 } else {
                     let (a, b) = (self.f32(rs1), self.f32(rs2));
-                    let v = if max {
-                        sf::f32_max(a, b, &mut fl)
-                    } else {
-                        sf::f32_min(a, b, &mut fl)
+                    let v = match (minm, max) {
+                        (false, false) => sf::f32_min(a, b, &mut fl),
+                        (false, true) => sf::f32_max(a, b, &mut fl),
+                        (true, false) => sf::f32_minm(a, b, &mut fl),
+                        (true, true) => sf::f32_maxm(a, b, &mut fl),
                     };
                     self.set_f32(rd, v);
                 }
+            }
+            Op::Fli => {
+                if insn.dbl {
+                    self.set_f64(rd, sf::FLI_D_TABLE[rs1 as usize]);
+                } else {
+                    self.set_f32(rd, sf::FLI_S_TABLE[rs1 as usize]);
+                }
+            }
+            Op::Fround | Op::Froundnx => {
+                let nx = insn.op == Op::Froundnx;
+                if insn.dbl {
+                    let a = self.f[rs1 as usize];
+                    let v = if nx {
+                        sf::f64_roundnx(a, rm, &mut fl)
+                    } else {
+                        sf::f64_round(a, rm, &mut fl)
+                    };
+                    self.set_f64(rd, v);
+                } else {
+                    let a = self.f32(rs1);
+                    let v = if nx {
+                        sf::f32_roundnx(a, rm, &mut fl)
+                    } else {
+                        sf::f32_round(a, rm, &mut fl)
+                    };
+                    self.set_f32(rd, v);
+                }
+            }
+            Op::FcvtmodWD => {
+                let v = sf::f64_to_i32_mod(self.f[rs1 as usize], &mut fl) as i64 as u64;
+                self.set_x(rd, v);
             }
             Op::FcvtIntF => {
                 let v = if insn.dbl {
@@ -262,20 +298,24 @@ impl Hart {
                     self.set_f32(rd, xs1 as u32);
                 }
             }
-            Op::Feq | Op::Flt | Op::Fle => {
+            Op::Feq | Op::Flt | Op::Fle | Op::Fleq | Op::Fltq => {
                 let r = if insn.dbl {
                     let (a, b) = (self.f[rs1 as usize], self.f[rs2 as usize]);
                     match insn.op {
                         Op::Feq => sf::f64_eq(a, b, &mut fl),
                         Op::Flt => sf::f64_lt(a, b, &mut fl),
-                        _ => sf::f64_le(a, b, &mut fl),
+                        Op::Fle => sf::f64_le(a, b, &mut fl),
+                        Op::Fleq => sf::f64_leq(a, b, &mut fl),
+                        _ => sf::f64_ltq(a, b, &mut fl),
                     }
                 } else {
                     let (a, b) = (self.f32(rs1), self.f32(rs2));
                     match insn.op {
                         Op::Feq => sf::f32_eq(a, b, &mut fl),
                         Op::Flt => sf::f32_lt(a, b, &mut fl),
-                        _ => sf::f32_le(a, b, &mut fl),
+                        Op::Fle => sf::f32_le(a, b, &mut fl),
+                        Op::Fleq => sf::f32_leq(a, b, &mut fl),
+                        _ => sf::f32_ltq(a, b, &mut fl),
                     }
                 };
                 self.set_x(rd, u64::from(r));
