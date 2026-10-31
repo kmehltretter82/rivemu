@@ -1472,6 +1472,353 @@ fn macro_op_fusion_and_direct_offset_soft_tlb() {
     assert_eq!(h_fused.instret(), h_step.instret());
 }
 
+#[test]
+fn zimop_zcmop_and_zicfiss_shadow_stack() {
+    use rivemu_cpu_riscv::{Priv, cause, csr};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    const PT_ROOT: u64 = 0x8000_2000;
+    const PT_L1: u64 = 0x8000_3000;
+    const PT_L0: u64 = 0x8000_4000;
+    const SS_PAGE: u64 = 0x8000_5000;
+    const RW_PAGE: u64 = 0x8000_6000;
+
+    // Identity-map 0x8000_0000..0x8001_0000 via 3-level 4 KiB Sv39 page tables:
+    //   VPN[2] = 2 -> PT_L1
+    //   VPN[1] = 0 -> PT_L0
+    //   VPN[0] = 0: CODE (R|W|X|A|D|V = 0xcf)
+    //   VPN[0] = 5: SS_PAGE (shadow stack: R=0, W=1, X=0, A=1, D=1, V=1 = 0xc5)
+    //   VPN[0] = 6: RW_PAGE (ordinary RW: R=1, W=1, X=0, A=1, D=1, V=1 = 0xc7)
+    bus.write(PT_ROOT + 2 * 8, AccessSize::Double, (PT_L1 >> 12) << 10 | 1)
+        .unwrap();
+    bus.write(PT_L1, AccessSize::Double, (PT_L0 >> 12) << 10 | 1)
+        .unwrap();
+    bus.write(PT_L0, AccessSize::Double, (CODE >> 12) << 10 | 0xcf)
+        .unwrap();
+    bus.write(
+        PT_L0 + 5 * 8,
+        AccessSize::Double,
+        (SS_PAGE >> 12) << 10 | 0xc5,
+    )
+    .unwrap();
+    bus.write(
+        PT_L0 + 6 * 8,
+        AccessSize::Double,
+        (RW_PAGE >> 12) << 10 | 0xc7,
+    )
+    .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mtvec = 0x8000_0800;
+
+    // 1. senvcfg.SSE cannot be set while menvcfg.SSE == 0, and clearing menvcfg.SSE clears senvcfg.SSE.
+    h.csr_write(csr::SENVCFG, csr::envcfg::SSE).unwrap();
+    assert_eq!(h.csr_read(csr::SENVCFG).unwrap() & csr::envcfg::SSE, 0);
+    h.csr_write(csr::MENVCFG, csr::envcfg::SSE | csr::envcfg::CBCFE)
+        .unwrap();
+    h.csr_write(csr::SENVCFG, csr::envcfg::SSE).unwrap();
+    assert_ne!(h.csr_read(csr::SENVCFG).unwrap() & csr::envcfg::SSE, 0);
+    h.csr_write(csr::MENVCFG, csr::envcfg::CBCFE).unwrap();
+    assert_eq!(h.csr_read(csr::SENVCFG).unwrap() & csr::envcfg::SSE, 0);
+
+    // 2. M-mode: mop.r.0, mop.rr.0, c.mop.1, and ssrdp write 0; ssamoswap.d raises ILLEGAL_INSN with mtval = raw.
+    h.csr_write(csr::MENVCFG, csr::envcfg::SSE | csr::envcfg::CBCFE)
+        .unwrap();
+    h.csr_write(csr::SSP, SS_PAGE + 0x103).unwrap();
+    assert_eq!(h.csr_read(csr::SSP).unwrap(), SS_PAGE + 0x100); // [1:0] masked to 0
+    h.x[5] = 0xdead_beef;
+    h.x[7] = 0xcafe_babe;
+    h.x[10] = 0x1111_2222;
+    h.x[1] = SS_PAGE + 0x100;
+    let m_insns: &[u32] = &[
+        0x81c3_42f3, // mop.r.0 x5, x6 -> x5 = 0
+        0x8294_43f3, // mop.rr.0 x7, x8, x9 -> x7 = 0
+        0xcdc0_4573, // ssrdp x10 (in M-mode acts as MOP -> x10 = 0)
+        0x4820_b1af, // ssamoswap.d x3, x2, (x1) (in M-mode -> ILLEGAL_INSN)
+    ];
+    for (i, &w) in m_insns.iter().enumerate() {
+        bus.write(CODE + (i as u64) * 4, AccessSize::Word, u64::from(w))
+            .unwrap();
+    }
+    for _ in 0..3 {
+        h.step(&bus);
+    }
+    assert_eq!(h.x[5], 0);
+    assert_eq!(h.x[7], 0);
+    assert_eq!(h.x[10], 0);
+    h.step(&bus);
+    assert_eq!(h.pc, 0x8000_0800);
+    assert_eq!(h.csr.mcause, cause::ILLEGAL_INSN);
+    assert_eq!(h.csr.mtval, 0x4820_b1af);
+
+    // 3. S-mode with Sv39 active and menvcfg.SSE = 1:
+    const S_CODE: u64 = CODE + 0x100;
+    h.prv = Priv::Supervisor;
+    h.csr_write(csr::SATP, (8u64 << 60) | (PT_ROOT >> 12))
+        .unwrap();
+    h.csr_write(csr::MENVCFG, csr::envcfg::SSE | csr::envcfg::CBCFE)
+        .unwrap();
+    h.pc = S_CODE;
+    h.x[1] = 0x1234_5678_9abc_def0;
+    h.x[5] = 0xfedc_ba98_7654_3210;
+    h.x[6] = SS_PAGE + 0xf0;
+    h.x[7] = 0xaaaa_bbbb_cccc_dddd;
+    h.x[8] = RW_PAGE;
+
+    // Sequence in S-mode:
+    //   0: sspush x1         (0xce10_4073) -> [SS_PAGE + 0xf8] = x1, ssp = SS_PAGE + 0xf8
+    //   1: sspush x5         (0xce50_4073) -> [SS_PAGE + 0xf0] = x5, ssp = SS_PAGE + 0xf0
+    //   2: ssrdp x10         (0xcdc0_4573) -> x10 = SS_PAGE + 0xf0
+    //   3: ld x11, 0(x6)     (0x0003_3583) -> x11 = x5 (ordinary load Permitted, warms TLB)
+    //   4: cbo.flush 0(x6)   (0x0023_200f) -> MUST fault with STORE_ACCESS (mcause=7) even on warm TLB!
+    //   5: sd x7, 0(x6)      (0x0073_3023) -> MUST fault with STORE_ACCESS (mcause=7)
+    //   6: ssamoswap.d x12, x7, (x6) (0x4873_362f) -> x12 = x5, [SS_PAGE + 0xf0] = x7
+    //   7: ssamoswap.d x13, x7, (x8) (0x4874_36af) -> RW_PAGE is not shadow stack -> STORE_PAGE_FAULT (mcause=15)
+    //   8: sspopchk x5       (0xcdc2_c073) -> [SS_PAGE + 0xf0] is now x7 != x5 -> SW_CHECK (mcause=18, mtval=3)
+    //   9: sspopchk x1       (0xcdc0_c073)
+    let s_insns: &[u32] = &[
+        0xce10_4073, // 0: sspush x1
+        0xce50_4073, // 1: sspush x5
+        0xcdc0_4573, // 2: ssrdp x10
+        0x0003_3583, // 3: ld x11, 0(x6)
+        0x0023_200f, // 4: cbo.flush 0(x6)
+        0x0073_3023, // 5: sd x7, 0(x6)
+        0x4873_362f, // 6: ssamoswap.d x12, x7, (x6)
+        0x4874_36af, // 7: ssamoswap.d x13, x7, (x8)
+        0xcdc2_c073, // 8: sspopchk x5
+        0xcdc0_c073, // 9: sspopchk x1
+    ];
+    for (i, &w) in s_insns.iter().enumerate() {
+        bus.write(S_CODE + (i as u64) * 4, AccessSize::Word, u64::from(w))
+            .unwrap();
+    }
+
+    // Execute 0..4 (sspush x1, sspush x5, ssrdp x10, ld x11, 0(x6)):
+    for _ in 0..4 {
+        h.step(&bus);
+    }
+    assert_eq!(h.x[10], SS_PAGE + 0xf0);
+    assert_eq!(h.x[11], 0xfedc_ba98_7654_3210);
+
+    // Step 4: cbo.flush 0(x6) on warm TLB must raise STORE_ACCESS (mcause=7, mtval=SS_PAGE+0xf0):
+    h.step(&bus);
+    assert_eq!(h.csr.mcause, cause::STORE_ACCESS);
+    assert_eq!(h.csr.mtval, SS_PAGE + 0xf0);
+
+    // Step 5: sd x7, 0(x6) must raise STORE_ACCESS (mcause=7, mtval=SS_PAGE+0xf0):
+    h.prv = Priv::Supervisor;
+    h.pc = S_CODE + 5 * 4;
+    h.step(&bus);
+    assert_eq!(h.csr.mcause, cause::STORE_ACCESS);
+    assert_eq!(h.csr.mtval, SS_PAGE + 0xf0);
+
+    // Step 6: ssamoswap.d x12, x7, (x6) succeeds:
+    h.prv = Priv::Supervisor;
+    h.pc = S_CODE + 6 * 4;
+    h.step(&bus);
+    assert_eq!(h.x[12], 0xfedc_ba98_7654_3210);
+
+    // Step 7: ssamoswap.d x13, x7, (x8) on ordinary RW page raises STORE_ACCESS (mcause=7):
+    h.step(&bus);
+    assert_eq!(h.csr.mcause, cause::STORE_ACCESS);
+    assert_eq!(h.csr.mtval, RW_PAGE);
+
+    // Step 8: sspopchk x5 with x5 != [SS_PAGE + 0xf0] raises SW_CHECK (mcause=18, mtval=3):
+    h.prv = Priv::Supervisor;
+    h.pc = S_CODE + 8 * 4;
+    h.step(&bus);
+    assert_eq!(h.csr.mcause, cause::SW_CHECK);
+    assert_eq!(h.csr.mtval, 3);
+    assert_eq!(h.csr.ssp, SS_PAGE + 0xf0); // ssp unchanged on fault
+
+    // Update x5 to match x7 and re-run sspopchk x5 + sspopchk x1:
+    h.prv = Priv::Supervisor;
+    h.x[5] = h.x[7];
+    h.pc = S_CODE + 8 * 4;
+    h.step(&bus);
+    assert_eq!(h.csr.ssp, SS_PAGE + 0xf8);
+    h.step(&bus);
+    assert_eq!(h.csr.ssp, SS_PAGE + 0x100);
+
+    // 4. M-mode with MPRV=1, MPP=S on cold TLB: LD from shadow stack page succeeds, SD raises STORE_ACCESS (mcause=7):
+    h.prv = Priv::Machine;
+    h.csr.mstatus = csr::status::MPRV | (1 << csr::status::MPP_SHIFT);
+    h.csr_write(csr::MENVCFG, csr::envcfg::SSE | csr::envcfg::CBCFE)
+        .unwrap();
+    h.pc = S_CODE + 3 * 4; // ld x11, 0(x6)
+    h.x[11] = 0;
+    h.step(&bus);
+    assert_eq!(h.x[11], h.x[7]);
+    h.pc = S_CODE + 5 * 4; // sd x7, 0(x6)
+    h.step(&bus);
+    assert_eq!(h.csr.mcause, cause::STORE_ACCESS);
+    assert_eq!(h.csr.mtval, SS_PAGE + 0xf0);
+}
+
+#[test]
+fn svukte_zjpm_and_zicfilp_semantics() {
+    use rivemu_cpu_riscv::{Priv, cause, csr};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(0x8002_1000);
+    h.csr.mtvec = 0x8000_0800;
+    const PT_ROOT: u64 = 0x8002_0000;
+    const CODE_PA: u64 = 0x8002_1000;
+    const DATA_PA: u64 = 0x8002_2000;
+    const HIGH_VA: u64 = 0xffff_ffc0_0000_0000; // VPN[2] = 256 (1 GiB leaf in upper half of Sv39)
+
+    // Leaf 1 GiB PTE[2] -> identity maps 0x8000_0000..0xbfff_ffff with U|R|W|X|A|D
+    bus.write(
+        PT_ROOT + 2 * 8,
+        AccessSize::Double,
+        ((0x8000_0000u64 >> 12) << 10) | 0xdf,
+    )
+    .unwrap();
+    // Leaf 1 GiB PTE[3] -> maps 0xc000_0000..0xffff_ffff to 0x8000_0000 with S-mode R|W|X|A|D (U=0)
+    bus.write(
+        PT_ROOT + 3 * 8,
+        AccessSize::Double,
+        ((0x8000_0000u64 >> 12) << 10) | 0xcf,
+    )
+    .unwrap();
+    // Leaf 1 GiB PTE[256] -> maps HIGH_VA (0xffff_ffc0_0000_0000) to 0x8000_0000 with U|R|W|X|A|D
+    bus.write(
+        PT_ROOT + 256 * 8,
+        AccessSize::Double,
+        ((0x8000_0000u64 >> 12) << 10) | 0xdf,
+    )
+    .unwrap();
+    bus.write(DATA_PA, AccessSize::Double, 0xdead_beef_cafe_babe)
+        .unwrap();
+
+    h.csr_write(csr::SATP, (8u64 << 60) | (PT_ROOT >> 12))
+        .unwrap();
+
+    // 1. Svukte: with senvcfg.UKTE == 0, U-mode load from HIGH_VA + 0x22000 succeeds and warms the TLB.
+    let high_data_va = HIGH_VA + (DATA_PA - 0x8000_0000);
+    bus.write(CODE_PA, AccessSize::Word, 0x0005_3583).unwrap(); // ld x11, 0(x10)
+    h.prv = Priv::User;
+    h.pc = CODE_PA;
+    h.x[10] = high_data_va;
+    h.step(&bus);
+    assert_eq!(h.x[11], 0xdead_beef_cafe_babe);
+
+    // Enable senvcfg.UKTE: U-mode load from high_data_va must now raise LOAD_PAGE_FAULT (13),
+    // while S-mode (with SUM=1) still succeeds.
+    h.csr_write(csr::SENVCFG, csr::envcfg::UKTE).unwrap();
+    h.prv = Priv::User;
+    h.pc = CODE_PA;
+    h.x[11] = 0;
+    h.step(&bus);
+    assert_eq!(h.csr.mcause, cause::LOAD_PAGE_FAULT);
+    assert_eq!(h.csr.mtval, high_data_va);
+
+    h.prv = Priv::Machine;
+    h.csr.mstatus |= csr::status::MPRV | (1 << csr::status::MPP_SHIFT) | csr::status::SUM;
+    h.pc = CODE_PA;
+    h.step(&bus);
+    assert_eq!(h.x[11], 0xdead_beef_cafe_babe);
+    h.csr.mstatus &= !(csr::status::MPRV | csr::status::MPP);
+
+    // 2. Ssnpm / Smnpm pointer masking (PMLEN = 7 and PMLEN = 16):
+    // Reserved PMM = 1 must be ignored (WARL preserves old PMM = 0).
+    h.csr_write(csr::SENVCFG, 1u64 << csr::envcfg::PMM_SHIFT)
+        .unwrap();
+    assert_eq!(h.csr.senvcfg & csr::envcfg::PMM_MASK, 0);
+
+    // Set senvcfg.PMM = PMLEN_7 (2 << 32): top 7 bits of U-mode data pointer are sign-extended from bit 56.
+    h.csr_write(csr::SENVCFG, csr::envcfg::PMM_PMLEN_7).unwrap();
+    h.prv = Priv::User;
+    h.pc = CODE_PA;
+    h.x[10] = (0x5au64 << 57) | DATA_PA; // bit 56 is 0 -> sign-extends to DATA_PA
+    h.x[11] = 0;
+    h.step(&bus);
+    assert_eq!(h.x[11], 0xdead_beef_cafe_babe);
+
+    // When mstatus.MXR == 1, pointer masking is bypassed for U/S mode -> non-canonical address faults with full VA in mtval.
+    h.csr.mstatus |= csr::status::MXR;
+    h.prv = Priv::User;
+    h.pc = CODE_PA;
+    h.step(&bus);
+    assert_eq!(h.csr.mcause, cause::LOAD_PAGE_FAULT);
+    assert_eq!(h.csr.mtval, (0x5au64 << 57) | DATA_PA);
+    h.csr.mstatus &= !csr::status::MXR;
+
+    // 3. Zicfilp forward-edge CFI (lpad + ELP + SPELP):
+    // Enable senvcfg.LPE for U-mode and delegate SW_CHECK (18) to S-mode:
+    h.csr_write(csr::SENVCFG, csr::envcfg::LPE).unwrap();
+    h.csr.medeleg = 1 << cause::SW_CHECK;
+    h.csr.stvec = 0xc002_1200; // S-mode alias (U=0) of CODE_PA + 0x200
+
+    // Code at CODE_PA + 0x40:
+    //   +0x40: jalr x1, 0(x6)      (0x0003_00e7) -> indirect call via x6 sets ELP = true
+    //   +0x80: lpad 0xabcde        (auipc x0, 0xabcde = 0xabcd_e017)
+    //   +0x84: addi x12, x0, 42    (0x02a0_0613)
+    //   +0xc0: addi x12, x0, 99    (0x0630_0613) -> non-lpad target
+    bus.write(CODE_PA + 0x40, AccessSize::Word, 0x0003_00e7)
+        .unwrap();
+    bus.write(CODE_PA + 0x80, AccessSize::Word, 0xabcd_e017)
+        .unwrap();
+    bus.write(CODE_PA + 0x84, AccessSize::Word, 0x02a0_0613)
+        .unwrap();
+    bus.write(CODE_PA + 0xc0, AccessSize::Word, 0x0630_0613)
+        .unwrap();
+    bus.write(CODE_PA + 0x200, AccessSize::Word, 0x1020_0073) // sret at stvec
+        .unwrap();
+
+    // Case A: matching label in x7[31:12] = 0xabcde succeeds and clears ELP:
+    h.prv = Priv::User;
+    h.pc = CODE_PA + 0x40;
+    h.x[6] = CODE_PA + 0x80;
+    h.x[7] = 0xabcd_e000;
+    h.step(&bus); // jalr x1, 0(x6)
+    assert!(h.elp);
+    h.step(&bus); // lpad 0xabcde
+    assert!(!h.elp);
+    h.step(&bus); // addi x12, x0, 42
+    assert_eq!(h.x[12], 42);
+
+    // Case B: mismatched label in x7[31:12] raises SW_CHECK (scause=18, stval=2) and saves SPELP=1 in sstatus:
+    h.prv = Priv::User;
+    h.pc = CODE_PA + 0x40;
+    h.x[7] = 0x1234_5000;
+    h.step(&bus); // jalr x1, 0(x6)
+    assert!(h.elp);
+    h.step(&bus); // lpad 0xabcde -> mismatch -> trap to S-mode
+    assert_eq!(h.prv, Priv::Supervisor);
+    assert_eq!(h.csr.scause, cause::SW_CHECK);
+    assert_eq!(h.csr.stval, 2);
+    assert_ne!(h.csr.mstatus & csr::status::SPELP, 0);
+    assert!(!h.elp);
+
+    // Fix x7 in the trap handler and execute sret: SPELP is restored to h.elp and cleared in mstatus,
+    // so the retried lpad succeeds!
+    h.x[7] = 0xabcd_e000;
+    h.step(&bus); // sret
+    assert_eq!(h.prv, Priv::User);
+    assert_eq!(h.csr.mstatus & csr::status::SPELP, 0);
+    assert!(h.elp);
+    h.step(&bus); // lpad 0xabcde now succeeds!
+    assert!(!h.elp);
+
+    // Case C: indirect jump to non-lpad instruction raises SW_CHECK (scause=18, stval=2):
+    h.prv = Priv::User;
+    h.pc = CODE_PA + 0x40;
+    h.x[6] = CODE_PA + 0xc0;
+    h.step(&bus); // jalr x1, 0(x6)
+    h.step(&bus); // addi at +0xc0 -> SW_CHECK (stval=2)
+    assert_eq!(h.csr.scause, cause::SW_CHECK);
+    assert_eq!(h.csr.stval, 2);
+}
+
 
 
 

@@ -6,6 +6,7 @@
 pub const FFLAGS: u16 = 0x001;
 pub const FRM: u16 = 0x002;
 pub const FCSR: u16 = 0x003;
+pub const SSP: u16 = 0x011;
 pub const CYCLE: u16 = 0xc00;
 pub const TIME: u16 = 0xc01;
 pub const INSTRET: u16 = 0xc02;
@@ -82,17 +83,32 @@ pub mod status {
     pub const TVM: u64 = 1 << 20;
     pub const TW: u64 = 1 << 21;
     pub const TSR: u64 = 1 << 22;
+    pub const SPELP: u64 = 1 << 23;
     pub const UXL: u64 = 3 << 32;
     pub const SXL: u64 = 3 << 34;
+    pub const MPELP: u64 = 1 << 41;
     pub const SD: u64 = 1 << 63;
 
     /// Bits writable through `mstatus`.
-    pub const M_WRITABLE: u64 =
-        SIE | MIE | SPIE | MPIE | SPP | MPP | FS | MPRV | SUM | MXR | TVM | TW | TSR;
+    pub const M_WRITABLE: u64 = SIE
+        | MIE
+        | SPIE
+        | MPIE
+        | SPP
+        | MPP
+        | FS
+        | MPRV
+        | SUM
+        | MXR
+        | TVM
+        | TW
+        | TSR
+        | SPELP
+        | MPELP;
     /// Bits visible through `sstatus`.
-    pub const S_READABLE: u64 = SIE | SPIE | SPP | FS | SUM | MXR | UXL | SD;
+    pub const S_READABLE: u64 = SIE | SPIE | SPP | FS | SUM | MXR | SPELP | UXL | SD;
     /// Bits writable through `sstatus`.
-    pub const S_WRITABLE: u64 = SIE | SPIE | SPP | FS | SUM | MXR;
+    pub const S_WRITABLE: u64 = SIE | SPIE | SPP | FS | SUM | MXR | SPELP;
 }
 
 /// Interrupt bits in `mip` / `mie` (and interrupt cause numbers).
@@ -137,26 +153,36 @@ pub mod hpmevent {
 /// `menvcfg` / `senvcfg` bits.
 pub mod envcfg {
     pub const FIOM: u64 = 1;
+    pub const LPE: u64 = 1 << 2;
+    pub const SSE: u64 = 1 << 3;
     pub const CBIE_SHIFT: u32 = 4;
     pub const CBIE_MASK: u64 = 3 << CBIE_SHIFT;
     pub const CBCFE: u64 = 1 << 6;
     pub const CBZE: u64 = 1 << 7;
+    pub const UKTE: u64 = 1 << 8;
+    pub const PMM_SHIFT: u32 = 32;
+    pub const PMM_MASK: u64 = 3 << PMM_SHIFT;
+    pub const PMM_PMLEN_7: u64 = 2 << PMM_SHIFT;
+    pub const PMM_PMLEN_16: u64 = 3 << PMM_SHIFT;
     pub const ADUE: u64 = 1 << 61;
     pub const PBMTE: u64 = 1 << 62;
     pub const STCE: u64 = 1 << 63;
 
-    pub const S_MASK: u64 = FIOM | CBIE_MASK | CBCFE | CBZE;
-    pub const M_MASK: u64 = S_MASK | ADUE | PBMTE | STCE;
+    pub const S_MASK: u64 = FIOM | LPE | SSE | CBIE_MASK | CBCFE | CBZE | UKTE | PMM_MASK;
+    pub const M_MASK: u64 = (S_MASK & !UKTE) | ADUE | PBMTE | STCE;
 
-    /// Masks `v` to `mask` and clears the reserved `CBIE = 0b10` encoding (WARL).
+    /// Masks `v` to `mask`, clears the reserved `CBIE = 0b10` encoding (WARL),
+    /// and preserves the previous `PMM` field if `v` specifies reserved `PMM = 0b01`.
     #[inline]
-    pub const fn sanitize(v: u64, mask: u64) -> u64 {
-        let out = v & mask;
+    pub const fn sanitize(v: u64, old: u64, mask: u64) -> u64 {
+        let mut out = v & mask;
         if (out & CBIE_MASK) == (2 << CBIE_SHIFT) {
-            out & !CBIE_MASK
-        } else {
-            out
+            out &= !CBIE_MASK;
         }
+        if (out & PMM_MASK) == (1 << PMM_SHIFT) {
+            out = (out & !PMM_MASK) | (old & PMM_MASK);
+        }
+        out
     }
 }
 
@@ -171,8 +197,8 @@ pub const MISA_VALUE: u64 = (2 << 62)
     | (1 << 18) // S
     | (1 << 20); // U
 
-/// Exceptions that may be delegated to S-mode (all but ecall-from-M and reserved).
-pub const MEDELEG_MASK: u64 = 0xb3ff;
+/// Exceptions that may be delegated to S-mode (all but ecall-from-M and reserved, plus `SW_CHECK` = 18).
+pub const MEDELEG_MASK: u64 = 0x4b3ff;
 
 /// Number of implemented PMP entries.
 pub const PMP_ENTRIES: usize = 16;
@@ -213,12 +239,51 @@ pub struct Csrs {
     pub satp: u64,
     pub fflags: u64,
     pub frm: u64,
+    pub ssp: u64,
     pub pmpcfg: [u8; PMP_ENTRIES],
     pub pmpaddr: [u64; PMP_ENTRIES],
     pub minstret: u64,
 }
 
 impl Csrs {
+    /// Returns whether `Zicfiss` shadow-stack operations are enabled for `prv`.
+    #[inline]
+    pub fn shadow_stack_enabled(&self, prv: crate::hart::Priv) -> bool {
+        match prv {
+            crate::hart::Priv::Machine => false,
+            crate::hart::Priv::Supervisor => (self.menvcfg & envcfg::SSE) != 0,
+            crate::hart::Priv::User => (self.menvcfg & self.senvcfg & envcfg::SSE) != 0,
+        }
+    }
+
+    /// Returns whether `Zicfilp` forward-edge landing-pad enforcement is enabled for `prv`.
+    #[inline]
+    pub fn landing_pad_enabled(&self, prv: crate::hart::Priv) -> bool {
+        match prv {
+            crate::hart::Priv::Machine => false,
+            crate::hart::Priv::Supervisor => (self.menvcfg & envcfg::LPE) != 0,
+            crate::hart::Priv::User => (self.senvcfg & envcfg::LPE) != 0,
+        }
+    }
+
+    /// Returns the effective `Ssnpm`/`Smnpm` pointer-masking width (`0`, `7`, or `16`) for `prv`.
+    #[inline]
+    pub fn effective_pmlen(&self, prv: crate::hart::Priv) -> u32 {
+        if prv != crate::hart::Priv::Machine && (self.mstatus & status::MXR) != 0 {
+            return 0;
+        }
+        let pmm = match prv {
+            crate::hart::Priv::Machine => 0,
+            crate::hart::Priv::Supervisor => (self.menvcfg & envcfg::PMM_MASK) >> envcfg::PMM_SHIFT,
+            crate::hart::Priv::User => (self.senvcfg & envcfg::PMM_MASK) >> envcfg::PMM_SHIFT,
+        };
+        match pmm {
+            2 => 7,
+            3 => 16,
+            _ => 0,
+        }
+    }
+
     /// Recomputes [`Self::active_hpm_mask`] from `mcountinhibit` and `mhpmevent`.
     pub fn update_active_hpm_mask(&mut self) {
         let mut mask = 0u32;
@@ -268,6 +333,7 @@ impl Default for Csrs {
             satp: 0,
             fflags: 0,
             frm: 0,
+            ssp: 0,
             pmpcfg: [0; PMP_ENTRIES],
             pmpaddr: [0; PMP_ENTRIES],
             minstret: 0,

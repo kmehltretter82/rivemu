@@ -230,6 +230,10 @@ fn run() -> Result<ExitCode> {
             None => {}
         }
     };
+    let out = machine.uart.take_output();
+    if !out.is_empty() {
+        sink.write_all(&out)?;
+    }
     sink.flush()?;
     drop(_raw);
     if let Some(snap) = &opts.savevm {

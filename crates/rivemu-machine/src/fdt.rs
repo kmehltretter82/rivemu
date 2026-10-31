@@ -16,7 +16,7 @@ pub(crate) struct FdtParams<'a> {
     pub(crate) virtio: Vec<(u64, u32)>,
 }
 
-const ISA: &str = "rv64imafdc_zabha_zacas_zalasr_zba_zbb_zbc_zbs_zca_zcb_zcd_zfa_zicbom_zicboz_zicntr_zicond_zicsr_zifencei_zihintpause_smcntrpmf_sscofpmf_sstc_svinval_svpbmt";
+const ISA: &str = "rv64imafdc_zabha_zacas_zalasr_zba_zbb_zbc_zbs_zca_zcb_zcd_zcmop_zfa_zicbom_zicboz_zicfilp_zicfiss_zicntr_zicond_zicsr_zifencei_zihintpause_zimop_smcntrpmf_smnpm_sscofpmf_ssnpm_sstc_svinval_svpbmt_svukte";
 const ISA_EXTENSIONS: &[&str] = &[
     "i",
     "m",
@@ -34,19 +34,26 @@ const ISA_EXTENSIONS: &[&str] = &[
     "zca",
     "zcb",
     "zcd",
+    "zcmop",
     "zfa",
     "zicbom",
     "zicboz",
+    "zicfilp",
+    "zicfiss",
     "zicntr",
     "zicond",
     "zicsr",
     "zifencei",
     "zihintpause",
+    "zimop",
     "smcntrpmf",
+    "smnpm",
     "sscofpmf",
+    "ssnpm",
     "sstc",
     "svinval",
     "svpbmt",
+    "svukte",
 ];
 
 pub(crate) fn build(p: &FdtParams<'_>) -> Vec<u8> {

@@ -194,6 +194,12 @@ pub enum Op {
     // Zicond (integer conditional operations)
     CzeroEqz,
     CzeroNez,
+    // Zimop / Zcmop / Zicfiss
+    Mop,
+    Ssrdp,
+    Sspush,
+    Sspopchk,
+    Ssamoswap,
 }
 
 /// AMO operation codes (instruction bits 31:27).
@@ -508,7 +514,22 @@ pub fn decode(raw: u32) -> Insn {
                 };
                 (op, 0)
             }
-            4 => (Op::Illegal, 0),
+            4 => {
+                let op = if raw == 0xce10_4073 || raw == 0xce50_4073 {
+                    Op::Sspush
+                } else if raw == 0xcdc0_c073 || raw == 0xcdc2_c073 {
+                    Op::Sspopchk
+                } else if (raw & 0xffff_f07f) == 0xcdc0_4073 && rd != 0 {
+                    Op::Ssrdp
+                } else if (raw & 0xb3c0_707f) == 0x81c0_4073
+                    || (raw & 0xb200_707f) == 0x8200_4073
+                {
+                    Op::Mop
+                } else {
+                    Op::Illegal
+                };
+                (op, 0)
+            }
             _ => {
                 let op = match f3 {
                     1 => Op::Csrrw,
@@ -534,6 +555,7 @@ pub fn decode(raw: u32) -> Insn {
                 (0x05, 4) if (rd | rs2) & 1 == 0 => Op::AmoCas,
                 (0x06, 0..=3) if aq && rs2 == 0 => Op::LoadAq,
                 (0x07, 0..=3) if rl && rd == 0 => Op::StoreRl,
+                (0x09, 2 | 3) => Op::Ssamoswap,
                 (
                     amo::ADD
                     | amo::SWAP

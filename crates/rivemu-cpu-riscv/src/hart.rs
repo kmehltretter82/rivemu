@@ -28,6 +28,7 @@ pub mod cause {
     pub const INSN_PAGE_FAULT: u64 = 12;
     pub const LOAD_PAGE_FAULT: u64 = 13;
     pub const STORE_PAGE_FAULT: u64 = 15;
+    pub const SW_CHECK: u64 = 18;
 }
 
 /// A synchronous exception raised by an instruction.
@@ -249,6 +250,8 @@ pub struct Hart {
     pub svade: bool,
     /// Enforce strict PMP rules (deny S/U-mode access even when all PMP entries are `OFF`).
     pub strict_pmp: bool,
+    /// `Zicfilp` expected landing pad state (`true` = `LP_EXPECTED`).
+    pub elp: bool,
     /// Cached flag indicating that PMP permission checks are active.
     pub(crate) pmp_enforced: bool,
     /// True when any active PMP entry has boundaries not aligned to 4 KiB (`0x1000`).
@@ -310,6 +313,7 @@ impl Hart {
             strict_align: false,
             svade: false,
             strict_pmp: false,
+            elp: false,
             pmp_enforced: false,
             pmp_subpage: false,
             pmp_any_locked: false,
@@ -335,6 +339,7 @@ impl Hart {
         self.pending_sbi = false;
         self.pending_semihost = false;
         self.hsm_stopped = false;
+        self.elp = false;
         self.update_pmp_state();
     }
 
@@ -447,6 +452,8 @@ impl Hart {
             }
             if n + 1 < budget
                 && !has_bp
+                && !self.elp
+                && !self.csr.landing_pad_enabled(self.prv)
                 && !self.pmp_subpage
                 && self.log_flags.is_empty()
                 && self.csr.active_hpm_mask == 0
@@ -664,18 +671,23 @@ impl Hart {
             self.csr.medeleg
         };
         let cause = code | (u64::from(interrupt) << 63);
+        let save_elp = self.elp && self.csr.landing_pad_enabled(old_prv);
+        self.elp = false;
         let s = &mut self.csr.mstatus;
         if self.prv <= Priv::Supervisor && (deleg >> code) & 1 != 0 {
             self.csr.scause = cause;
             self.csr.sepc = self.pc;
             self.csr.stval = tval;
             let sie = *s & status::SIE != 0;
-            *s &= !(status::SPIE | status::SIE | status::SPP);
+            *s &= !(status::SPIE | status::SIE | status::SPP | status::SPELP);
             if sie {
                 *s |= status::SPIE;
             }
             if self.prv == Priv::Supervisor {
                 *s |= status::SPP;
+            }
+            if save_elp {
+                *s |= status::SPELP;
             }
             self.prv = Priv::Supervisor;
             self.pc = trap_vector(self.csr.stvec, code, interrupt);
@@ -684,11 +696,14 @@ impl Hart {
             self.csr.mepc = self.pc;
             self.csr.mtval = tval;
             let mie = *s & status::MIE != 0;
-            *s &= !(status::MPIE | status::MIE | status::MPP);
+            *s &= !(status::MPIE | status::MIE | status::MPP | status::MPELP);
             if mie {
                 *s |= status::MPIE;
             }
             *s |= (self.prv as u64) << status::MPP_SHIFT;
+            if save_elp {
+                *s |= status::MPELP;
+            }
             self.prv = Priv::Machine;
             self.pc = trap_vector(self.csr.mtvec, code, interrupt);
         }
@@ -819,6 +834,7 @@ impl Hart {
         va: u64,
         size: AccessSize,
     ) -> Result<u64, Exception> {
+        let va = self.mask_data_addr(va);
         let n = size.bytes();
         if self.strict_align && va & (n - 1) != 0 {
             return Err(Exception::new(cause::LOAD_MISALIGNED, va));
@@ -859,6 +875,7 @@ impl Hart {
         size: AccessSize,
         value: u64,
     ) -> Result<(), Exception> {
+        let va = self.mask_data_addr(va);
         let n = size.bytes();
         if self.strict_align && va & (n - 1) != 0 {
             return Err(Exception::new(cause::STORE_MISALIGNED, va));
@@ -925,6 +942,21 @@ impl Hart {
 
     fn execute(&mut self, bus: &AddressSpace, insn: &Insn) -> Result<(), Exception> {
         let pc = self.pc;
+        if self.elp {
+            if self.csr.landing_pad_enabled(self.prv) {
+                let label = u64::from((insn.raw >> 12) & 0xfffff);
+                let expected = (self.x[7] >> 12) & 0xfffff;
+                let valid_lpad = insn.len == 4
+                    && insn.op == Op::Auipc
+                    && insn.rd == 0
+                    && (pc & 3) == 0
+                    && (label == 0 || label == expected);
+                if !valid_lpad {
+                    return Err(Exception::new(cause::SW_CHECK, 2));
+                }
+            }
+            self.elp = false;
+        }
         let next = pc.wrapping_add(u64::from(insn.len));
         let rs1 = self.x[insn.rs1 as usize];
         let rs2 = self.x[insn.rs2 as usize];
@@ -951,6 +983,9 @@ impl Hart {
             Op::Jalr => {
                 new_pc = rs1.wrapping_add(imm) & !1;
                 self.set_x(rd, next);
+                if self.csr.landing_pad_enabled(self.prv) && !matches!(insn.rs1, 1 | 5 | 7) {
+                    self.elp = true;
+                }
             }
             Op::Beq => branch!(rs1 == rs2),
             Op::Bne => branch!(rs1 != rs2),
@@ -1193,7 +1228,8 @@ impl Hart {
                 }
                 let s = self.csr.mstatus;
                 let mpp = Priv::from_bits(s >> status::MPP_SHIFT);
-                let mut n = s & !(status::MIE | status::MPP);
+                let mpelp = s & status::MPELP != 0;
+                let mut n = s & !(status::MIE | status::MPP | status::MPELP);
                 if s & status::MPIE != 0 {
                     n |= status::MIE;
                 }
@@ -1203,6 +1239,7 @@ impl Hart {
                 }
                 self.csr.mstatus = n;
                 self.prv = mpp;
+                self.elp = mpelp && self.csr.landing_pad_enabled(mpp);
                 self.reservation = None;
                 self.fetch_vpn = 0;
                 self.check_irq = true;
@@ -1220,13 +1257,15 @@ impl Hart {
                 } else {
                     Priv::User
                 };
-                let mut n = s & !(status::SIE | status::SPP | status::MPRV);
+                let spelp = s & status::SPELP != 0;
+                let mut n = s & !(status::SIE | status::SPP | status::MPRV | status::SPELP);
                 if s & status::SPIE != 0 {
                     n |= status::SIE;
                 }
                 n |= status::SPIE;
                 self.csr.mstatus = n;
                 self.prv = spp;
+                self.elp = spelp && self.csr.landing_pad_enabled(spp);
                 self.reservation = None;
                 self.fetch_vpn = 0;
                 self.check_irq = true;
@@ -1272,11 +1311,12 @@ impl Hart {
                 if !ok {
                     return Err(Self::illegal(insn));
                 }
-                let base_va = rs1 & !63;
+                let va = self.mask_data_addr(rs1);
+                let base_va = va & !63;
                 let pa = self
                     .translate(bus, base_va, Access::CacheBom)
-                    .map_err(|e| Exception::new(e.cause, rs1))?;
-                self.check_pmp_access(rs1, pa, 64, Access::CacheBom)?;
+                    .map_err(|e| Exception::new(e.cause, va))?;
+                self.check_pmp_access(va, pa, 64, Access::CacheBom)?;
                 self.invalidate_reservation(pa);
                 bus.invalidate_cache_line(pa, AccessSize::Double);
             }
@@ -1289,11 +1329,12 @@ impl Hart {
                 if !ok {
                     return Err(Self::illegal(insn));
                 }
-                let base_va = rs1 & !63;
+                let va = self.mask_data_addr(rs1);
+                let base_va = va & !63;
                 let pa = self
                     .translate(bus, base_va, Access::CacheBom)
-                    .map_err(|e| Exception::new(e.cause, rs1))?;
-                self.check_pmp_access(rs1, pa, 64, Access::CacheBom)?;
+                    .map_err(|e| Exception::new(e.cause, va))?;
+                self.check_pmp_access(va, pa, 64, Access::CacheBom)?;
                 self.invalidate_reservation(pa);
                 bus.invalidate_cache_line(pa, AccessSize::Double);
             }
@@ -1306,17 +1347,94 @@ impl Hart {
                 if !ok {
                     return Err(Self::illegal(insn));
                 }
-                let base_va = rs1 & !63;
+                let va = self.mask_data_addr(rs1);
+                let base_va = va & !63;
                 let pa = self
                     .translate(bus, base_va, Access::Store)
-                    .map_err(|e| Exception::new(e.cause, rs1))?;
-                self.check_pmp_access(rs1, pa, 64, Access::Store)?;
+                    .map_err(|e| Exception::new(e.cause, va))?;
+                self.check_pmp_access(va, pa, 64, Access::Store)?;
                 self.invalidate_reservation(pa);
                 bus.invalidate_cache_line(pa, AccessSize::Double);
                 for off in (0..64u64).step_by(8) {
                     bus.write(pa + off, AccessSize::Double, 0)
-                        .map_err(|_| Exception::new(cause::STORE_ACCESS, rs1))?;
+                        .map_err(|_| Exception::new(cause::STORE_ACCESS, va))?;
                 }
+            }
+
+            // Zimop / Zcmop / Zicfiss extensions.
+            Op::Mop => self.set_x(rd, 0),
+            Op::Ssrdp => {
+                let v = if self.csr.shadow_stack_enabled(self.prv) {
+                    self.csr.ssp
+                } else {
+                    0
+                };
+                self.set_x(rd, v);
+            }
+            Op::Sspush => {
+                if self.csr.shadow_stack_enabled(self.prv) {
+                    let addr = self.csr.ssp.wrapping_sub(8);
+                    let va = self.mask_data_addr(addr);
+                    if va & 7 != 0 {
+                        return Err(Exception::new(cause::STORE_ACCESS, va));
+                    }
+                    let pa = self.translate(bus, va, Access::ShadowStackStore)?;
+                    self.check_pmp_access(va, pa, 8, Access::ShadowStackStore)?;
+                    self.invalidate_reservation(pa);
+                    bus.write(pa, AccessSize::Double, rs2)
+                        .map_err(|_| Exception::new(cause::STORE_ACCESS, va))?;
+                    self.csr.ssp = addr;
+                }
+            }
+            Op::Sspopchk => {
+                if self.csr.shadow_stack_enabled(self.prv) {
+                    let addr = self.csr.ssp;
+                    let va = self.mask_data_addr(addr);
+                    if va & 7 != 0 {
+                        return Err(Exception::new(cause::STORE_ACCESS, va));
+                    }
+                    let pa = self.translate(bus, va, Access::ShadowStackLoad)?;
+                    self.check_pmp_access(va, pa, 8, Access::ShadowStackLoad)?;
+                    let val = bus
+                        .read(pa, AccessSize::Double)
+                        .map_err(|_| Exception::new(cause::STORE_ACCESS, va))?;
+                    if val != rs1 {
+                        return Err(Exception::new(cause::SW_CHECK, 3));
+                    }
+                    self.csr.ssp = addr.wrapping_add(8);
+                }
+            }
+            Op::Ssamoswap => {
+                if !self.csr.shadow_stack_enabled(self.prv) {
+                    return Err(Self::illegal(insn));
+                }
+                let va = self.mask_data_addr(rs1);
+                let size = if insn.imm == 2 {
+                    AccessSize::Word
+                } else {
+                    AccessSize::Double
+                };
+                let n = size.bytes();
+                if va & (n - 1) != 0 {
+                    return Err(Exception::new(cause::STORE_ACCESS, va));
+                }
+                let pa = self.translate(bus, va, Access::ShadowStackStore)?;
+                self.check_pmp_access(va, pa, n, Access::ShadowStackStore)?;
+                let b_u = if size == AccessSize::Word {
+                    u64::from(rs2 as u32)
+                } else {
+                    rs2
+                };
+                let old = bus
+                    .atomic_rmw(pa, size, |_| b_u)
+                    .map_err(|_| Exception::new(cause::STORE_ACCESS, va))?;
+                self.invalidate_reservation(pa);
+                let res = if size == AccessSize::Word {
+                    sext32(old)
+                } else {
+                    old
+                };
+                self.set_x(rd, res);
             }
 
             // F/D extensions.
@@ -1333,6 +1451,7 @@ impl Hart {
         addr: u64,
         src: u64,
     ) -> Result<(), Exception> {
+        let addr = self.mask_data_addr(addr);
         if insn.op == Op::AmoCas && insn.imm == 4 {
             if addr & 15 != 0 {
                 return Err(Exception::new(cause::STORE_MISALIGNED, addr));
@@ -1550,6 +1669,12 @@ impl Hart {
             csr::FFLAGS => c.fflags,
             csr::FRM => c.frm,
             csr::FCSR => (c.frm << 5) | c.fflags,
+            csr::SSP => {
+                if self.prv != Priv::Machine && !c.shadow_stack_enabled(self.prv) {
+                    return None;
+                }
+                c.ssp
+            }
             csr::CYCLE..=csr::HPMCOUNTER31 => {
                 let idx = num - csr::CYCLE;
                 if !self.counter_enabled(idx) {
@@ -1580,7 +1705,13 @@ impl Hart {
             csr::SIE => c.mie & c.mideleg,
             csr::STVEC => c.stvec,
             csr::SCOUNTEREN => c.scounteren,
-            csr::SENVCFG => c.senvcfg,
+            csr::SENVCFG => {
+                let mut v = c.senvcfg;
+                if c.menvcfg & envcfg::SSE == 0 {
+                    v &= !envcfg::SSE;
+                }
+                v
+            }
             csr::SSCRATCH => c.sscratch,
             csr::SEPC => c.sepc,
             csr::SCAUSE => c.scause,
@@ -1682,6 +1813,12 @@ impl Hart {
                 self.csr.frm = (v >> 5) & 7;
                 self.csr.mstatus |= status::FS;
             }
+            csr::SSP => {
+                if self.prv != Priv::Machine && !self.csr.shadow_stack_enabled(self.prv) {
+                    return None;
+                }
+                self.csr.ssp = v & !3;
+            }
             csr::SSTATUS => {
                 let m = status::S_WRITABLE;
                 self.csr.mstatus = (self.csr.mstatus & !m) | (v & m);
@@ -1696,7 +1833,14 @@ impl Hart {
                 }
             }
             csr::SCOUNTEREN => self.csr.scounteren = v & 0xffff_ffff,
-            csr::SENVCFG => self.csr.senvcfg = envcfg::sanitize(v, envcfg::S_MASK),
+            csr::SENVCFG => {
+                let mut mask = envcfg::S_MASK;
+                if self.csr.menvcfg & envcfg::SSE == 0 {
+                    mask &= !envcfg::SSE;
+                }
+                self.csr.senvcfg = envcfg::sanitize(v, self.csr.senvcfg, mask);
+                self.flush_tlb();
+            }
             csr::SSCRATCH => self.csr.sscratch = v,
             csr::SEPC => self.csr.sepc = v & !1,
             csr::SCAUSE => self.csr.scause = v,
@@ -1750,7 +1894,10 @@ impl Hart {
             }
             csr::MCOUNTEREN => self.csr.mcounteren = v & 0xffff_ffff,
             csr::MENVCFG => {
-                self.csr.menvcfg = envcfg::sanitize(v, envcfg::M_MASK);
+                self.csr.menvcfg = envcfg::sanitize(v, self.csr.menvcfg, envcfg::M_MASK);
+                if self.csr.menvcfg & envcfg::SSE == 0 {
+                    self.csr.senvcfg &= !envcfg::SSE;
+                }
                 self.flush_tlb();
             }
             csr::MCOUNTINHIBIT => {

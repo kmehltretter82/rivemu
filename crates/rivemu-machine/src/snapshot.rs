@@ -30,7 +30,8 @@ impl Machine {
             let flags = (h.prv as u8)
                 | (u8::from(h.wfi) << 2)
                 | (u8::from(h.handle_sbi) << 3)
-                | (u8::from(h.hsm_stopped) << 4);
+                | (u8::from(h.hsm_stopped) << 4)
+                | (u8::from(h.elp) << 5);
             w.write_all(&[flags, h.csr.fflags as u8, h.csr.frm as u8, 0])?;
             for &r in &h.x {
                 write_u64(&mut w, r)?;
@@ -63,6 +64,8 @@ impl Machine {
                 h.csr.minstret,
                 h.csr.mcyclecfg,
                 h.csr.minstretcfg,
+                h.csr.senvcfg,
+                h.csr.ssp,
             ] {
                 write_u64(&mut w, v)?;
             }
@@ -223,6 +226,7 @@ impl Machine {
             h.wfi = hdr[0] & (1 << 2) != 0;
             h.handle_sbi = hdr[0] & (1 << 3) != 0;
             h.hsm_stopped = hdr[0] & (1 << 4) != 0;
+            h.elp = hdr[0] & (1 << 5) != 0;
             h.csr.fflags = u64::from(hdr[1]);
             h.csr.frm = u64::from(hdr[2]);
             for reg in &mut h.x {
@@ -255,6 +259,8 @@ impl Machine {
             h.csr.minstret = read_u64(&mut r)?;
             h.csr.mcyclecfg = read_u64(&mut r)?;
             h.csr.minstretcfg = read_u64(&mut r)?;
+            h.csr.senvcfg = read_u64(&mut r)?;
+            h.csr.ssp = read_u64(&mut r)?;
             for ev in &mut h.csr.mhpmevent {
                 *ev = read_u64(&mut r)?;
             }

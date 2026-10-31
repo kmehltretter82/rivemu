@@ -16,6 +16,10 @@ pub(crate) enum Access {
     Store,
     /// `Zicbom` cache-block management operations (`cbo.inval`, `cbo.clean`, `cbo.flush`).
     CacheBom,
+    /// `Zicfiss` shadow-stack pop (`sspopchk`, `c.sspopchk`).
+    ShadowStackLoad,
+    /// `Zicfiss` shadow-stack push/swap (`sspush`, `c.sspush`, `ssamoswap`).
+    ShadowStackStore,
 }
 
 impl Access {
@@ -23,7 +27,10 @@ impl Access {
         let c = match self {
             Access::Fetch => cause::INSN_PAGE_FAULT,
             Access::Load => cause::LOAD_PAGE_FAULT,
-            Access::Store | Access::CacheBom => cause::STORE_PAGE_FAULT,
+            Access::Store
+            | Access::CacheBom
+            | Access::ShadowStackLoad
+            | Access::ShadowStackStore => cause::STORE_PAGE_FAULT,
         };
         Exception::new(c, va)
     }
@@ -32,7 +39,10 @@ impl Access {
         let c = match self {
             Access::Fetch => cause::INSN_ACCESS,
             Access::Load => cause::LOAD_ACCESS,
-            Access::Store | Access::CacheBom => cause::STORE_ACCESS,
+            Access::Store
+            | Access::CacheBom
+            | Access::ShadowStackLoad
+            | Access::ShadowStackStore => cause::STORE_ACCESS,
         };
         Exception::new(c, va)
     }
@@ -195,21 +205,50 @@ impl Hart {
         }
     }
 
+    /// Applies `Ssnpm`/`Smnpm` pointer masking (`PMLEN = 7` or `16`) to a data
+    /// virtual address when enabled for the effective data privilege level.
+    #[inline]
+    pub(crate) fn mask_data_addr(&self, va: u64) -> u64 {
+        let prv = self.effective_priv(Access::Load);
+        let pmlen = self.csr.effective_pmlen(prv);
+        if pmlen == 0 {
+            return va;
+        }
+        if prv != Priv::Machine && (self.csr.satp >> 60) != 0 {
+            ((va << pmlen) as i64 >> pmlen) as u64
+        } else {
+            (va << pmlen) >> pmlen
+        }
+    }
+
     #[inline]
     fn pte_permits(&self, flags: u64, prv: Priv, acc: Access) -> bool {
         let s = self.csr.mstatus;
+        let is_ss_pte =
+            (flags & (pte::R | pte::W | pte::X)) == pte::W && (self.csr.menvcfg & envcfg::SSE != 0);
         let ok = match acc {
-            Access::Fetch => flags & pte::X != 0,
-            Access::Load => flags & pte::R != 0 || (s & status::MXR != 0 && flags & pte::X != 0),
-            Access::Store => flags & pte::W != 0,
-            Access::CacheBom => {
-                flags & (pte::R | pte::W) != 0 || (s & status::MXR != 0 && flags & pte::X != 0)
+            Access::Fetch => !is_ss_pte && (flags & pte::X != 0),
+            Access::Load => {
+                is_ss_pte
+                    || (flags & pte::R != 0)
+                    || (s & status::MXR != 0 && flags & pte::X != 0)
             }
+            Access::Store => !is_ss_pte && (flags & pte::W != 0),
+            Access::CacheBom => {
+                !is_ss_pte
+                    && ((flags & (pte::R | pte::W) != 0)
+                        || (s & status::MXR != 0 && flags & pte::X != 0))
+            }
+            Access::ShadowStackLoad | Access::ShadowStackStore => is_ss_pte,
         };
         ok && match prv {
             Priv::User => flags & pte::U != 0,
             Priv::Supervisor => {
-                flags & pte::U == 0 || (acc != Access::Fetch && s & status::SUM != 0)
+                flags & pte::U == 0
+                    || (!matches!(
+                        acc,
+                        Access::Fetch | Access::ShadowStackLoad | Access::ShadowStackStore
+                    ) && s & status::SUM != 0)
             }
             Priv::Machine => true,
         }
@@ -303,6 +342,7 @@ impl Hart {
                     Access::Load => cfg & 0x01 != 0,
                     Access::Store => cfg & 0x02 != 0,
                     Access::CacheBom => cfg & 0x03 != 0,
+                    Access::ShadowStackLoad | Access::ShadowStackStore => (cfg & 0x03) == 0x03,
                 };
             }
         }
@@ -340,6 +380,9 @@ impl Hart {
         let prv = self.effective_priv(acc);
         let mode = self.csr.satp >> 60;
         if prv == Priv::Machine || mode == 0 {
+            if matches!(acc, Access::ShadowStackLoad | Access::ShadowStackStore) {
+                return Err(acc.access_fault(va));
+            }
             if self.pmp_enforced
                 && (prv != Priv::Machine || self.pmp_any_locked)
                 && !self.pmp_check(va, 1, prv, acc)
@@ -347,6 +390,13 @@ impl Hart {
                 return Err(acc.access_fault(va));
             }
             return Ok((va, u64::MAX));
+        }
+        if mode == 8
+            && prv == Priv::User
+            && (self.csr.senvcfg & envcfg::UKTE) != 0
+            && (va >> 63) != 0
+        {
+            return Err(acc.page_fault(va));
         }
         let asid = ((self.csr.satp >> 44) & 0xffff) as u16;
         let tag = (va >> 12) + 1;
@@ -356,7 +406,7 @@ impl Hart {
             && e.epoch == self.tlb.epoch
             && (flags & pte::G != 0 || e.asid == asid)
             && self.pte_permits(flags, prv, acc)
-            && (acc != Access::Store || flags & pte::D != 0)
+            && (!matches!(acc, Access::Store | Access::ShadowStackStore) || flags & pte::D != 0)
         {
             let off = va & 0xfff;
             let pa = e.pa_page | off;
@@ -396,6 +446,13 @@ impl Hart {
         let mode = self.csr.satp >> 60;
         if self.prv == Priv::Machine || mode == 0 {
             return Some(va);
+        }
+        if mode == 8
+            && self.prv == Priv::User
+            && (self.csr.senvcfg & envcfg::UKTE) != 0
+            && (va >> 63) != 0
+        {
+            return None;
         }
         let levels: u32 = match mode {
             8 => 3,
@@ -470,6 +527,13 @@ impl Hart {
         mode: u64,
     ) -> Result<u64, Exception> {
         let levels: u32 = if mode == 8 { 3 } else { 4 };
+        if mode == 8
+            && prv == Priv::User
+            && (self.csr.senvcfg & envcfg::UKTE) != 0
+            && (va >> 63) != 0
+        {
+            return Err(acc.page_fault(va));
+        }
         let va_bits = 12 + 9 * levels;
         let shift = 64 - va_bits;
         if ((va << shift) as i64 >> shift) as u64 != va {
@@ -486,8 +550,10 @@ impl Hart {
             let pte = bus
                 .read(pte_addr, AccessSize::Double)
                 .map_err(|_| acc.access_fault(va))?;
+            let is_ss_pte = (pte & (pte::R | pte::W | pte::X)) == pte::W
+                && (self.csr.menvcfg & envcfg::SSE != 0);
             if pte & pte::V == 0
-                || (pte & pte::R == 0 && pte & pte::W != 0)
+                || (pte & pte::R == 0 && pte & pte::W != 0 && !is_ss_pte)
                 || pte & pte::RESERVED_HIGH_MASK != 0
             {
                 return Err(acc.page_fault(va));
@@ -495,7 +561,7 @@ impl Hart {
             global |= pte & pte::G;
             let pbmt = (pte & pte::PBMT_MASK) >> pte::PBMT_SHIFT;
             let ppn = (pte >> 10) & pte::PPN_MASK;
-            if pte & (pte::R | pte::X) == 0 {
+            if pte & (pte::R | pte::W | pte::X) == 0 {
                 // Pointer to the next level.
                 if level == 0 || pte & (pte::D | pte::A | pte::U) != 0 || pbmt != 0 {
                     return Err(acc.page_fault(va));
@@ -508,6 +574,24 @@ impl Hart {
                 return Err(acc.page_fault(va));
             }
             if !self.pte_permits(pte, prv, acc) {
+                let u_ok = match prv {
+                    Priv::User => pte & pte::U != 0,
+                    Priv::Supervisor => {
+                        pte & pte::U == 0
+                            || (!matches!(
+                                acc,
+                                Access::Fetch | Access::ShadowStackLoad | Access::ShadowStackStore
+                            ) && self.csr.mstatus & status::SUM != 0)
+                    }
+                    Priv::Machine => true,
+                };
+                if (is_ss_pte
+                    || (matches!(acc, Access::ShadowStackLoad | Access::ShadowStackStore)
+                        && (pte & pte::W != 0)))
+                    && u_ok
+                {
+                    return Err(acc.access_fault(va));
+                }
                 return Err(acc.page_fault(va));
             }
             let low_mask = (1u64 << (9 * level)) - 1;
@@ -515,16 +599,17 @@ impl Hart {
                 return Err(acc.page_fault(va)); // misaligned superpage
             }
             // Svade vs Svadu: when Svade is active (`self.svade` and `menvcfg.ADUE == 0`),
-            // missing A (or D on a store) raises a page fault instead of updating the PTE.
+            // missing A (or D on a store / shadow-stack store) raises a page fault instead of updating the PTE.
+            let needs_dirty = matches!(acc, Access::Store | Access::ShadowStackStore);
             if self.svade
                 && self.csr.menvcfg & envcfg::ADUE == 0
-                && (pte & pte::A == 0 || (acc == Access::Store && pte & pte::D == 0))
+                && (pte & pte::A == 0 || (needs_dirty && pte & pte::D == 0))
             {
                 return Err(acc.page_fault(va));
             }
             // Hardware A/D update.
             let mut new = pte | pte::A;
-            if acc == Access::Store {
+            if needs_dirty {
                 new |= pte::D;
             }
             if new != pte {

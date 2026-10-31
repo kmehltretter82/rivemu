@@ -164,8 +164,15 @@ pub(crate) fn expand(c: u16) -> Option<u32> {
             i(imm, 2, 0, 2, OP_IMM)
         }
         (1, 3) => {
-            // C.LUI
+            // C.LUI (and Zcmop c.mop.n / Zicfiss c.sspush x1, c.sspopchk x5 when imm6 == 0)
             if imm6 == 0 {
+                if rd == 1 {
+                    return Some(0xce10_4073); // c.sspush x1 -> sspush x1
+                } else if rd == 5 {
+                    return Some(0xcdc2_c073); // c.sspopchk x5 -> sspopchk x5
+                } else if (rd & 0x11) == 0x01 {
+                    return Some(0x81c0_4073); // c.mop.{3,7,9,11,13,15} -> mop.r.0 x0, x0
+                }
                 return None;
             }
             ((imm6 as u32) << 12) | (rd << 7) | OP_LUI
@@ -321,6 +328,9 @@ mod tests {
             (0xe406, 0x00113423), // c.sdsp ra,8(sp)
             (0xc03e, 0x00f12023), // c.swsp a5,0(sp)
             (0xbfaa, 0x1ea13c27), // c.fsdsp fa0,504(sp)
+            (0x6081, 0xce104073), // c.sspush x1 (Zicfiss)
+            (0x6281, 0xcdc2c073), // c.sspopchk x5 (Zicfiss)
+            (0x6181, 0x81c04073), // c.mop.3 (Zcmop)
         ];
         for &(c, want) in cases {
             assert_eq!(expand(c), Some(want), "c={c:#06x}");
@@ -331,7 +341,7 @@ mod tests {
     fn reserved_encodings() {
         assert_eq!(expand(0x0000), None); // all-zero
         assert_eq!(expand(0x6101), None); // c.addi16sp with imm 0
-        assert_eq!(expand(0x6081), None); // c.lui x1,0
+        assert_eq!(expand(0x6301), None); // c.lui x6,0 (even rd != 0, 2 remains reserved)
         assert_eq!(expand(0x2001), None); // c.addiw x0
         assert_eq!(expand(0x8002), None); // c.jr x0
         assert_eq!(expand(0x4002), None); // c.lwsp x0
