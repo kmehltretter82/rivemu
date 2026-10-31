@@ -2778,5 +2778,136 @@ fn sdtrig_mcontrol6_and_icount_semantics() {
     assert_eq!(h.csr.mepc, CODE + 4);
 }
 
+#[test]
+fn rvv_vector_configuration_memory_alu_mask_and_fp_semantics() {
+    use rivemu_cpu_riscv::{cause, csr, csr::status};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    const DATA: u64 = 0x8000_2000;
+    const MTVEC: u64 = 0x8000_4000;
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mtvec = MTVEC;
+
+    // 1. With mstatus.VS == Off (default after reset), executing vsetvli traps with ILLEGAL_INSN:
+    // vsetvli a1, a0, e64, m1, tu, mu: zimm = 0b000000_011_000 = 0x018
+    // raw = (0x018 << 20) | (10 << 15) | (7 << 12) | (11 << 7) | 0x57 = 0x0185_75d7
+    let vsetvli_e64_m1 = 0x0185_75d7u32;
+    bus.write(CODE, AccessSize::Word, u64::from(vsetvli_e64_m1))
+        .unwrap();
+    h.x[10] = 4;
+    h.step(&bus);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr.mcause, cause::ILLEGAL_INSN);
+
+    // 2. Enable mstatus.VS = Initial (1 << 9) and mstatus.FS = Initial (1 << 13):
+    h.csr.mstatus |= (1 << status::VS_SHIFT) | (1 << status::FS_SHIFT);
+    h.pc = CODE;
+    h.step(&bus);
+    assert_eq!(h.pc, CODE + 4);
+    assert_eq!(h.x[11], 4); // vl = 4 (VLEN=256, SEW=64, LMUL=1 -> VLMAX=4)
+    assert_eq!(h.csr.vl, 4);
+    assert_eq!(h.csr.vtype, 0x18);
+    assert_eq!(h.csr_read(csr::VLENB).unwrap(), 32);
+    assert_eq!(h.csr.mstatus & status::VS, status::VS); // VS transitioned to Dirty (3 << 9)
+
+    // 3. Populate 4 u64 elements at DATA and DATA+32, load into v1 and v2, compute v3 = v1 + v2, store to DATA+64:
+    let a_vals = [10u64, 20, 30, 40];
+    let b_vals = [1u64, 2, 3, 4];
+    for i in 0..4 {
+        bus.write(DATA + (i as u64) * 8, AccessSize::Double, a_vals[i])
+            .unwrap();
+        bus.write(DATA + 32 + (i as u64) * 8, AccessSize::Double, b_vals[i])
+            .unwrap();
+    }
+    h.x[12] = DATA;
+    h.x[13] = DATA + 32;
+    h.x[14] = DATA + 64;
+
+    // vle64.v v1, (a2): nf=0, mew=0, mop=0, vm=1, lumop=0, rs1=12, width=7, vd=1, op=0x07
+    let vle64_v1: u32 = (1 << 25) | (12 << 15) | (7 << 12) | (1 << 7) | 0x07;
+    // vle64.v v2, (a3):
+    let vle64_v2: u32 = (1 << 25) | (13 << 15) | (7 << 12) | (2 << 7) | 0x07;
+    // vadd.vv v3, v2, v1 (funct6=0x00, vm=1, vs2=2, vs1=1, f3=0, vd=3, op=0x57):
+    let vadd_v3_v2_v1: u32 = (1 << 25) | (2 << 20) | (1 << 15) | (3 << 7) | 0x57;
+    // vse64.v v3, (a4):
+    let vse64_v3: u32 = (1 << 25) | (14 << 15) | (7 << 12) | (3 << 7) | 0x27;
+    // vredsum.vs v4, v3, v1 (funct6=0x00, vm=1, vs2=3, vs1=1, f3=2 (OPMVV), vd=4, op=0x57):
+    let vredsum_v4: u32 = (1 << 25) | (3 << 20) | (1 << 15) | (2 << 12) | (4 << 7) | 0x57;
+    // vmv.x.s a5, v4 (funct6=0x10, vm=1, vs2=4, rs1=0, f3=2 (OPMVV), rd=15, op=0x57):
+    let vmv_x_s_a5_v4: u32 = (0x10 << 26) | (1 << 25) | (4 << 20) | (2 << 12) | (15 << 7) | 0x57;
+
+    let prog = [
+        vle64_v1,
+        vle64_v2,
+        vadd_v3_v2_v1,
+        vse64_v3,
+        vredsum_v4,
+        vmv_x_s_a5_v4,
+    ];
+    for (idx, &insn) in prog.iter().enumerate() {
+        bus.write(CODE + 4 + (idx as u64) * 4, AccessSize::Word, u64::from(insn))
+            .unwrap();
+    }
+    for _ in 0..prog.len() {
+        h.step(&bus);
+    }
+    for i in 0..4 {
+        let got = bus.read(DATA + 64 + (i as u64) * 8, AccessSize::Double).unwrap();
+        assert_eq!(got, a_vals[i] + b_vals[i]);
+    }
+    // vredsum.vs sums v3 = [11, 22, 33, 44] (= 110) + v1[0] (10) = 120:
+    assert_eq!(h.x[15], 120);
+
+    // 4. Mask operations: vmseq.vi v0, v2, 2 (marks element 1) + vcpop.m a6, v0 + vfirst.m a7, v0:
+    // vmseq.vi v0, v2, 2: funct6=0x18, vm=1, vs2=2, simm5=2, f3=3 (OPIVI), vd=0, op=0x57
+    let vmseq_v0: u32 = (0x18 << 26) | (1 << 25) | (2 << 20) | (2 << 15) | (3 << 12) | 0x57;
+    // vcpop.m a6, v0: funct6=0x10, vm=1, vs2=0, rs1=16, f3=2, rd=16, op=0x57
+    let vcpop_a6: u32 = (0x10 << 26) | (1 << 25) | (16 << 15) | (2 << 12) | (16 << 7) | 0x57;
+    // vfirst.m a7, v0: funct6=0x10, vm=1, vs2=0, rs1=17, f3=2, rd=17, op=0x57
+    let vfirst_a7: u32 = (0x10 << 26) | (1 << 25) | (17 << 15) | (2 << 12) | (17 << 7) | 0x57;
+    let base_pc = h.pc;
+    for (idx, &insn) in [vmseq_v0, vcpop_a6, vfirst_a7].iter().enumerate() {
+        bus.write(base_pc + (idx as u64) * 4, AccessSize::Word, u64::from(insn))
+            .unwrap();
+    }
+    for _ in 0..3 {
+        h.step(&bus);
+    }
+    assert_eq!(h.x[16], 1); // 1 bit set in mask
+    assert_eq!(h.x[17], 1); // index 1
+
+    // 5. Vector FP: vfadd.vv v5, v1, v2 (with f64 elements):
+    let f1 = [1.5f64, 2.5, 3.5, 4.5];
+    let f2 = [0.5f64, 1.5, 2.5, 3.5];
+    for i in 0..4 {
+        bus.write(DATA + (i as u64) * 8, AccessSize::Double, f1[i].to_bits())
+            .unwrap();
+        bus.write(DATA + 32 + (i as u64) * 8, AccessSize::Double, f2[i].to_bits())
+            .unwrap();
+    }
+    // vfadd.vv v5, v2, v1: funct6=0x00, vm=1, vs2=2, vs1=1, f3=1 (OPFVV), vd=5, op=0x57
+    let vfadd_v5 = (1 << 25) | (2 << 20) | (1 << 15) | (1 << 12) | (5 << 7) | 0x57;
+    // vse64.v v5, (a4):
+    let vse64_v5 = (1 << 25) | (14 << 15) | (7 << 12) | (5 << 7) | 0x27;
+    let base_pc = h.pc;
+    for (idx, &insn) in [vle64_v1, vle64_v2, vfadd_v5, vse64_v5].iter().enumerate() {
+        bus.write(base_pc + (idx as u64) * 4, AccessSize::Word, u64::from(insn))
+            .unwrap();
+    }
+    for _ in 0..4 {
+        h.step(&bus);
+    }
+    for i in 0..4 {
+        let got = f64::from_bits(bus.read(DATA + 64 + (i as u64) * 8, AccessSize::Double).unwrap());
+        assert_eq!(got, f1[i] + f2[i]);
+    }
+}
+
 
 

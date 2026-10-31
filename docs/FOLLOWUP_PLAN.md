@@ -1,5 +1,6 @@
 # Rivemu & Rivemu-Lockstep Follow-Up Plan (P27–P32)
 
+> **Status: COMPLETED (P27–P32).** All six follow-up milestones (**P27–P32**) are implemented, unit-tested, and verified in differential lockstep against Sail 0.16 and `qemu-system-riscv64`.
 > **Baseline:** Milestones **P0–P26** are complete and committed in [`qemu_rust`](../README.md) (`4e83a03`) and [`rivemu-lockstep`](../../rivemu-lockstep/README.md) (`3a87bf3`).
 > This follow-up plan defines the next six milestones (**P27–P32**) covering IEEE-754 half-precision & BFloat16 floating-point, ShangMi cryptography & entropy source CSRs, RVA23 virtual-memory/QoS refinements, double-trap protection, architectural debug triggers (`Sdtrig`), and the RISC-V Vector 1.0 (`V`) extension.
 

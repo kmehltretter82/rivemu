@@ -6,6 +6,10 @@
 pub const FFLAGS: u16 = 0x001;
 pub const FRM: u16 = 0x002;
 pub const FCSR: u16 = 0x003;
+pub const VSTART: u16 = 0x008;
+pub const VXSAT: u16 = 0x009;
+pub const VXRM: u16 = 0x00a;
+pub const VCSR: u16 = 0x00f;
 pub const SSP: u16 = 0x011;
 pub const SEED: u16 = 0x015;
 pub const CYCLE: u16 = 0xc00;
@@ -13,6 +17,14 @@ pub const TIME: u16 = 0xc01;
 pub const INSTRET: u16 = 0xc02;
 pub const HPMCOUNTER3: u16 = 0xc03;
 pub const HPMCOUNTER31: u16 = 0xc1f;
+pub const VL: u16 = 0xc20;
+pub const VTYPE: u16 = 0xc21;
+pub const VLENB: u16 = 0xc22;
+
+/// Vector register width in bits (`VLEN = 256`).
+pub const VLEN: usize = 256;
+/// Vector register width in bytes (`vlenb = VLEN / 8 = 32`).
+pub const VLENB_VAL: u64 = (VLEN / 8) as u64;
 
 // Supervisor.
 pub const SSTATUS: u16 = 0x100;
@@ -86,6 +98,8 @@ pub mod status {
     pub const SPIE: u64 = 1 << 5;
     pub const MPIE: u64 = 1 << 7;
     pub const SPP: u64 = 1 << 8;
+    pub const VS_SHIFT: u32 = 9;
+    pub const VS: u64 = 3 << VS_SHIFT;
     pub const MPP_SHIFT: u32 = 11;
     pub const MPP: u64 = 3 << MPP_SHIFT;
     pub const FS_SHIFT: u32 = 13;
@@ -110,6 +124,7 @@ pub mod status {
         | SPIE
         | MPIE
         | SPP
+        | VS
         | MPP
         | FS
         | MPRV
@@ -123,9 +138,9 @@ pub mod status {
         | MPELP
         | MDT;
     /// Bits visible through `sstatus`.
-    pub const S_READABLE: u64 = SIE | SPIE | SPP | FS | SUM | MXR | SPELP | SDT | UXL | SD;
+    pub const S_READABLE: u64 = SIE | SPIE | SPP | VS | FS | SUM | MXR | SPELP | SDT | UXL | SD;
     /// Bits writable through `sstatus`.
-    pub const S_WRITABLE: u64 = SIE | SPIE | SPP | FS | SUM | MXR | SPELP | SDT;
+    pub const S_WRITABLE: u64 = SIE | SPIE | SPP | VS | FS | SUM | MXR | SPELP | SDT;
 }
 
 /// Interrupt bits in `mip` / `mie` (and interrupt cause numbers).
@@ -226,7 +241,7 @@ pub mod stateen {
     pub const M1_3_MASK: u64 = SE;
 }
 
-/// `misa` value: RV64 IMAFDC + S + U.
+/// `misa` value: RV64 IMAFDCV + S + U.
 pub const MISA_VALUE: u64 = (2 << 62)
     | (1 << 0)  // A
     | (1 << 2)  // C
@@ -235,7 +250,8 @@ pub const MISA_VALUE: u64 = (2 << 62)
     | (1 << 8)  // I
     | (1 << 12) // M
     | (1 << 18) // S
-    | (1 << 20); // U
+    | (1 << 20) // U
+    | (1 << 21); // V
 
 /// Exceptions that may be delegated to S-mode (all but ecall-from-M and reserved, plus `SW_CHECK` = 18).
 pub const MEDELEG_MASK: u64 = 0x4b3ff;
@@ -320,6 +336,11 @@ pub struct Csrs {
     pub srmcfg: u64,
     pub fflags: u64,
     pub frm: u64,
+    pub vstart: u64,
+    pub vxsat: u64,
+    pub vxrm: u64,
+    pub vl: u64,
+    pub vtype: u64,
     pub ssp: u64,
     pub mseccfg: u64,
     pub mstateen: [u64; 4],
@@ -451,6 +472,11 @@ impl Default for Csrs {
             srmcfg: 0,
             fflags: 0,
             frm: 0,
+            vstart: 0,
+            vxsat: 0,
+            vxrm: 0,
+            vl: 0,
+            vtype: 1 << 63,
             ssp: 0,
             mseccfg: 0,
             mstateen: [

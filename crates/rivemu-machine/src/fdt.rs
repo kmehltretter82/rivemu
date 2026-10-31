@@ -16,7 +16,7 @@ pub(crate) struct FdtParams<'a> {
     pub(crate) virtio: Vec<(u64, u32)>,
 }
 
-const ISA: &str = "rv64imafdc_zabha_zacas_zalasr_zawrs_zba_zbb_zbc_zbkb_zbkc_zbkx_zbs_zca_zcb_zcd_zcmop_zfa_zfbfmin_zfh_zfhmin_zicbom_zicbop_zicboz_zicfilp_zicfiss_zicntr_zicond_zicsr_zifencei_zihintpause_zimop_zknd_zkne_zknh_zkr_zksed_zksh_zkt_sdtrig_smcntrpmf_smdbltrp_smepmp_smmpm_smnpm_smstateen_sscofpmf_ssdbltrp_ssnpm_ssqosid_ssstateen_sstc_svinval_svnapot_svpbmt_svrsw60t59b_svukte_svvptc";
+const ISA: &str = "rv64imafdcv_zabha_zacas_zalasr_zawrs_zba_zbb_zbc_zbkb_zbkc_zbkx_zbs_zca_zcb_zcd_zcmop_zfa_zfbfmin_zfh_zfhmin_zicbom_zicbop_zicboz_zicfilp_zicfiss_zicntr_zicond_zicsr_zifencei_zihintpause_zimop_zknd_zkne_zknh_zkr_zksed_zksh_zkt_sdtrig_smcntrpmf_smdbltrp_smepmp_smmpm_smnpm_smstateen_sscofpmf_ssdbltrp_ssnpm_ssqosid_ssstateen_sstc_svinval_svnapot_svpbmt_svrsw60t59b_svukte_svvptc";
 const ISA_EXTENSIONS: &[&str] = &[
     "i",
     "m",
@@ -24,6 +24,7 @@ const ISA_EXTENSIONS: &[&str] = &[
     "f",
     "d",
     "c",
+    "v",
     "zabha",
     "zacas",
     "zalasr",

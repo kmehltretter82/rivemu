@@ -264,6 +264,8 @@ pub struct Hart {
     pub x: [u64; 32],
     /// Floating-point registers (raw bits, NaN-boxed singles).
     pub f: [u64; 32],
+    /// Vector registers (`v0..v31`, 256 bits = 32 bytes each, little-endian).
+    pub v: [[u8; 32]; 32],
     /// Current privilege level.
     pub prv: Priv,
     /// CSR state.
@@ -353,6 +355,7 @@ impl Hart {
             pc: 0,
             x: [0; 32],
             f: [0; 32],
+            v: [[0; 32]; 32],
             prv: Priv::Machine,
             csr: Csrs::default(),
             irqs: HartIrqs::new(),
@@ -396,6 +399,7 @@ impl Hart {
         self.pc = pc;
         self.x = [0; 32];
         self.f = [0; 32];
+        self.v = [[0; 32]; 32];
         self.prv = Priv::Machine;
         self.csr = Csrs::default();
         self.wfi = false;
@@ -1989,6 +1993,9 @@ impl Hart {
                 self.set_x(rd, res);
             }
 
+            // V extension.
+            Op::Vload | Op::Vstore | Op::Vop => self.exec_vector(bus, insn)?,
+
             // F/D extensions.
             _ => self.exec_fp(bus, insn)?,
         }
@@ -2212,6 +2219,10 @@ impl Hart {
         self.csr.mstatus & status::FS != 0
     }
 
+    fn vs_enabled(&self) -> bool {
+        self.csr.mstatus & status::VS != 0
+    }
+
     /// Whether counter `idx` (0 = cycle, 1 = time, 2 = instret, ...) is
     /// accessible at the current privilege level.
     fn counter_enabled(&self, idx: u16) -> bool {
@@ -2231,6 +2242,24 @@ impl Hart {
             csr::FFLAGS => c.fflags,
             csr::FRM => c.frm,
             csr::FCSR => (c.frm << 5) | c.fflags,
+            csr::VSTART
+            | csr::VXSAT
+            | csr::VXRM
+            | csr::VCSR
+            | csr::VL
+            | csr::VTYPE
+            | csr::VLENB
+                if !self.vs_enabled() =>
+            {
+                return None;
+            }
+            csr::VSTART => c.vstart,
+            csr::VXSAT => c.vxsat & 1,
+            csr::VXRM => c.vxrm & 3,
+            csr::VCSR => ((c.vxrm & 3) << 1) | (c.vxsat & 1),
+            csr::VL => c.vl,
+            csr::VTYPE => c.vtype,
+            csr::VLENB => csr::VLENB_VAL,
             csr::SSP => {
                 if self.prv != Priv::Machine && !c.shadow_stack_enabled(self.prv) {
                     return None;
@@ -2392,7 +2421,7 @@ impl Hart {
 
     fn read_mstatus(&self) -> u64 {
         let s = self.csr.mstatus;
-        if s & status::FS == status::FS {
+        if s & status::FS == status::FS || s & status::VS == status::VS {
             s | status::SD
         } else {
             s & !status::SD
@@ -2415,6 +2444,24 @@ impl Hart {
                 self.csr.fflags = v & 0x1f;
                 self.csr.frm = (v >> 5) & 7;
                 self.csr.mstatus |= status::FS;
+            }
+            csr::VSTART | csr::VXSAT | csr::VXRM | csr::VCSR if !self.vs_enabled() => return None,
+            csr::VSTART => {
+                self.csr.vstart = v & ((csr::VLEN as u64) - 1);
+                self.csr.mstatus |= status::VS;
+            }
+            csr::VXSAT => {
+                self.csr.vxsat = v & 1;
+                self.csr.mstatus |= status::VS;
+            }
+            csr::VXRM => {
+                self.csr.vxrm = v & 3;
+                self.csr.mstatus |= status::VS;
+            }
+            csr::VCSR => {
+                self.csr.vxsat = v & 1;
+                self.csr.vxrm = (v >> 1) & 3;
+                self.csr.mstatus |= status::VS;
             }
             csr::SSP => {
                 if self.prv != Priv::Machine && !self.csr.shadow_stack_enabled(self.prv) {

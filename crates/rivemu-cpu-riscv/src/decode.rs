@@ -232,6 +232,10 @@ pub enum Op {
     Sm4ks,
     Sm3p0,
     Sm3p1,
+    // V (RVV 1.0 Vector extension)
+    Vload,
+    Vstore,
+    Vop,
 }
 
 /// AMO operation codes (instruction bits 31:27).
@@ -649,11 +653,14 @@ pub fn decode(raw: u32) -> Insn {
             insn.funct = f3 as u8;
             (Op::Fload, imm_i(raw))
         }
+        0x07 if matches!(f3, 0 | 5 | 6 | 7) && (raw & 0x1000_0000) == 0 => (Op::Vload, 0),
         0x27 if matches!(f3, 1..=3) => {
             insn.dbl = f3 == 3;
             insn.funct = f3 as u8;
             (Op::Fstore, imm_s(raw))
         }
+        0x27 if matches!(f3, 0 | 5 | 6 | 7) && (raw & 0x1000_0000) == 0 => (Op::Vstore, 0),
+        0x57 => (Op::Vop, 0),
         opc @ (0x43 | 0x47 | 0x4b | 0x4f) => {
             let fmt = (raw >> 25) & 3;
             insn.dbl = fmt == 1;

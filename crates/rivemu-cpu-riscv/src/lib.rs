@@ -12,6 +12,7 @@ mod hart;
 pub mod log;
 mod mmu;
 mod rvc;
+mod vector;
 
 pub use hart::{Exception, Hart, HartIrqs, Priv, cause};
 pub use log::{LogFlags, Logger};

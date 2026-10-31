@@ -71,8 +71,16 @@ impl Machine {
                 h.csr.tselect,
                 h.csr.scontext,
                 h.csr.mcontext,
+                h.csr.vstart,
+                h.csr.vxsat,
+                h.csr.vxrm,
+                h.csr.vl,
+                h.csr.vtype,
             ] {
                 write_u64(&mut w, v)?;
+            }
+            for vreg in &h.v {
+                w.write_all(vreg)?;
             }
             for &t in &h.csr.tdata1 {
                 write_u64(&mut w, t)?;
@@ -286,6 +294,14 @@ impl Machine {
             h.csr.tselect = read_u64(&mut r)?;
             h.csr.scontext = read_u64(&mut r)?;
             h.csr.mcontext = read_u64(&mut r)?;
+            h.csr.vstart = read_u64(&mut r)?;
+            h.csr.vxsat = read_u64(&mut r)?;
+            h.csr.vxrm = read_u64(&mut r)?;
+            h.csr.vl = read_u64(&mut r)?;
+            h.csr.vtype = read_u64(&mut r)?;
+            for vreg in &mut h.v {
+                r.read_exact(vreg)?;
+            }
             for t in &mut h.csr.tdata1 {
                 *t = read_u64(&mut r)?;
             }

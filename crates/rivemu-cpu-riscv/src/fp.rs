@@ -19,7 +19,7 @@ const SIGN64: u64 = 1 << 63;
 impl Hart {
     /// Reads an f register as a half, unboxing (improperly boxed → canonical NaN).
     #[inline]
-    fn f16(&self, r: u8) -> u16 {
+    pub(crate) fn f16(&self, r: u8) -> u16 {
         let v = self.f[r as usize];
         if v & BOX16 == BOX16 {
             v as u16
@@ -40,14 +40,14 @@ impl Hart {
     }
 
     #[inline]
-    fn set_f16(&mut self, r: u8, v: u16) {
+    pub(crate) fn set_f16(&mut self, r: u8, v: u16) {
         self.f[r as usize] = BOX16 | u64::from(v);
         self.csr.mstatus |= status::FS;
     }
 
     /// Reads an f register as a single, unboxing (improperly boxed → canonical NaN).
     #[inline]
-    fn f32(&self, r: u8) -> u32 {
+    pub(crate) fn f32(&self, r: u8) -> u32 {
         let v = self.f[r as usize];
         if v & BOX == BOX {
             v as u32
@@ -57,19 +57,19 @@ impl Hart {
     }
 
     #[inline]
-    fn set_f32(&mut self, r: u8, v: u32) {
+    pub(crate) fn set_f32(&mut self, r: u8, v: u32) {
         self.f[r as usize] = BOX | u64::from(v);
         self.csr.mstatus |= status::FS;
     }
 
     #[inline]
-    fn set_f64(&mut self, r: u8, v: u64) {
+    pub(crate) fn set_f64(&mut self, r: u8, v: u64) {
         self.f[r as usize] = v;
         self.csr.mstatus |= status::FS;
     }
 
     #[inline]
-    fn accrue(&mut self, fl: Flags) {
+    pub(crate) fn accrue(&mut self, fl: Flags) {
         if fl.0 != 0 {
             self.csr.fflags |= u64::from(fl.0);
             self.csr.mstatus |= status::FS;
