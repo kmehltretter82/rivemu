@@ -2348,6 +2348,96 @@ fn zfh_zfhmin_zfbfmin_and_zfa_fp16_semantics() {
     assert_eq!(h.f[3], BOX16 | 0x7e00);
 }
 
+#[test]
+fn zksed_zksh_and_zkr_seed_semantics() {
+    use rivemu_cpu_riscv::csr::{self, mseccfg};
+    use rivemu_cpu_riscv::{Priv, cause};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    const MTVEC: u64 = 0x8000_1000;
+
+    // 0: sm4ed  x12, x10, x11, 0  (f7=0x18, rs2=11, rs1=10, f3=0, rd=12, opc=0x33 -> 0x30b5_0633)
+    // 1: sm4ks  x13, x10, x11, 1  (f7=0x3a, rs2=11, rs1=10, f3=0, rd=13, opc=0x33 -> 0x74b5_06b3)
+    // 2: sm3p0  x14, x10          (imm12=0x108, rs1=10, f3=1, rd=14, opc=0x13 -> 0x1085_1713)
+    // 3: sm3p1  x15, x10          (imm12=0x109, rs1=10, f3=1, rd=15, opc=0x13 -> 0x1095_1793)
+    // 4: csrrw  x16, seed, x0     (0x0150_1873) -> legal R/W in M-mode, returns OPST=ES16 (0x8000_xxxx)
+    // 5: csrrs  x17, seed, x0     (0x0150_28f3) -> read-only access to seed MUST trap with ILLEGAL_INSN!
+    let insns: &[u32] = &[
+        0x30b5_0633,
+        0x74b5_06b3,
+        0x1085_1713,
+        0x1095_1793,
+        0x0150_1873,
+        0x0150_28f3,
+    ];
+    for (i, &w) in insns.iter().enumerate() {
+        bus.write(CODE + (i as u64) * 4, AccessSize::Word, u64::from(w))
+            .unwrap();
+    }
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr_write(csr::MTVEC, MTVEC).unwrap();
+    h.x[10] = 0x0123_4567;
+    h.x[11] = 0x89ab_cdef;
+
+    // Step 0..4 (sm4ed, sm4ks, sm3p0, sm3p1, csrrw seed):
+    for _ in 0..5 {
+        h.step(&bus);
+    }
+    assert_eq!(h.pc, CODE + 5 * 4);
+    assert_eq!(h.x[16] & 0xffff_0000, 0x8000_0000); // OPST = 0b10 (ES16)
+    // sm3p0(0x0123_4567) = 0x01234567 ^ rol32(0x01234567, 9) ^ rol32(0x01234567, 17)
+    let x = 0x0123_4567u32;
+    let exp_sm3p0 = (x ^ x.rotate_left(9) ^ x.rotate_left(17)) as i32 as i64 as u64;
+    let exp_sm3p1 = (x ^ x.rotate_left(15) ^ x.rotate_left(23)) as i32 as i64 as u64;
+    assert_eq!(h.x[14], exp_sm3p0);
+    assert_eq!(h.x[15], exp_sm3p1);
+
+    // Step 5: csrrs x17, seed, x0 (read-only) traps with ILLEGAL_INSN:
+    h.step(&bus);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr.mcause, cause::ILLEGAL_INSN);
+
+    // S-mode access to seed is gated by mseccfg.SSEED, and U-mode by mseccfg.USEED:
+    h.prv = Priv::Supervisor;
+    h.pc = CODE + 4 * 4; // csrrw x16, seed, x0
+    h.step(&bus);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr.mcause, cause::ILLEGAL_INSN);
+
+    // Enable SSEED in mseccfg -> S-mode csrrw seed succeeds, U-mode still traps:
+    h.prv = Priv::Machine;
+    h.csr_write(csr::MSECCFG, mseccfg::SSEED).unwrap();
+    h.prv = Priv::Supervisor;
+    h.pc = CODE + 4 * 4;
+    h.x[16] = 0;
+    h.step(&bus);
+    assert_eq!(h.pc, CODE + 5 * 4);
+    assert_eq!(h.x[16] & 0xffff_0000, 0x8000_0000);
+
+    h.prv = Priv::User;
+    h.pc = CODE + 4 * 4;
+    h.step(&bus);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr.mcause, cause::ILLEGAL_INSN);
+
+    // Enable USEED in mseccfg -> U-mode csrrw seed succeeds:
+    h.prv = Priv::Machine;
+    h.csr_write(csr::MSECCFG, mseccfg::SSEED | mseccfg::USEED)
+        .unwrap();
+    h.prv = Priv::User;
+    h.pc = CODE + 4 * 4;
+    h.x[16] = 0;
+    h.step(&bus);
+    assert_eq!(h.pc, CODE + 5 * 4);
+    assert_eq!(h.x[16] & 0xffff_0000, 0x8000_0000);
+}
+
 
 
 

@@ -7,6 +7,7 @@ pub const FFLAGS: u16 = 0x001;
 pub const FRM: u16 = 0x002;
 pub const FCSR: u16 = 0x003;
 pub const SSP: u16 = 0x011;
+pub const SEED: u16 = 0x015;
 pub const CYCLE: u16 = 0xc00;
 pub const TIME: u16 = 0xc01;
 pub const INSTRET: u16 = 0xc02;
@@ -190,11 +191,13 @@ pub mod envcfg {
     }
 }
 
-/// `mseccfg` bits (`Smepmp`, `Zicfilp`, `Smnpm`).
+/// `mseccfg` bits (`Smepmp`, `Zkr`, `Zicfilp`, `Smnpm`).
 pub mod mseccfg {
     pub const MML: u64 = 1 << 0;
     pub const MMWP: u64 = 1 << 1;
     pub const RLB: u64 = 1 << 2;
+    pub const USEED: u64 = 1 << 8;
+    pub const SSEED: u64 = 1 << 9;
     pub const MLPE: u64 = 1 << 10;
     pub const PMM_SHIFT: u32 = 32;
     pub const PMM_MASK: u64 = 3 << PMM_SHIFT;

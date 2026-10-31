@@ -227,6 +227,11 @@ pub enum Op {
     Sha512sum1,
     Sha512sig0,
     Sha512sig1,
+    // Zksed / Zksh (SM4 / SM3 ShangMi scalar cryptography)
+    Sm4ed,
+    Sm4ks,
+    Sm3p0,
+    Sm3p1,
 }
 
 /// AMO operation codes (instruction bits 31:27).
@@ -402,6 +407,8 @@ pub fn decode(raw: u32) -> Insn {
                         5 => (Op::Sha512sum1, 0),
                         6 => (Op::Sha512sig0, 0),
                         7 => (Op::Sha512sig1, 0),
+                        8 => (Op::Sm3p0, 0),
+                        9 => (Op::Sm3p1, 0),
                         _ => (Op::Illegal, 0),
                     },
                     0x0a => (Op::Bseti, shamt),
@@ -507,12 +514,20 @@ pub fn decode(raw: u32) -> Insn {
                 (0x1d, 0) => Op::Aes64ds,
                 (0x1f, 0) => Op::Aes64dsm,
                 (0x3f, 0) => Op::Aes64ks2,
+                // Zksed
+                (_, 0) if (f7 & 0x1f) == 0x18 => Op::Sm4ed,
+                (_, 0) if (f7 & 0x1f) == 0x1a => Op::Sm4ks,
                 // Zicond
                 (0x07, 5) => Op::CzeroEqz,
                 (0x07, 7) => Op::CzeroNez,
                 _ => Op::Illegal,
             };
-            (op, 0)
+            let imm = if matches!(op, Op::Sm4ed | Op::Sm4ks) {
+                ((f7 >> 5) & 3) as i32
+            } else {
+                0
+            };
+            (op, imm)
         }
         0x3b => {
             let op = match (f7, f3) {
