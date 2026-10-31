@@ -337,6 +337,39 @@ impl AddressSpace {
         }
     }
 
+    /// If the 4 KiB page `[pa_page, pa_page + 0x1000)` is backed entirely by
+    /// the primary `fast_ram` region, returns its byte offset within `fast_ram`.
+    #[inline]
+    pub fn fast_ram_page_offset(&self, pa_page: GuestAddr) -> Option<u64> {
+        let (base, len, _) = self.fast_ram.as_ref()?;
+        let off = pa_page.wrapping_sub(*base);
+        (off.saturating_add(0x1000) <= *len).then_some(off)
+    }
+
+    /// Reads directly from the primary `fast_ram` region using a pre-validated
+    /// byte offset from [`Self::fast_ram_page_offset`].
+    #[inline]
+    pub fn read_fast_ram(&self, ram_off: u64, size: AccessSize) -> Option<u64> {
+        let (_, _, ram) = self.fast_ram.as_ref()?;
+        ram.read(ram_off, size)
+    }
+
+    /// Writes directly to the primary `fast_ram` region using a pre-validated
+    /// byte offset from [`Self::fast_ram_page_offset`] and updates reservation tracking.
+    #[inline]
+    pub fn write_fast_ram(
+        &self,
+        addr: GuestAddr,
+        ram_off: u64,
+        size: AccessSize,
+        value: u64,
+    ) -> Option<()> {
+        let (_, _, ram) = self.fast_ram.as_ref()?;
+        ram.write(ram_off, size, value)?;
+        self.invalidate_cache_line(addr, size);
+        Some(())
+    }
+
     /// Guest-visible read.
     #[inline]
     pub fn read(&self, addr: GuestAddr, size: AccessSize) -> Result<u64, BusError> {

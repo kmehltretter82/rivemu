@@ -55,12 +55,15 @@ mod pte {
 
 const TLB_SIZE: usize = 1024;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct TlbEntry {
     /// `(va >> 12) + 1` (0 means invalid).
     tag: u64,
     /// Physical address of the 4 KiB page.
     pa_page: u64,
+    /// Pre-validated byte offset of `pa_page` within `AddressSpace::fast_ram`
+    /// when `PBMT == 0` (`u64::MAX` otherwise).
+    ram_page_off: u64,
     /// Flush epoch matching [`Tlb::epoch`].
     epoch: u32,
     /// Address-space identifier (`satp.ASID`) when the entry was installed.
@@ -69,6 +72,20 @@ struct TlbEntry {
     flags: u8,
     /// Page-table level (`0` = 4 KiB, `1` = 2 MiB, `2` = 1 GiB, `3` = 512 GiB).
     level: u8,
+}
+
+impl Default for TlbEntry {
+    fn default() -> Self {
+        Self {
+            tag: 0,
+            pa_page: 0,
+            ram_page_off: u64::MAX,
+            epoch: 0,
+            asid: 0,
+            flags: 0,
+            level: 0,
+        }
+    }
 }
 
 /// Direct-mapped TLB caching leaf translations. Permissions are re-checked
@@ -310,14 +327,16 @@ impl Hart {
         Ok(())
     }
 
-    /// Translates a virtual address.
+    /// Translates a virtual address and returns `(pa, fast_ram_offset)` where
+    /// `fast_ram_offset != u64::MAX` when the translated 4 KiB page has
+    /// `PBMT == 0`, `!pmp_enforced`, and lies inside `AddressSpace::fast_ram`.
     #[inline]
-    pub(crate) fn translate(
+    pub(crate) fn translate_with_ram_off(
         &mut self,
         bus: &AddressSpace,
         va: u64,
         acc: Access,
-    ) -> Result<u64, Exception> {
+    ) -> Result<(u64, u64), Exception> {
         let prv = self.effective_priv(acc);
         let mode = self.csr.satp >> 60;
         if prv == Priv::Machine || mode == 0 {
@@ -327,7 +346,7 @@ impl Hart {
             {
                 return Err(acc.access_fault(va));
             }
-            return Ok(va);
+            return Ok((va, u64::MAX));
         }
         let asid = ((self.csr.satp >> 44) & 0xffff) as u16;
         let tag = (va >> 12) + 1;
@@ -339,17 +358,37 @@ impl Hart {
             && self.pte_permits(flags, prv, acc)
             && (acc != Access::Store || flags & pte::D != 0)
         {
-            let pa = e.pa_page | (va & 0xfff);
-            if self.pmp_enforced && !self.pmp_check(pa, 1, prv, acc) {
-                return Err(acc.access_fault(va));
+            let off = va & 0xfff;
+            let pa = e.pa_page | off;
+            if self.pmp_enforced {
+                if !self.pmp_check(pa, 1, prv, acc) {
+                    return Err(acc.access_fault(va));
+                }
+                return Ok((pa, u64::MAX));
             }
-            return Ok(pa);
+            let ram_off = if e.ram_page_off != u64::MAX {
+                e.ram_page_off | off
+            } else {
+                u64::MAX
+            };
+            return Ok((pa, ram_off));
         }
         let pa = self.walk(bus, va, acc, prv, mode)?;
         if self.pmp_enforced && !self.pmp_check(pa, 1, prv, acc) {
             return Err(acc.access_fault(va));
         }
-        Ok(pa)
+        Ok((pa, u64::MAX))
+    }
+
+    /// Translates a virtual address.
+    #[inline]
+    pub(crate) fn translate(
+        &mut self,
+        bus: &AddressSpace,
+        va: u64,
+        acc: Access,
+    ) -> Result<u64, Exception> {
+        self.translate_with_ram_off(bus, va, acc).map(|(pa, _)| pa)
     }
 
     /// Side-effect-free virtual-to-physical translation for debuggers (GDB).
@@ -499,12 +538,18 @@ impl Hart {
             }
             let asid = ((self.csr.satp >> 44) & 0xffff) as u16;
             let pa_page = (ppn | ((va >> 12) & low_mask)) << 12;
+            let ram_page_off = if pbmt == 0 {
+                bus.fast_ram_page_offset(pa_page).unwrap_or(u64::MAX)
+            } else {
+                u64::MAX
+            };
             if level > 0 {
                 self.tlb.has_superpages = true;
             }
             self.tlb.entries[((va >> 12) as usize) & (TLB_SIZE - 1)] = TlbEntry {
                 tag: (va >> 12) + 1,
                 pa_page,
+                ram_page_off,
                 epoch: self.tlb.epoch,
                 asid,
                 flags: (new | global) as u8,

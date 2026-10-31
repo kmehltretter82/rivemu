@@ -101,11 +101,77 @@ impl HartIrqs {
 
 const ICACHE_SIZE: usize = 8192;
 
+/// Macro-op fusion descriptor cached alongside the first instruction in [`IcacheEntry`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FusedOp {
+    #[default]
+    None,
+    /// `auipc rd, imm20` + `addi rd, rd, imm12`
+    AuipcAddi { rd: u8, total_len: u8, offset: i64 },
+    /// `lui rd, imm20` + `addi rd, rd, imm12`
+    LuiAddi { rd: u8, total_len: u8, imm: u64 },
+    /// `lui rd, imm20` + `addiw rd, rd, imm12`
+    LuiAddiw { rd: u8, total_len: u8, imm: u64 },
+    /// `slli rd, rs1, 32` + `srli rd, rd, 32`
+    ZextW { rd: u8, rs1: u8, total_len: u8 },
+    /// `auipc t, imm20` + `jalr rd, imm12(t)`
+    AuipcJalr {
+        t_reg: u8,
+        link_rd: u8,
+        total_len: u8,
+        auipc_imm: i32,
+        jalr_offset: i64,
+    },
+}
+
+pub(crate) fn try_fuse(first: &Insn, second: &Insn) -> FusedOp {
+    let rd = first.rd;
+    if rd == 0 {
+        return FusedOp::None;
+    }
+    let total_len = first.len + second.len;
+    match (first.op, second.op) {
+        (Op::Auipc, Op::Addi) if second.rd == rd && second.rs1 == rd => FusedOp::AuipcAddi {
+            rd,
+            total_len,
+            offset: i64::from(first.imm).wrapping_add(i64::from(second.imm)),
+        },
+        (Op::Lui, Op::Addi) if second.rd == rd && second.rs1 == rd => FusedOp::LuiAddi {
+            rd,
+            total_len,
+            imm: (first.imm as u64).wrapping_add(second.imm as u64),
+        },
+        (Op::Lui, Op::Addiw) if second.rd == rd && second.rs1 == rd => FusedOp::LuiAddiw {
+            rd,
+            total_len,
+            imm: sext32((first.imm as u64).wrapping_add(second.imm as u64)),
+        },
+        (Op::Slli, Op::Srli)
+            if first.imm == 32 && second.imm == 32 && second.rd == rd && second.rs1 == rd =>
+        {
+            FusedOp::ZextW {
+                rd,
+                rs1: first.rs1,
+                total_len,
+            }
+        }
+        (Op::Auipc, Op::Jalr) if second.rs1 == rd => FusedOp::AuipcJalr {
+            t_reg: rd,
+            link_rd: second.rd,
+            total_len,
+            auipc_imm: first.imm,
+            jalr_offset: i64::from(first.imm).wrapping_add(i64::from(second.imm)),
+        },
+        _ => FusedOp::None,
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct IcacheEntry {
     /// `(pa << 16) | icache_gen` (0 means invalid).
     tag: u64,
     insn: Insn,
+    fused: FusedOp,
 }
 
 impl Default for IcacheEntry {
@@ -113,6 +179,7 @@ impl Default for IcacheEntry {
         Self {
             tag: 0,
             insn: Insn::ILLEGAL,
+            fused: FusedOp::None,
         }
     }
 }
@@ -378,6 +445,16 @@ impl Hart {
                 self.hit_breakpoint = true;
                 break;
             }
+            if n + 1 < budget
+                && !has_bp
+                && !self.pmp_subpage
+                && self.log_flags.is_empty()
+                && self.csr.active_hpm_mask == 0
+                && self.try_step_fused(bus)
+            {
+                n += 2;
+                continue;
+            }
             self.step(bus);
             n += 1;
             if self.check_irq {
@@ -389,6 +466,85 @@ impl Hart {
         }
         self.reservation = None;
         n
+    }
+
+    #[inline]
+    fn bump_minstret(&mut self, delta: u64) {
+        if self.csr.mcountinhibit & 4 == 0 && !self.mode_inhibited(self.csr.minstretcfg) {
+            self.csr.minstret = self.csr.minstret.wrapping_add(delta);
+        }
+    }
+
+    #[inline]
+    fn try_step_fused(&mut self, bus: &AddressSpace) -> bool {
+        let pc = self.pc;
+        if pc & 0xfff > 0xffc {
+            return false;
+        }
+        let vpn_tag = (pc >> 12) + 1;
+        let pa = if self.fetch_vpn == vpn_tag {
+            self.fetch_pa_page | (pc & 0xfff)
+        } else {
+            let Ok(pa) = self.translate(bus, pc, Access::Fetch) else {
+                return false;
+            };
+            self.fetch_vpn = vpn_tag;
+            self.fetch_pa_page = pa & !0xfff;
+            pa
+        };
+        if pa >> 48 != 0 {
+            return false;
+        }
+        let idx = ((pa >> 1) as usize) & (ICACHE_SIZE - 1);
+        let tag = (pa << 16) | u64::from(self.icache_gen);
+        let fused = if self.icache[idx].tag == tag {
+            self.icache[idx].fused
+        } else {
+            let Ok(entry) = self.populate_icache_same_page(bus, pc, pa, idx, tag) else {
+                return false;
+            };
+            entry.fused
+        };
+        match fused {
+            FusedOp::None => false,
+            FusedOp::AuipcAddi {
+                rd,
+                total_len,
+                offset,
+            } => {
+                self.x[rd as usize] = pc.wrapping_add(offset as u64);
+                self.pc = pc.wrapping_add(u64::from(total_len));
+                self.bump_minstret(2);
+                true
+            }
+            FusedOp::LuiAddi { rd, total_len, imm }
+            | FusedOp::LuiAddiw { rd, total_len, imm } => {
+                self.x[rd as usize] = imm;
+                self.pc = pc.wrapping_add(u64::from(total_len));
+                self.bump_minstret(2);
+                true
+            }
+            FusedOp::ZextW { rd, rs1, total_len } => {
+                let v = u64::from(self.x[rs1 as usize] as u32);
+                self.x[rd as usize] = v;
+                self.pc = pc.wrapping_add(u64::from(total_len));
+                self.bump_minstret(2);
+                true
+            }
+            FusedOp::AuipcJalr {
+                t_reg,
+                link_rd,
+                total_len,
+                auipc_imm,
+                jalr_offset,
+            } => {
+                self.x[t_reg as usize] = pc.wrapping_add(auipc_imm as i64 as u64);
+                self.set_x(link_rd, pc.wrapping_add(u64::from(total_len)));
+                self.pc = pc.wrapping_add(jalr_offset as u64) & !1;
+                self.bump_minstret(2);
+                true
+            }
+        }
     }
 
     /// Executes a single instruction (or takes the resulting trap).
@@ -570,12 +726,11 @@ impl Hart {
                     }
                     return Ok(entry.insn);
                 }
-                let insn = self.fetch_decode_same_page(bus, pc, pa)?;
+                let entry = self.populate_icache_same_page(bus, pc, pa, idx, tag)?;
                 if self.log_flags.has(LogFlags::IN_ASM) {
-                    self.log_in_asm(pc, pa, &insn);
+                    self.log_in_asm(pc, pa, &entry.insn);
                 }
-                self.icache[idx] = IcacheEntry { tag, insn };
-                return Ok(insn);
+                return Ok(entry.insn);
             }
         }
         let insn = self.fetch_slow(bus, pc)?;
@@ -583,6 +738,34 @@ impl Hart {
             self.log_in_asm(pc, pc, &insn);
         }
         Ok(insn)
+    }
+
+    #[cold]
+    fn populate_icache_same_page(
+        &mut self,
+        bus: &AddressSpace,
+        pc: u64,
+        pa: u64,
+        idx: usize,
+        tag: u64,
+    ) -> Result<IcacheEntry, Exception> {
+        let insn = self.fetch_decode_same_page(bus, pc, pa)?;
+        let fused = if !self.pmp_subpage
+            && insn.rd != 0
+            && matches!(insn.op, Op::Auipc | Op::Lui | Op::Slli)
+            && (pc & 0xfff) + u64::from(insn.len) + 4 <= 0x1000
+        {
+            let len1 = u64::from(insn.len);
+            match self.fetch_decode_same_page(bus, pc + len1, pa + len1) {
+                Ok(next) => try_fuse(&insn, &next),
+                Err(_) => FusedOp::None,
+            }
+        } else {
+            FusedOp::None
+        };
+        let entry = IcacheEntry { tag, insn, fused };
+        self.icache[idx] = entry;
+        Ok(entry)
     }
 
     #[cold]
@@ -643,8 +826,13 @@ impl Hart {
         if (va & 0xfff) + n > 0x1000 {
             return self.load_page_cross(bus, va, n);
         }
-        let pa = self.translate(bus, va, Access::Load)?;
+        let (pa, ram_page_off) = self.translate_with_ram_off(bus, va, Access::Load)?;
         self.check_pmp_access(va, pa, n, Access::Load)?;
+        if ram_page_off != u64::MAX
+            && let Some(v) = bus.read_fast_ram(ram_page_off | (pa & 0xfff), size)
+        {
+            return Ok(v);
+        }
         bus.read(pa, size).map_err(|e| {
             if self.log_flags.has(LogFlags::GUEST_ERRORS) {
                 self.log_guest_error(format_args!("load fault at va={va:#x} pa={pa:#x}: {e}"));
@@ -678,9 +866,16 @@ impl Hart {
         if (va & 0xfff) + n > 0x1000 {
             return self.store_page_cross(bus, va, n, value);
         }
-        let pa = self.translate(bus, va, Access::Store)?;
+        let (pa, ram_page_off) = self.translate_with_ram_off(bus, va, Access::Store)?;
         self.check_pmp_access(va, pa, n, Access::Store)?;
         self.invalidate_reservation(pa);
+        if ram_page_off != u64::MAX
+            && bus
+                .write_fast_ram(pa, ram_page_off | (pa & 0xfff), size, value)
+                .is_some()
+        {
+            return Ok(());
+        }
         if pa < 0x8000_0000 {
             self.check_irq = true;
             if (0x0200_0000..0x0200_4000).contains(&pa) && value & 1 != 0 {

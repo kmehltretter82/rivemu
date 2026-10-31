@@ -102,6 +102,30 @@ pub(crate) fn expand(c: u16) -> Option<u32> {
             let imm = (bits(c, 12, 10) << 3) | (bit(c, 6) << 2) | (bit(c, 5) << 6);
             i(imm as i32, rs1p, 2, rdp, OP_LOAD)
         }
+        (0, 4) => match bits(c, 12, 10) {
+            0 => {
+                // C.LBU (Zcb)
+                let imm = (bit(c, 5) << 1) | bit(c, 6);
+                i(imm as i32, rs1p, 4, rdp, OP_LOAD)
+            }
+            1 => {
+                // C.LHU / C.LH (Zcb)
+                let imm = bit(c, 5) << 1;
+                let width = if bit(c, 6) == 0 { 5 } else { 1 };
+                i(imm as i32, rs1p, width, rdp, OP_LOAD)
+            }
+            2 => {
+                // C.SB (Zcb)
+                let imm = (bit(c, 5) << 1) | bit(c, 6);
+                s(imm as i32, rdp, rs1p, 0, OP_STORE)
+            }
+            3 if bit(c, 6) == 0 => {
+                // C.SH (Zcb)
+                let imm = bit(c, 5) << 1;
+                s(imm as i32, rdp, rs1p, 1, OP_STORE)
+            }
+            _ => return None,
+        },
         (0, 5) | (0, 7) => {
             // C.FSD / C.SD
             let imm = (bits(c, 12, 10) << 3) | (bits(c, 6, 5) << 6);
@@ -161,6 +185,16 @@ pub(crate) fn expand(c: u16) -> Option<u32> {
                 (0, 3) => r(0, rdp, rs1p, 7, rs1p, OP),      // C.AND
                 (1, 0) => r(0x20, rdp, rs1p, 0, rs1p, OP32), // C.SUBW
                 (1, 1) => r(0, rdp, rs1p, 0, rs1p, OP32),    // C.ADDW
+                (1, 2) => r(0x01, rdp, rs1p, 0, rs1p, OP),   // C.MUL (Zcb)
+                (1, 3) => match bits(c, 4, 2) {
+                    0 => i(0xff, rs1p, 7, rs1p, OP_IMM),     // C.ZEXT.B (Zcb)
+                    1 => i(0x604, rs1p, 1, rs1p, OP_IMM),    // C.SEXT.B (Zcb)
+                    2 => r(0x04, 0, rs1p, 4, rs1p, OP32),    // C.ZEXT.H (Zcb)
+                    3 => i(0x605, rs1p, 1, rs1p, OP_IMM),    // C.SEXT.H (Zcb)
+                    4 => r(0x04, 0, rs1p, 0, rs1p, OP32),    // C.ZEXT.W (Zcb)
+                    5 => i(-1, rs1p, 4, rs1p, OP_IMM),       // C.NOT (Zcb)
+                    _ => return None,
+                },
                 _ => return None,
             },
         },

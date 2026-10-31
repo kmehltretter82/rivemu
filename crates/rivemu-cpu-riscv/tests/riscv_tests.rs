@@ -1312,6 +1312,167 @@ fn zacas_zabha_and_zalasr_atomic_extensions() {
     assert_eq!(h.csr_read(csr::MCAUSE).unwrap(), 4);
 }
 
+#[test]
+fn zcb_compressed_loads_stores_exts_not_and_mul() {
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    const DATA: u64 = 0x8000_2000;
+
+    // 16-bit Zcb instructions using compressed registers s0=x8 (0), s1=x9 (1), a0=x10 (2), a1=x11 (3), a2=x12 (4):
+    //   0: c.sb     s1, 3(s0)   -- (4<<13)|(1<<6)|(1<<5)|(0<<7)|(1<<2)|0 = 0x8864
+    //   1: c.sh     a0, 2(s0)   -- (4<<13)|(1<<10)|(0<<7)|(1<<6)|(0<<5)|(2<<2)|0 = 0x8448
+    //   2: c.lbu    a1, 3(s0)   -- (4<<13)|(0<<7)|(1<<6)|(1<<5)|(3<<2)|0 = 0x806c
+    //   3: c.lhu    a2, 2(s0)   -- (4<<13)|(0<<7)|(1<<6)|(0<<5)|(4<<2)|0 = 0x8050
+    //   4: c.lh     a3, 2(s0)   -- (4<<13)|(1<<6)|(1<<5)|(0<<7)|(5<<2)|0 = 0x8074 (f3=4, bit10=1 -> 0x8454)
+    //   5: c.zext.b s1          -- 0x9c61 | (1<<7) = 0x9ce1
+    //   6: c.sext.b a0          -- 0x9c65 | (2<<7) = 0x9d65
+    //   7: c.zext.h a1          -- 0x9c69 | (3<<7) = 0x9de9
+    //   8: c.sext.h a2          -- 0x9c6d | (4<<7) = 0x9e6d
+    //   9: c.zext.w a3          -- 0x9c71 | (5<<7) = 0x9ef1
+    //  10: c.not    a4          -- 0x9c75 | (6<<7) = 0x9f75
+    //  11: c.mul    a5, s1      -- 0x9c41 | (7<<7) | (1<<2) = 0x9fc5
+    let halfwords: &[u16] = &[
+        0x8864, // c.sb     s1, 3(s0)
+        0x8c28, // c.sh     a0, 2(s0)
+        0x806c, // c.lbu    a1, 3(s0)
+        0x8430, // c.lhu    a2, 2(s0)
+        0x8474, // c.lh     a3, 2(s0)
+        0x9ce1, // c.zext.b s1
+        0x9d65, // c.sext.b a0
+        0x9de9, // c.zext.h a1
+        0x9e6d, // c.sext.h a2
+        0x9ef1, // c.zext.w a3
+        0x9f75, // c.not    a4
+        0x9fc5, // c.mul    a5, s1
+    ];
+    for (i, &hw) in halfwords.iter().enumerate() {
+        bus.write(CODE + (i as u64) * 2, AccessSize::Half, u64::from(hw))
+            .unwrap();
+    }
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.x[8] = DATA; // s0
+    h.x[9] = 0x1234_5678_9abc_def1; // s1
+    h.x[10] = 0xffff_ffff_ffff_80fe; // a0
+    h.x[14] = 0x0000_ffff_0000_ffff; // a4
+    h.x[15] = 7; // a5
+
+    // Step 0: c.sb s1, 3(s0) -> byte at DATA+3 = 0xf1
+    h.step(&bus);
+    assert_eq!(bus.read(DATA + 3, AccessSize::Byte).unwrap(), 0xf1);
+    // Step 1: c.sh a0, 2(s0) -> half at DATA+2 = 0x80fe (so DATA+2 = 0xfe, DATA+3 = 0x80)
+    h.step(&bus);
+    assert_eq!(bus.read(DATA + 2, AccessSize::Half).unwrap(), 0x80fe);
+    // Step 2: c.lbu a1, 3(s0) -> a1 = 0x80
+    h.step(&bus);
+    assert_eq!(h.x[11], 0x80);
+    // Step 3: c.lhu a2, 2(s0) -> a2 = 0x80fe
+    h.step(&bus);
+    assert_eq!(h.x[12], 0x80fe);
+    // Step 4: c.lh a3, 2(s0) -> a3 = 0xffff_ffff_ffff_80fe
+    h.step(&bus);
+    assert_eq!(h.x[13], 0xffff_ffff_ffff_80fe);
+    // Step 5: c.zext.b s1 -> s1 = 0xf1
+    h.step(&bus);
+    assert_eq!(h.x[9], 0xf1);
+    // Step 6: c.sext.b a0 (low byte 0xfe = -2) -> 0xffff_ffff_ffff_fffe
+    h.step(&bus);
+    assert_eq!(h.x[10], 0xffff_ffff_ffff_fffe);
+    // Step 7: c.zext.h a1 (0x1234_5678_9abc_def0 -> 0xdef0)
+    h.x[11] = 0x1234_5678_9abc_def0;
+    h.step(&bus);
+    assert_eq!(h.x[11], 0xdef0);
+    // Step 8: c.sext.h a2 (0x80fe -> 0xffff_ffff_ffff_80fe)
+    h.step(&bus);
+    assert_eq!(h.x[12], 0xffff_ffff_ffff_80fe);
+    // Step 9: c.zext.w a3 (0xffff_ffff_ffff_80fe -> 0xffff_80fe)
+    h.step(&bus);
+    assert_eq!(h.x[13], 0xffff_80fe);
+    // Step 10: c.not a4
+    h.step(&bus);
+    assert_eq!(h.x[14], !0x0000_ffff_0000_ffffu64);
+    // Step 11: c.mul a5, s1 (7 * 0xf1 = 1687)
+    h.step(&bus);
+    assert_eq!(h.x[15], 7 * 0xf1);
+}
+
+#[test]
+fn macro_op_fusion_and_direct_offset_soft_tlb() {
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    const TARGET: u64 = 0x8000_0100;
+
+    // 5 macro-op fused pairs at CODE (10 instructions total):
+    //   Pair 1 (AuipcAddi):
+    //     0x00: auipc x5, 2          (0x0000_2297)
+    //     0x04: addi  x5, x5, 0x123  (0x1232_8293) -> x5 = CODE + 0x2123
+    //   Pair 2 (LuiAddi):
+    //     0x08: lui   x6, 0x12345    (0x1234_5337)
+    //     0x0c: addi  x6, x6, 0x678  (0x6783_0313) -> x6 = 0x1234_5678
+    //   Pair 3 (LuiAddiw):
+    //     0x10: lui   x7, 0x80001    (0x8000_13b7)
+    //     0x14: addiw x7, x7, -1     (0xfff3_839b) -> x7 = 0xffff_ffff_8000_0fff
+    //   Pair 4 (ZextW: slli rd, rs1, 32 + srli rd, rd, 32):
+    //     0x18: slli  x8, x7, 32     (0x0203_9413)
+    //     0x1c: srli  x8, x8, 32     (0x0204_5413) -> x8 = 0x8000_0fff
+    //   Pair 5 (AuipcJalr):
+    //     0x20: auipc x1, 0          (0x0000_0097)
+    //     0x24: jalr  x1, 0xe0(x1)   (0x0e00_80e7) -> x1 = CODE + 0x28, pc = CODE + 0x100 = TARGET
+    let insns: &[u32] = &[
+        0x0000_2297,
+        0x1232_8293,
+        0x1234_5337,
+        0x6783_0313,
+        0x8000_13b7,
+        0xfff3_839b,
+        0x0203_9413,
+        0x0204_5413,
+        0x0000_0097,
+        0x0e00_80e7,
+    ];
+    for (i, &w) in insns.iter().enumerate() {
+        bus.write(CODE + (i as u64) * 4, AccessSize::Word, u64::from(w))
+            .unwrap();
+    }
+
+    // At TARGET (0x8000_0100): sd x6, 0(x5); ld x9, 0(x5) (exercises Direct-Offset SoftTLB)
+    bus.write(TARGET, AccessSize::Word, 0x0062_b023).unwrap();
+    bus.write(TARGET + 4, AccessSize::Word, 0x0002_b483).unwrap();
+
+    // Run with Hart::run(budget = 12) which executes all 5 fused pairs in 5 fused dispatches + 2 memory ops:
+    let mut h_fused = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h_fused.reset(CODE);
+    let executed = h_fused.run(&bus, 12);
+    assert_eq!(executed, 12);
+    assert_eq!(h_fused.instret(), 12);
+    assert_eq!(h_fused.x[5], CODE + 0x2123);
+    assert_eq!(h_fused.x[6], 0x1234_5678);
+    assert_eq!(h_fused.x[7], 0xffff_ffff_8000_0fff);
+    assert_eq!(h_fused.x[8], 0x8000_0fff);
+    assert_eq!(h_fused.x[1], CODE + 0x28);
+    assert_eq!(h_fused.x[9], 0x1234_5678);
+    assert_eq!(h_fused.pc, TARGET + 8);
+
+    // Compare against 12 individual Hart::step() calls:
+    bus.write(CODE + 0x2123, AccessSize::Double, 0).unwrap();
+    let mut h_step = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h_step.reset(CODE);
+    for _ in 0..12 {
+        h_step.step(&bus);
+    }
+    assert_eq!(h_fused.x, h_step.x);
+    assert_eq!(h_fused.pc, h_step.pc);
+    assert_eq!(h_fused.instret(), h_step.instret());
+}
+
+
 
 
 
