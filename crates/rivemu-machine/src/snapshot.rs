@@ -61,8 +61,16 @@ impl Machine {
                 h.csr.satp,
                 h.csr.stimecmp,
                 h.csr.minstret,
+                h.csr.mcyclecfg,
+                h.csr.minstretcfg,
             ] {
                 write_u64(&mut w, v)?;
+            }
+            for &ev in &h.csr.mhpmevent {
+                write_u64(&mut w, ev)?;
+            }
+            for &ctr in &h.csr.mhpmcounter {
+                write_u64(&mut w, ctr)?;
             }
             w.write_all(&h.csr.pmpcfg)?;
             for &addr in &h.csr.pmpaddr {
@@ -201,6 +209,15 @@ impl Machine {
             h.csr.satp = read_u64(&mut r)?;
             h.csr.stimecmp = read_u64(&mut r)?;
             h.csr.minstret = read_u64(&mut r)?;
+            h.csr.mcyclecfg = read_u64(&mut r)?;
+            h.csr.minstretcfg = read_u64(&mut r)?;
+            for ev in &mut h.csr.mhpmevent {
+                *ev = read_u64(&mut r)?;
+            }
+            for ctr in &mut h.csr.mhpmcounter {
+                *ctr = read_u64(&mut r)?;
+            }
+            h.csr.update_active_hpm_mask();
             r.read_exact(&mut h.csr.pmpcfg)?;
             for addr in &mut h.csr.pmpaddr {
                 *addr = read_u64(&mut r)?;

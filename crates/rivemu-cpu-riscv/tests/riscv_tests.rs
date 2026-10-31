@@ -1020,6 +1020,97 @@ fn pmp_m_mode_straddle_of_unlocked_subpage_entry_faults() {
     assert_eq!(h.x[2], 0x1122_3344);
 }
 
+#[test]
+fn sscofpmf_and_smcntrpmf_filtering_overflow_scountovf_and_lcofi_interrupt() {
+    use rivemu_cpu_riscv::csr::{self, hpmevent, irq, status};
+    use rivemu_cpu_riscv::Priv;
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(2 * MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    const STVEC: u64 = 0x8000_1000;
+
+    // 4 NOPs at CODE, 1 NOP at STVEC
+    for i in 0..4 {
+        bus.write(CODE + i * 4, AccessSize::Word, 0x0000_0013).unwrap();
+    }
+    bus.write(STVEC, AccessSize::Word, 0x0000_0013).unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+
+    // 1. Smcntrpmf mode filtering on minstret: set minstretcfg.MINH = 1, verify M-mode
+    // does not increment minstret, while S-mode does.
+    h.csr_write(csr::MINSTRETCFG, hpmevent::MINH).unwrap();
+    assert_eq!(h.csr_read(csr::MINSTRET).unwrap(), 0);
+    h.step(&bus);
+    assert_eq!(h.csr_read(csr::MINSTRET).unwrap(), 0);
+
+    h.prv = Priv::Supervisor;
+    h.step(&bus);
+    assert_eq!(h.csr_read(csr::MINSTRET).unwrap(), 1);
+
+    // 2. Configure mhpmcounter3 (event = instructions, MINH = 1, SINH = 0) at u64::MAX - 1,
+    // and mhpmcounter4 (event = cycles, SINH = 1) at 100.
+    h.prv = Priv::Machine;
+    h.csr_write(csr::MHPMEVENT3, hpmevent::MINH | hpmevent::EVENT_INSTRUCTIONS)
+        .unwrap();
+    h.csr_write(csr::MHPMCOUNTER3, u64::MAX - 1).unwrap();
+    h.csr_write(csr::MHPMEVENT3 + 1, hpmevent::SINH | hpmevent::EVENT_CYCLES)
+        .unwrap();
+    h.csr_write(csr::MHPMCOUNTER3 + 1, 100).unwrap();
+
+    // Stepping in M-mode inhibits mhpmcounter3 (MINH=1) and increments mhpmcounter4 (SINH=1, MINH=0).
+    h.pc = CODE;
+    h.step(&bus);
+    assert_eq!(h.csr_read(csr::MHPMCOUNTER3).unwrap(), u64::MAX - 1);
+    assert_eq!(h.csr_read(csr::MHPMCOUNTER3 + 1).unwrap(), 101);
+
+    // 3. Delegate LCOFI (bit 13) to S-mode, enable SIE.LCOFIE and SSTATUS.SIE, and step in S-mode:
+    // Step 1 advances mhpmcounter3 from u64::MAX - 1 -> u64::MAX (no overflow yet), while
+    // mhpmcounter4 is inhibited in S-mode (SINH=1).
+    h.csr_write(csr::MIDELEG, irq::LCOFIP).unwrap();
+    h.csr_write(csr::MIE, irq::LCOFIP).unwrap();
+    h.csr_write(csr::STVEC, STVEC).unwrap();
+    let mstatus = h.csr_read(csr::MSTATUS).unwrap();
+    h.csr_write(csr::MSTATUS, mstatus | status::SIE).unwrap();
+
+    h.prv = Priv::Supervisor;
+    h.pc = CODE;
+    h.step(&bus);
+    assert_eq!(h.csr_read(csr::MHPMCOUNTER3).unwrap(), u64::MAX);
+    assert_eq!(h.csr_read(csr::MHPMCOUNTER3 + 1).unwrap(), 101);
+    assert_eq!(h.csr_read(csr::MIP).unwrap() & irq::LCOFIP, 0);
+
+    // Step 2 wraps mhpmcounter3 from u64::MAX -> 0, sets mhpmevent3.OF (bit 63),
+    // sets mip.LCOFIP (bit 13), and on the next step delivers the S-mode LCOFI interrupt!
+    h.step(&bus);
+    assert_eq!(h.csr_read(csr::MHPMCOUNTER3).unwrap(), 0);
+    assert_ne!(h.csr_read(csr::MHPMEVENT3).unwrap() & hpmevent::OF, 0);
+    assert_ne!(h.csr_read(csr::MIP).unwrap() & irq::LCOFIP, 0);
+
+    // Verify scountovf (0xda0) in S-mode is gated by mcounteren bit 3.
+    assert_eq!(h.csr_read(csr::SCOUNTOVF).unwrap(), 0);
+    h.prv = Priv::Machine;
+    h.csr_write(csr::MCOUNTEREN, 1 << 3).unwrap();
+    h.prv = Priv::Supervisor;
+    assert_eq!(h.csr_read(csr::SCOUNTOVF).unwrap(), 1 << 3);
+
+    // Next interrupt check in S-mode takes the delegated LCOFI interrupt
+    // (scause = (1 << 63) | 13) to STVEC.
+    h.take_pending_interrupt();
+    assert_eq!(h.pc, STVEC);
+    assert_eq!(h.prv, Priv::Supervisor);
+    assert_eq!(h.csr_read(csr::SCAUSE).unwrap(), (1u64 << 63) | irq::LCOFI);
+
+    // S-mode software can clear sip.LCOFIP via SIP write!
+    h.csr_write(csr::SIP, 0).unwrap();
+    assert_eq!(h.csr_read(csr::SIP).unwrap() & irq::LCOFIP, 0);
+}
+
+
 
 
 

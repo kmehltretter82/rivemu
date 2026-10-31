@@ -25,6 +25,7 @@ pub const STVAL: u16 = 0x143;
 pub const SIP: u16 = 0x144;
 pub const STIMECMP: u16 = 0x14d;
 pub const SATP: u16 = 0x180;
+pub const SCOUNTOVF: u16 = 0xda0;
 
 // Machine.
 pub const MVENDORID: u16 = 0xf11;
@@ -41,6 +42,8 @@ pub const MTVEC: u16 = 0x305;
 pub const MCOUNTEREN: u16 = 0x306;
 pub const MENVCFG: u16 = 0x30a;
 pub const MCOUNTINHIBIT: u16 = 0x320;
+pub const MCYCLECFG: u16 = 0x321;
+pub const MINSTRETCFG: u16 = 0x322;
 pub const MHPMEVENT3: u16 = 0x323;
 pub const MHPMEVENT31: u16 = 0x33f;
 pub const MSCRATCH: u16 = 0x340;
@@ -100,6 +103,7 @@ pub mod irq {
     pub const MTI: u64 = 7;
     pub const SEI: u64 = 9;
     pub const MEI: u64 = 11;
+    pub const LCOFI: u64 = 13;
 
     pub const SSIP: u64 = 1 << SSI;
     pub const MSIP: u64 = 1 << MSI;
@@ -107,13 +111,27 @@ pub mod irq {
     pub const MTIP: u64 = 1 << MTI;
     pub const SEIP: u64 = 1 << SEI;
     pub const MEIP: u64 = 1 << MEI;
+    pub const LCOFIP: u64 = 1 << LCOFI;
 
     /// Interrupts that can be delegated to S-mode.
-    pub const S_MASK: u64 = SSIP | STIP | SEIP;
+    pub const S_MASK: u64 = SSIP | STIP | SEIP | LCOFIP;
     /// All implemented interrupts.
     pub const ALL: u64 = S_MASK | MSIP | MTIP | MEIP;
     /// Priority order for taking interrupts (highest first).
-    pub const PRIORITY: [u64; 6] = [MEI, MSI, MTI, SEI, SSI, STI];
+    pub const PRIORITY: [u64; 7] = [MEI, MSI, MTI, SEI, SSI, STI, LCOFI];
+}
+
+/// `mhpmevent3..31`, `mcyclecfg`, and `minstretcfg` bits (`Sscofpmf` / `Smcntrpmf`).
+pub mod hpmevent {
+    pub const OF: u64 = 1 << 63;
+    pub const MINH: u64 = 1 << 62;
+    pub const SINH: u64 = 1 << 61;
+    pub const UINH: u64 = 1 << 60;
+    pub const FILTER_MASK: u64 = MINH | SINH | UINH;
+    pub const EVENT_MASK: u64 = 0x000f_ffff;
+    pub const EVENT_CYCLES: u64 = 1;
+    pub const EVENT_INSTRUCTIONS: u64 = 2;
+    pub const MHPMEVENT_MASK: u64 = OF | FILTER_MASK | EVENT_MASK;
 }
 
 /// `menvcfg` / `senvcfg` bits.
@@ -159,6 +177,9 @@ pub const MEDELEG_MASK: u64 = 0xb3ff;
 /// Number of implemented PMP entries.
 pub const PMP_ENTRIES: usize = 16;
 
+/// Number of programmable HPM counters (`mhpmcounter3..31`).
+pub const HPM_COUNTERS: usize = 29;
+
 /// The CSR state of a hart that is not derived from other state.
 #[derive(Clone, Debug)]
 pub struct Csrs {
@@ -166,12 +187,17 @@ pub struct Csrs {
     pub medeleg: u64,
     pub mideleg: u64,
     pub mie: u64,
-    /// Software-writable pending bits (SSIP, STIP without Sstc, SEIP).
+    /// Software-writable pending bits (SSIP, STIP without Sstc, SEIP, LCOFIP).
     pub mip: u64,
     pub mtvec: u64,
     pub mcounteren: u64,
     pub menvcfg: u64,
     pub mcountinhibit: u64,
+    pub mcyclecfg: u64,
+    pub minstretcfg: u64,
+    pub mhpmevent: [u64; HPM_COUNTERS],
+    pub mhpmcounter: [u64; HPM_COUNTERS],
+    pub active_hpm_mask: u32,
     pub mscratch: u64,
     pub mepc: u64,
     pub mcause: u64,
@@ -192,6 +218,23 @@ pub struct Csrs {
     pub minstret: u64,
 }
 
+impl Csrs {
+    /// Recomputes [`Self::active_hpm_mask`] from `mcountinhibit` and `mhpmevent`.
+    pub fn update_active_hpm_mask(&mut self) {
+        let mut mask = 0u32;
+        for i in 0..HPM_COUNTERS {
+            let bit = 1u32 << (i + 3);
+            let ev = self.mhpmevent[i] & hpmevent::EVENT_MASK;
+            if (self.mcountinhibit as u32) & bit == 0
+                && matches!(ev, hpmevent::EVENT_CYCLES | hpmevent::EVENT_INSTRUCTIONS)
+            {
+                mask |= bit;
+            }
+        }
+        self.active_hpm_mask = mask;
+    }
+}
+
 impl Default for Csrs {
     fn default() -> Self {
         Self {
@@ -205,6 +248,11 @@ impl Default for Csrs {
             mcounteren: 0,
             menvcfg: envcfg::CBIE_MASK | envcfg::CBCFE | envcfg::CBZE | envcfg::PBMTE,
             mcountinhibit: 0,
+            mcyclecfg: 0,
+            minstretcfg: 0,
+            mhpmevent: [0; HPM_COUNTERS],
+            mhpmcounter: [0; HPM_COUNTERS],
+            active_hpm_mask: 0,
             mscratch: 0,
             mepc: 0,
             mcause: 0,

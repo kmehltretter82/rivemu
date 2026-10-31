@@ -159,6 +159,8 @@ pub struct Hart {
     yield_slice: bool,
     /// The current instruction wrote `minstret` (suppresses its increment).
     instret_written: bool,
+    /// Bitmask of `mhpmcounter3..31` written by the current instruction.
+    hpm_written_mask: u32,
     /// Active `-d` flags (`0` when logging is disabled).
     pub(crate) log_flags: LogFlags,
     pub(crate) logger: Option<Arc<Logger>>,
@@ -229,6 +231,7 @@ impl Hart {
             check_irq: true,
             yield_slice: false,
             instret_written: false,
+            hpm_written_mask: 0,
             log_flags: LogFlags::default(),
             logger: None,
             breakpoints: Vec::new(),
@@ -393,15 +396,61 @@ impl Hart {
         if self.log_flags.has(LogFlags::EXEC | LogFlags::CPU) {
             self.log_exec_cpu();
         }
+        self.instret_written = false;
+        self.hpm_written_mask = 0;
         let result = self.fetch(bus).and_then(|insn| self.execute(bus, &insn));
         match result {
             Ok(()) => {
                 // An explicit write to minstret suppresses that instruction's increment.
-                if self.csr.mcountinhibit & 4 == 0 && !std::mem::take(&mut self.instret_written) {
+                if self.csr.mcountinhibit & 4 == 0
+                    && !self.mode_inhibited(self.csr.minstretcfg)
+                    && !std::mem::take(&mut self.instret_written)
+                {
                     self.csr.minstret = self.csr.minstret.wrapping_add(1);
                 }
+                if self.csr.active_hpm_mask != 0 {
+                    self.step_hpm_counters();
+                } else {
+                    self.hpm_written_mask = 0;
+                }
             }
-            Err(e) => self.trap(e.cause, false, e.tval),
+            Err(e) => {
+                self.instret_written = false;
+                self.hpm_written_mask = 0;
+                self.trap(e.cause, false, e.tval);
+            }
+        }
+    }
+
+    #[inline]
+    fn mode_inhibited(&self, cfg: u64) -> bool {
+        let bit = match self.prv {
+            Priv::Machine => csr::hpmevent::MINH,
+            Priv::Supervisor => csr::hpmevent::SINH,
+            Priv::User => csr::hpmevent::UINH,
+        };
+        cfg & bit != 0
+    }
+
+    #[cold]
+    fn step_hpm_counters(&mut self) {
+        let written = std::mem::take(&mut self.hpm_written_mask);
+        let mut mask = self.csr.active_hpm_mask & !written;
+        while mask != 0 {
+            let idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let i = idx - 3;
+            let ev = self.csr.mhpmevent[i];
+            if self.mode_inhibited(ev) {
+                continue;
+            }
+            let (next, overflowed) = self.csr.mhpmcounter[i].overflowing_add(1);
+            self.csr.mhpmcounter[i] = next;
+            if overflowed && ev & csr::hpmevent::OF == 0 {
+                self.csr.mhpmevent[i] |= csr::hpmevent::OF;
+                self.csr.mip |= irq::LCOFIP;
+                self.check_irq = true;
+            }
         }
     }
 
@@ -1233,8 +1282,23 @@ impl Hart {
                 match num {
                     csr::CYCLE | csr::INSTRET => c.minstret,
                     csr::TIME => self.timebase.now(),
-                    _ => 0,
+                    _ => c.mhpmcounter[(num - csr::HPMCOUNTER3) as usize],
                 }
+            }
+            csr::SCOUNTOVF => {
+                let mut ovf = 0u64;
+                let en = if self.prv == Priv::Machine {
+                    u64::MAX
+                } else {
+                    c.mcounteren
+                };
+                for i in 0..csr::HPM_COUNTERS {
+                    let bit = 1u64 << (i + 3);
+                    if en & bit != 0 && c.mhpmevent[i] & csr::hpmevent::OF != 0 {
+                        ovf |= bit;
+                    }
+                }
+                ovf
             }
             csr::SSTATUS => self.read_mstatus() & status::S_READABLE,
             csr::SIE => c.mie & c.mideleg,
@@ -1269,7 +1333,11 @@ impl Hart {
             csr::MCOUNTEREN => c.mcounteren,
             csr::MENVCFG => c.menvcfg,
             csr::MCOUNTINHIBIT => c.mcountinhibit,
-            csr::MHPMEVENT3..=csr::MHPMEVENT31 => 0,
+            csr::MCYCLECFG => c.mcyclecfg,
+            csr::MINSTRETCFG => c.minstretcfg,
+            csr::MHPMEVENT3..=csr::MHPMEVENT31 => {
+                c.mhpmevent[(num - csr::MHPMEVENT3) as usize]
+            }
             csr::MSCRATCH => c.mscratch,
             csr::MEPC => c.mepc,
             csr::MCAUSE => c.mcause,
@@ -1295,7 +1363,9 @@ impl Hart {
             }
             csr::TSELECT..=csr::TDATA3 | csr::TINFO => 0,
             csr::MCYCLE | csr::MINSTRET => c.minstret,
-            csr::MHPMCOUNTER3..=csr::MHPMCOUNTER31 => 0,
+            csr::MHPMCOUNTER3..=csr::MHPMCOUNTER31 => {
+                c.mhpmcounter[(num - csr::MHPMCOUNTER3) as usize]
+            }
             _ => return None,
         })
     }
@@ -1356,7 +1426,7 @@ impl Hart {
             csr::SCAUSE => self.csr.scause = v,
             csr::STVAL => self.csr.stval = v,
             csr::SIP => {
-                let m = self.csr.mideleg & irq::SSIP;
+                let m = self.csr.mideleg & (irq::SSIP | irq::LCOFIP);
                 self.csr.mip = (self.csr.mip & !m) | (v & m);
             }
             csr::STIMECMP => {
@@ -1407,14 +1477,23 @@ impl Hart {
                 self.csr.menvcfg = envcfg::sanitize(v, envcfg::M_MASK);
                 self.flush_tlb();
             }
-            csr::MCOUNTINHIBIT => self.csr.mcountinhibit = v & 0xffff_fffd,
-            csr::MHPMEVENT3..=csr::MHPMEVENT31 => {}
+            csr::MCOUNTINHIBIT => {
+                self.csr.mcountinhibit = v & 0xffff_fffd;
+                self.csr.update_active_hpm_mask();
+            }
+            csr::MCYCLECFG => self.csr.mcyclecfg = v & csr::hpmevent::FILTER_MASK,
+            csr::MINSTRETCFG => self.csr.minstretcfg = v & csr::hpmevent::FILTER_MASK,
+            csr::MHPMEVENT3..=csr::MHPMEVENT31 => {
+                let i = (num - csr::MHPMEVENT3) as usize;
+                self.csr.mhpmevent[i] = v & csr::hpmevent::MHPMEVENT_MASK;
+                self.csr.update_active_hpm_mask();
+            }
             csr::MSCRATCH => self.csr.mscratch = v,
             csr::MEPC => self.csr.mepc = v & !1,
             csr::MCAUSE => self.csr.mcause = v,
             csr::MTVAL => self.csr.mtval = v,
             csr::MIP => {
-                let mut m = irq::SSIP | irq::SEIP;
+                let mut m = irq::SSIP | irq::SEIP | irq::LCOFIP;
                 if self.csr.menvcfg & envcfg::STCE == 0 {
                     m |= irq::STIP;
                 }
@@ -1455,7 +1534,11 @@ impl Hart {
                 self.csr.minstret = v;
                 self.instret_written = true;
             }
-            csr::MHPMCOUNTER3..=csr::MHPMCOUNTER31 => {}
+            csr::MHPMCOUNTER3..=csr::MHPMCOUNTER31 => {
+                let i = (num - csr::MHPMCOUNTER3) as usize;
+                self.csr.mhpmcounter[i] = v;
+                self.hpm_written_mask |= 1u32 << (i + 3);
+            }
             _ => return None,
         }
         Some(())
