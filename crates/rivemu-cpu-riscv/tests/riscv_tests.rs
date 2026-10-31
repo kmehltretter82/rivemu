@@ -2194,4 +2194,83 @@ fn scalar_crypto_zbkb_zbkc_zbkx_zknd_zkne_zknh_semantics() {
     assert_ne!(h.x[28], 0);
 }
 
+#[test]
+fn decoded_basic_block_cache_execution_and_mid_block_trap_accuracy() {
+    use rivemu_cpu_riscv::{cause, csr};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    const CODE: u64 = 0x8000_0000;
+    const MTVEC: u64 = 0x8000_1000;
+
+    // Basic block loop at CODE:
+    //   0x00: addi x10, x10, 3       (0x0035_0513)
+    //   0x04: addi x11, x11, -1      (0xfff5_8593)
+    //   0x08: bne  x11, x0, -8       (0xfe05_9ce3)
+    //   0x0c: wfi                    (0x1050_0073)
+    let loop_insns: &[u32] = &[0x0035_0513, 0xfff5_8593, 0xfe05_9ce3, 0x1050_0073];
+    for (i, &w) in loop_insns.iter().enumerate() {
+        bus.write(CODE + (i as u64) * 4, AccessSize::Word, u64::from(w))
+            .unwrap();
+    }
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr_write(csr::MTVEC, MTVEC).unwrap();
+    h.x[10] = 0;
+    h.x[11] = 10;
+
+    // 10 iterations * 3 insns + 1 wfi = 31 retired instructions:
+    let attempted = h.run(&bus, 100);
+    assert_eq!(attempted, 31);
+    assert_eq!(h.x[10], 30);
+    assert_eq!(h.x[11], 0);
+    assert_eq!(h.instret(), 31);
+    assert!(h.wfi);
+
+    // Patch 0x00 to `addi x10, x10, 7` (0x0075_0513) and flush icache/bbcache via fence.i:
+    bus.write(CODE, AccessSize::Word, 0x0075_0513).unwrap();
+    bus.write(CODE + 0x20, AccessSize::Word, 0x0000_100f)
+        .unwrap(); // fence.i
+    h.wfi = false;
+    h.pc = CODE + 0x20;
+    h.step(&bus); // executes fence.i, bumping icache_gen and invalidating bbcache
+    h.pc = CODE;
+    h.x[10] = 0;
+    h.x[11] = 5;
+    let attempted2 = h.run(&bus, 100);
+    assert_eq!(attempted2, 16); // 5 * 3 + 1 wfi
+    assert_eq!(h.x[10], 35);
+
+    // Mid-block trap accuracy:
+    //   0x100: addi x12, x0, 11      (0x00b0_0613)
+    //   0x104: addi x13, x0, 22      (0x0160_0693)
+    //   0x108: ld   x14, 0(x15)      (0x0007_b703) -> faults on unmapped x15 = 0xdead_0000
+    //   0x10c: addi x12, x0, 99      (0x0630_0613) -> must not execute!
+    //   MTVEC: wfi                   (0x1050_0073)
+    let trap_block: &[u32] = &[0x00b0_0613, 0x0160_0693, 0x0007_b703, 0x0630_0613];
+    for (i, &w) in trap_block.iter().enumerate() {
+        bus.write(CODE + 0x100 + (i as u64) * 4, AccessSize::Word, u64::from(w))
+            .unwrap();
+    }
+    bus.write(MTVEC, AccessSize::Word, 0x1050_0073).unwrap();
+
+    h.wfi = false;
+    h.pc = CODE + 0x100;
+    h.x[15] = 0xdead_0000;
+    let instret_before = h.instret();
+    let attempted3 = h.run(&bus, 100);
+    // 2 instructions retired + 1 faulting ld + 1 wfi at MTVEC = 4 attempted, 3 retired:
+    assert_eq!(attempted3, 4);
+    assert_eq!(h.instret() - instret_before, 3);
+    assert_eq!(h.x[12], 11);
+    assert_eq!(h.x[13], 22);
+    assert_eq!(h.csr.mcause, cause::LOAD_ACCESS);
+    assert_eq!(h.csr.mepc, CODE + 0x108);
+    assert_eq!(h.csr.mtval, 0xdead_0000);
+}
+
+
 

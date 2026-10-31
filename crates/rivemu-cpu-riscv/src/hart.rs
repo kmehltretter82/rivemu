@@ -101,6 +101,66 @@ impl HartIrqs {
 }
 
 const ICACHE_SIZE: usize = 8192;
+const BBCACHE_SIZE: usize = 1024;
+const BB_MAX_INSNS: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BbOpKind {
+    Seq,
+    Term,
+    Abort,
+}
+
+#[inline]
+const fn bb_op_kind(op: Op) -> BbOpKind {
+    match op {
+        Op::Illegal
+        | Op::Fence
+        | Op::FenceI
+        | Op::Ecall
+        | Op::Ebreak
+        | Op::Csrrw
+        | Op::Csrrs
+        | Op::Csrrc
+        | Op::Csrrwi
+        | Op::Csrrsi
+        | Op::Csrrci
+        | Op::Mret
+        | Op::Sret
+        | Op::Wfi
+        | Op::WrsNto
+        | Op::WrsSto
+        | Op::SfenceVma
+        | Op::SinvalVma
+        | Op::SfenceWInval
+        | Op::SfenceInvalIr
+        | Op::CboInval => BbOpKind::Abort,
+        Op::Jal | Op::Jalr | Op::Beq | Op::Bne | Op::Blt | Op::Bge | Op::Bltu | Op::Bgeu => {
+            BbOpKind::Term
+        }
+        _ => BbOpKind::Seq,
+    }
+}
+
+/// Decoded basic-block cache entry indexed by `(pa >> 1) & (BBCACHE_SIZE - 1)`.
+#[derive(Clone, Copy, Debug)]
+struct BbCacheEntry {
+    /// `(pa << 16) | icache_gen` (0 means invalid).
+    tag: u64,
+    /// Number of valid decoded instructions in `insns` (`0..=BB_MAX_INSNS`).
+    len: u8,
+    insns: [Insn; BB_MAX_INSNS],
+}
+
+impl Default for BbCacheEntry {
+    fn default() -> Self {
+        Self {
+            tag: 0,
+            len: 0,
+            insns: [Insn::ILLEGAL; BB_MAX_INSNS],
+        }
+    }
+}
 
 /// Macro-op fusion descriptor cached alongside the first instruction in [`IcacheEntry`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -216,6 +276,7 @@ pub struct Hart {
     reservation: Option<Reservation>,
     pub(crate) tlb: Tlb,
     icache: Box<[IcacheEntry; ICACHE_SIZE]>,
+    bbcache: Box<[BbCacheEntry; BBCACHE_SIZE]>,
     icache_gen: u16,
     /// Cached instruction-fetch page: `(pc >> 12) + 1` (0 = invalid).
     fetch_vpn: u64,
@@ -295,6 +356,7 @@ impl Hart {
             reservation: None,
             tlb: Tlb::default(),
             icache: Box::new([IcacheEntry::default(); ICACHE_SIZE]),
+            bbcache: Box::new([BbCacheEntry::default(); BBCACHE_SIZE]),
             icache_gen: 1,
             fetch_vpn: 0,
             fetch_pa_page: 0,
@@ -403,6 +465,7 @@ impl Hart {
         self.icache_gen = self.icache_gen.wrapping_add(1);
         if self.icache_gen == 0 {
             self.icache.fill(IcacheEntry::default());
+            self.bbcache.fill(BbCacheEntry::default());
             self.icache_gen = 1;
         }
     }
@@ -457,10 +520,19 @@ impl Hart {
                 && !self.pmp_subpage
                 && self.log_flags.is_empty()
                 && self.csr.active_hpm_mask == 0
-                && self.try_step_fused(bus)
             {
-                n += 2;
-                continue;
+                if self.try_step_fused(bus) {
+                    n += 2;
+                    continue;
+                }
+                let bb_steps = self.try_step_bb(bus, budget - n);
+                if bb_steps > 0 {
+                    n += bb_steps;
+                    if self.wfi || self.yield_slice {
+                        break;
+                    }
+                    continue;
+                }
             }
             self.step(bus);
             n += 1;
@@ -480,6 +552,109 @@ impl Hart {
         if self.csr.mcountinhibit & 4 == 0 && !self.mode_inhibited(self.csr.minstretcfg) {
             self.csr.minstret = self.csr.minstret.wrapping_add(delta);
         }
+    }
+
+    #[inline]
+    fn try_step_bb(&mut self, bus: &AddressSpace, max_insns: u64) -> u64 {
+        let pc = self.pc;
+        if pc & 0xfff > 0xffc {
+            return 0;
+        }
+        let vpn_tag = (pc >> 12) + 1;
+        let pa = if self.fetch_vpn == vpn_tag {
+            self.fetch_pa_page | (pc & 0xfff)
+        } else {
+            let Ok(pa) = self.translate(bus, pc, Access::Fetch) else {
+                return 0;
+            };
+            self.fetch_vpn = vpn_tag;
+            self.fetch_pa_page = pa & !0xfff;
+            pa
+        };
+        if pa >> 48 != 0 {
+            return 0;
+        }
+        let bb_idx = ((pa >> 1) as usize) & (BBCACHE_SIZE - 1);
+        let tag = (pa << 16) | u64::from(self.icache_gen);
+        let entry = if self.bbcache[bb_idx].tag == tag {
+            self.bbcache[bb_idx]
+        } else {
+            self.populate_bbcache_same_page(bus, pc, pa, bb_idx, tag)
+        };
+        let avail = usize::from(entry.len);
+        if avail < 2 {
+            return 0;
+        }
+        let limit = avail.min(max_insns as usize);
+        for (i, insn) in entry.insns[..limit].iter().enumerate() {
+            match self.execute(bus, insn) {
+                Ok(()) => {
+                    if self.check_irq || self.wfi || self.yield_slice {
+                        let done = (i + 1) as u64;
+                        self.bump_minstret(done);
+                        if self.check_irq {
+                            self.take_pending_interrupt();
+                        }
+                        return done;
+                    }
+                }
+                Err(e) => {
+                    let retired = i as u64;
+                    if retired > 0 {
+                        self.bump_minstret(retired);
+                    }
+                    self.instret_written = false;
+                    self.hpm_written_mask = 0;
+                    self.trap(e.cause, false, e.tval);
+                    return retired + 1;
+                }
+            }
+        }
+        let done = limit as u64;
+        self.bump_minstret(done);
+        done
+    }
+
+    #[cold]
+    fn populate_bbcache_same_page(
+        &mut self,
+        bus: &AddressSpace,
+        pc: u64,
+        pa: u64,
+        bb_idx: usize,
+        tag: u64,
+    ) -> BbCacheEntry {
+        let mut insns = [Insn::ILLEGAL; BB_MAX_INSNS];
+        let mut len = 0usize;
+        let mut cur_pc = pc;
+        let mut cur_pa = pa;
+        while len < BB_MAX_INSNS && (cur_pc & 0xfff) <= 0xffc {
+            let Ok(insn) = self.fetch_decode_same_page(bus, cur_pc, cur_pa) else {
+                break;
+            };
+            match bb_op_kind(insn.op) {
+                BbOpKind::Abort => break,
+                BbOpKind::Term => {
+                    insns[len] = insn;
+                    len += 1;
+                    break;
+                }
+                BbOpKind::Seq => {
+                    insns[len] = insn;
+                    len += 1;
+                    let step_len = u64::from(insn.len);
+                    cur_pc = cur_pc.wrapping_add(step_len);
+                    cur_pa = cur_pa.wrapping_add(step_len);
+                }
+            }
+        }
+        let entry = BbCacheEntry {
+            tag,
+            len: len as u8,
+            insns,
+        };
+        self.bbcache[bb_idx] = entry;
+        entry
     }
 
     #[inline]
