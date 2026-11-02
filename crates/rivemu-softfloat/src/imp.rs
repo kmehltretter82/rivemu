@@ -549,11 +549,7 @@ pub(crate) fn min_max_m<F: Format>(a: u64, b: u64, fl: &mut Flags, max: bool) ->
     if x.is_nan() || y.is_nan() {
         return propagate_nan::<F>(x.is_snan() || y.is_snan(), fl);
     }
-    if total_lt::<F>(a, b) != max {
-        a
-    } else {
-        b
-    }
+    if total_lt::<F>(a, b) != max { a } else { b }
 }
 
 /// Zfa `fround` (`exact = false`) and `froundnx` (`exact = true`).

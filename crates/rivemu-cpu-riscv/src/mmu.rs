@@ -232,9 +232,7 @@ impl Hart {
         let ok = match acc {
             Access::Fetch => !is_ss_pte && (flags & pte::X != 0),
             Access::Load => {
-                is_ss_pte
-                    || (flags & pte::R != 0)
-                    || (s & status::MXR != 0 && flags & pte::X != 0)
+                is_ss_pte || (flags & pte::R != 0) || (s & status::MXR != 0 && flags & pte::X != 0)
             }
             Access::Store => !is_ss_pte && (flags & pte::W != 0),
             Access::CacheBom => {
@@ -349,9 +347,8 @@ impl Hart {
                     return false;
                 }
                 let rwx = if mml {
-                    let idx =
-                        (((cfg >> 4) & 8) | ((cfg & 1) << 2) | (cfg & 2) | ((cfg >> 2) & 1))
-                            as usize;
+                    let idx = (((cfg >> 4) & 8) | ((cfg & 1) << 2) | (cfg & 2) | ((cfg >> 2) & 1))
+                        as usize;
                     if prv == Priv::Machine {
                         MML_M_PERMS[idx]
                     } else {

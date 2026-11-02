@@ -312,6 +312,8 @@ pub struct Hart {
     pub pending_semihost: bool,
     /// Whether the hart is parked in the SBI HSM `STOPPED` state.
     pub hsm_stopped: bool,
+    /// Per-hart SBI FWFT locks: bit 0 for landing pads, bit 1 for shadow stacks.
+    pub fwft_locks: u8,
     /// Trap on any unaligned scalar load or store (`LOAD_MISALIGNED` / `STORE_MISALIGNED`).
     pub strict_align: bool,
     /// Enforce `Svade` page-table rules (page fault when `pte.A == 0` or `pte.D == 0` on store).
@@ -382,6 +384,7 @@ impl Hart {
             pending_sbi: false,
             pending_semihost: false,
             hsm_stopped: false,
+            fwft_locks: 0,
             strict_align: false,
             svade: false,
             strict_pmp: false,
@@ -412,6 +415,7 @@ impl Hart {
         self.pending_sbi = false;
         self.pending_semihost = false;
         self.hsm_stopped = false;
+        self.fwft_locks = 0;
         self.elp = false;
         self.update_pmp_state();
     }
@@ -424,18 +428,32 @@ impl Hart {
         self.x[10] = self.id;
         self.x[11] = opaque;
         self.csr.mstatus = (2 << 32) | (2 << 34);
-        self.csr.medeleg = 0xb1ff;
+        self.csr.medeleg = 0xb1ff | (1 << cause::SW_CHECK);
         self.csr.mideleg = irq::S_MASK;
         self.csr.mcounteren = 0xffff_ffff;
         self.csr.scounteren = 0xffff_ffff;
         self.csr.menvcfg =
             envcfg::STCE | envcfg::PBMTE | envcfg::CBIE_MASK | envcfg::CBCFE | envcfg::CBZE;
         self.csr.senvcfg = envcfg::CBIE_MASK | envcfg::CBCFE | envcfg::CBZE;
+        self.csr.mseccfg = csr::mseccfg::SSEED;
         self.csr.pmpaddr[0] = (1 << 54) - 1;
         self.csr.pmpcfg[0] = 0x1f;
         self.update_pmp_state();
         self.handle_sbi = true;
         self.hsm_stopped = false;
+    }
+
+    /// Resumes an S-mode hart after a non-retentive SBI HSM suspend.
+    ///
+    /// Architectural state is reset as for a fresh S-mode entry, but local
+    /// firmware-feature values and their locks last until hart reset and must
+    /// therefore survive a non-retentive suspend.
+    pub fn resume_smode_nonretentive(&mut self, entry: u64, opaque: u64) {
+        let fwft_values = self.csr.menvcfg & (envcfg::LPE | envcfg::SSE);
+        let fwft_locks = self.fwft_locks;
+        self.init_smode_boot(entry, opaque);
+        self.csr.menvcfg |= fwft_values;
+        self.fwft_locks = fwft_locks;
     }
 
     /// Flushes the per-hart TLB (e.g. on remote `sfence.vma`).
@@ -641,7 +659,7 @@ impl Hart {
         let mut len = 0usize;
         let mut cur_pc = pc;
         let mut cur_pa = pa;
-        while len < BB_MAX_INSNS && (cur_pc & 0xfff) <= 0xffc {
+        while len < BB_MAX_INSNS && cur_pc >> 12 == pc >> 12 && (cur_pc & 0xfff) <= 0xffc {
             let Ok(insn) = self.fetch_decode_same_page(bus, cur_pc, cur_pa) else {
                 break;
             };
@@ -712,8 +730,7 @@ impl Hart {
                 self.bump_minstret(2);
                 true
             }
-            FusedOp::LuiAddi { rd, total_len, imm }
-            | FusedOp::LuiAddiw { rd, total_len, imm } => {
+            FusedOp::LuiAddi { rd, total_len, imm } | FusedOp::LuiAddiw { rd, total_len, imm } => {
                 self.x[rd as usize] = imm;
                 self.pc = pc.wrapping_add(u64::from(total_len));
                 self.bump_minstret(2);
@@ -843,8 +860,8 @@ impl Hart {
             let count = (t1 & csr::trig::ICOUNT_COUNT_MASK) >> csr::trig::ICOUNT_COUNT_SHIFT;
             if count > 0 {
                 let next_count = count - 1;
-                let mut next_t1 =
-                    (t1 & !csr::trig::ICOUNT_COUNT_MASK) | (next_count << csr::trig::ICOUNT_COUNT_SHIFT);
+                let mut next_t1 = (t1 & !csr::trig::ICOUNT_COUNT_MASK)
+                    | (next_count << csr::trig::ICOUNT_COUNT_SHIFT);
                 if next_count == 0 {
                     next_t1 |= csr::trig::ICOUNT_PENDING;
                 }
@@ -1073,7 +1090,12 @@ impl Hart {
         let dte = self.csr.menvcfg & envcfg::DTE != 0;
         let s_double_trap = delegated_to_s && dte && (self.csr.mstatus & status::SDT) != 0;
         let (code, interrupt, tval, to_s) = if s_double_trap {
-            (cause::DOUBLE_TRAP, false, if interrupt { 0 } else { tval }, false)
+            (
+                cause::DOUBLE_TRAP,
+                false,
+                if interrupt { 0 } else { tval },
+                false,
+            )
         } else {
             (code, interrupt, tval, delegated_to_s)
         };
@@ -1255,10 +1277,10 @@ impl Hart {
         }
         let (pa, ram_page_off) = self.translate_with_ram_off(bus, va, Access::Load)?;
         self.check_pmp_access(va, pa, n, Access::Load)?;
-        if ram_page_off != u64::MAX
-            && let Some(v) = bus.read_fast_ram(ram_page_off | (pa & 0xfff), size)
-        {
-            return Ok(v);
+        if ram_page_off != u64::MAX {
+            if let Some(v) = bus.read_fast_ram(ram_page_off | (pa & 0xfff), size) {
+                return Ok(v);
+            }
         }
         bus.read(pa, size).map_err(|e| {
             if self.log_flags.has(LogFlags::GUEST_ERRORS) {
@@ -1660,10 +1682,16 @@ impl Hart {
                 self.set_x(rd, sext32(u64::from(v)));
             }
             Op::Sha512sum0 => {
-                self.set_x(rd, rs1.rotate_right(28) ^ rs1.rotate_right(34) ^ rs1.rotate_right(39));
+                self.set_x(
+                    rd,
+                    rs1.rotate_right(28) ^ rs1.rotate_right(34) ^ rs1.rotate_right(39),
+                );
             }
             Op::Sha512sum1 => {
-                self.set_x(rd, rs1.rotate_right(14) ^ rs1.rotate_right(18) ^ rs1.rotate_right(41));
+                self.set_x(
+                    rd,
+                    rs1.rotate_right(14) ^ rs1.rotate_right(18) ^ rs1.rotate_right(41),
+                );
             }
             Op::Sha512sig0 => {
                 self.set_x(rd, rs1.rotate_right(1) ^ rs1.rotate_right(8) ^ (rs1 >> 7));
@@ -1676,12 +1704,8 @@ impl Hart {
             Op::Sm4ed => {
                 let shamt = ((insn.imm as u32) & 3) * 8;
                 let x = u32::from(SM4_SBOX[((rs2 >> shamt) & 0xff) as usize]);
-                let t = x
-                    ^ (x << 8)
-                    ^ (x << 2)
-                    ^ (x << 18)
-                    ^ ((x & 0x3f) << 26)
-                    ^ ((x & 0xc0) << 10);
+                let t =
+                    x ^ (x << 8) ^ (x << 2) ^ (x << 18) ^ ((x & 0x3f) << 26) ^ ((x & 0xc0) << 10);
                 let z = t.rotate_left(shamt);
                 self.set_x(rd, sext32(u64::from(z ^ (rs1 as u32))));
             }
@@ -2368,9 +2392,7 @@ impl Hart {
             csr::MCOUNTINHIBIT => c.mcountinhibit,
             csr::MCYCLECFG => c.mcyclecfg,
             csr::MINSTRETCFG => c.minstretcfg,
-            csr::MHPMEVENT3..=csr::MHPMEVENT31 => {
-                c.mhpmevent[(num - csr::MHPMEVENT3) as usize]
-            }
+            csr::MHPMEVENT3..=csr::MHPMEVENT31 => c.mhpmevent[(num - csr::MHPMEVENT3) as usize],
             csr::MSCRATCH => c.mscratch,
             csr::MEPC => c.mepc,
             csr::MCAUSE => c.mcause,
@@ -2555,7 +2577,8 @@ impl Hart {
                 self.csr.srmcfg = v & csr::SRMCFG_MASK;
             }
             csr::SCONTEXT => {
-                if self.prv != Priv::Machine && (self.csr.mstateen[0] & csr::stateen::CONTEXT) == 0 {
+                if self.prv != Priv::Machine && (self.csr.mstateen[0] & csr::stateen::CONTEXT) == 0
+                {
                     return None;
                 }
                 self.csr.scontext = v & 0xffff_ffff;
@@ -2763,16 +2786,18 @@ impl Hart {
         Some(())
     }
 
-    /// Handles hart-local SBI calls (`BASE` and `TIME`) inline without leaving
-    /// the inner execution loop. Returns `false` if the call requires
+    /// Handles hart-local SBI calls (`BASE`, `TIME`, and `FWFT`) inline without
+    /// leaving the inner execution loop. Returns `false` if the call requires
     /// machine-wide servicing (`IPI`, `RFENCE`, `HSM`, `SRST`, `DBCN`).
     fn try_local_sbi(&mut self) -> bool {
         let eid = self.x[17];
         let fid = self.x[16];
         let a0 = self.x[10];
+        let a1 = self.x[11];
+        let a2 = self.x[12];
         let (err, val): (i64, u64) = match (eid, fid) {
             // Base extension (0x10).
-            (0x10, 0) => (0, 2 << 24), // SBI spec v2.0
+            (0x10, 0) => (0, 3 << 24), // SBI spec v3.0
             (0x10, 1) => (0, 4),       // Implementation ID (RustSBI / rivemu-sbi)
             (0x10, 2) => (0, 0x0001_0000),
             (0x10, 3) => {
@@ -2784,6 +2809,7 @@ impl Hart {
                         | 0x0048_534d
                         | 0x5352_5354
                         | 0x4442_434e
+                        | 0x4657_4654
                 );
                 (0, u64::from(supported))
             }
@@ -2797,12 +2823,53 @@ impl Hart {
                 (0, 0)
             }
             (0x5449_4d45, _) => (-2, 0),
+            // Firmware Features extension ("FWFT" = 0x46574654).
+            (0x4657_4654, 0) => match a0 {
+                // SBI_FWFT_LANDING_PAD (1) / SBI_FWFT_SHADOW_STACK (2).
+                1 | 2 => {
+                    let (bit, lock) = if a0 == 1 {
+                        (envcfg::LPE, 1)
+                    } else {
+                        (envcfg::SSE, 2)
+                    };
+                    if a1 > 1 || a2 & !1 != 0 {
+                        (-3, 0) // SBI_ERR_INVALID_PARAM
+                    } else if self.fwft_locks & lock != 0
+                        && (self.csr.menvcfg & bit != 0) != (a1 != 0)
+                    {
+                        (-14, 0) // SBI_ERR_DENIED_LOCKED
+                    } else {
+                        if a1 == 1 {
+                            self.csr.menvcfg |= bit;
+                        } else {
+                            self.csr.menvcfg &= !bit;
+                            if a0 == 2 {
+                                self.csr.senvcfg &= !envcfg::SSE;
+                            }
+                        }
+                        if a2 & 1 != 0 {
+                            self.fwft_locks |= lock;
+                        }
+                        self.flush_tlb();
+                        (0, 0)
+                    }
+                }
+                0 | 3..=5 => (-2, 0), // SBI_ERR_NOT_SUPPORTED
+                _ => (-4, 0),         // SBI_ERR_DENIED for reserved features
+            },
+            (0x4657_4654, 1) => match a0 {
+                1 => (0, u64::from(self.csr.menvcfg & envcfg::LPE != 0)),
+                2 => (0, u64::from(self.csr.menvcfg & envcfg::SSE != 0)),
+                0 | 3..=5 => (-2, 0),
+                _ => (-4, 0),
+            },
+            (0x4657_4654, _) => (-2, 0),
             _ => return false,
         };
         self.x[10] = err as u64;
         self.x[11] = val;
         if self.log_flags.has(LogFlags::SBI) {
-            self.log_sbi(eid, fid, a0, self.x[11], err as u64, val);
+            self.log_sbi(eid, fid, a0, a1, err as u64, val);
         }
         true
     }

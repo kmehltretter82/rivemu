@@ -32,7 +32,7 @@ impl Machine {
                 | (u8::from(h.handle_sbi) << 3)
                 | (u8::from(h.hsm_stopped) << 4)
                 | (u8::from(h.elp) << 5);
-            w.write_all(&[flags, h.csr.fflags as u8, h.csr.frm as u8, 0])?;
+            w.write_all(&[flags, h.csr.fflags as u8, h.csr.frm as u8, h.fwft_locks])?;
             for &r in &h.x {
                 write_u64(&mut w, r)?;
             }
@@ -257,6 +257,7 @@ impl Machine {
             h.elp = hdr[0] & (1 << 5) != 0;
             h.csr.fflags = u64::from(hdr[1]);
             h.csr.frm = u64::from(hdr[2]);
+            h.fwft_locks = hdr[3] & 3;
             for reg in &mut h.x {
                 *reg = read_u64(&mut r)?;
             }

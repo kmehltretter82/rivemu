@@ -3,7 +3,9 @@
 //!
 //! Uses artifacts from `images/linux-test/` (created by
 //! `scripts/fetch-linux-test.sh`). Enabled when `RIVEMU_LINUX_TEST` or
-//! `RIVEMU_REQUIRE_LINUX_TEST` is set.
+//! `RIVEMU_REQUIRE_LINUX_TEST` is set. Set `RIVEMU_LINUX_TEST_KERNEL` to
+//! validate another kernel and `RIVEMU_REQUIRE_9P` to require the optional
+//! guest 9p mount/read/write assertions.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -22,6 +24,12 @@ fn image_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../images/linux-test")
 }
 
+fn linux_kernel() -> PathBuf {
+    std::env::var_os("RIVEMU_LINUX_TEST_KERNEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| image_dir().join("Image"))
+}
+
 fn run_linux_boot_test(use_external_opensbi: bool) {
     let _guard = LINUX_BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let required = std::env::var_os("RIVEMU_REQUIRE_LINUX_TEST").is_some();
@@ -33,7 +41,7 @@ fn run_linux_boot_test(use_external_opensbi: bool) {
 
     let dir = image_dir();
     let bios_path = dir.join("fw_dynamic.bin");
-    let kernel = dir.join("Image");
+    let kernel = linux_kernel();
     let initrd = dir.join("rootfs.cpio");
     let required_files: Vec<&PathBuf> = if use_external_opensbi {
         vec![&bios_path, &kernel, &initrd]
@@ -146,6 +154,7 @@ echo VCONSOLE_OK > /dev/hvc0 2>/dev/null || true\n\
 
     let bytes = machine.uart.take_output();
     console_out.push_str(&String::from_utf8_lossy(&bytes));
+    let vconsole_out = String::from_utf8_lossy(&vconsole.take_output()).into_owned();
     let elapsed = start.elapsed();
     eprintln!(
         "Linux + VirtIO smoke test completed in {:.2}s ({} instructions)",
@@ -196,6 +205,10 @@ echo VCONSOLE_OK > /dev/hvc0 2>/dev/null || true\n\
         console_out.contains("1 packets received"),
         "expected virtio-net ping reply from 10.0.2.2 in console:\n{console_out}"
     );
+    assert!(
+        vconsole_out.contains("VCONSOLE_OK"),
+        "expected guest output on the host virtio-console backend, got:\n{vconsole_out}"
+    );
     let mut sector1 = [0u8; 15];
     disk.read_at(512, &mut sector1).unwrap();
     assert_eq!(
@@ -220,16 +233,17 @@ fn boots_linux_with_builtin_rust_sbi_no_firmware() {
 }
 
 #[test]
-fn rust_userspace_init_and_virtio_9p_on_linux() {
+fn rust_userspace_init_and_optional_virtio_9p_on_linux() {
     let _guard = LINUX_BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let required = std::env::var_os("RIVEMU_REQUIRE_LINUX_TEST").is_some();
+    let require_9p = std::env::var_os("RIVEMU_REQUIRE_9P").is_some();
+    let required = require_9p || std::env::var_os("RIVEMU_REQUIRE_LINUX_TEST").is_some();
     let enabled = required || std::env::var_os("RIVEMU_LINUX_TEST").is_some();
     if !enabled {
-        eprintln!("skipping Rust PID 1 + virtio-9p test (set RIVEMU_LINUX_TEST=1 to run)");
+        eprintln!("skipping Rust PID 1 + optional virtio-9p test (set RIVEMU_LINUX_TEST=1 to run)");
         return;
     }
 
-    let kernel = image_dir().join("Image");
+    let kernel = linux_kernel();
     if !kernel.is_file() {
         assert!(!required, "missing {}", kernel.display());
         return;
@@ -390,11 +404,16 @@ fn main() {
 
     let Ok(st) = status else {
         let _ = std::fs::remove_dir_all(&tmp_dir);
+        assert!(!require_9p, "rustc is required by RIVEMU_REQUIRE_9P");
         eprintln!("skipping: rustc not available");
         return;
     };
     if !st.success() {
         let _ = std::fs::remove_dir_all(&tmp_dir);
+        assert!(
+            !require_9p,
+            "riscv64gc-unknown-linux-musl is required by RIVEMU_REQUIRE_9P"
+        );
         eprintln!("skipping: riscv64gc-unknown-linux-musl target not installed");
         return;
     }
@@ -454,7 +473,7 @@ fn main() {
     let bytes = machine.uart.take_output();
     console_out.push_str(&String::from_utf8_lossy(&bytes));
     eprintln!(
-        "Rust PID 1 + virtio-9p test completed in {:.2}s:\n{}",
+        "Rust PID 1 + optional virtio-9p test completed in {:.2}s:\n{}",
         start.elapsed().as_secs_f64(),
         console_out
             .lines()
@@ -482,11 +501,17 @@ fn main() {
         "{console_out}"
     );
     assert!(console_out.contains("RUST_CBO_ZERO=OK"), "{console_out}");
-    if console_out.contains("RUST_9P_READ=") {
+    let exercised_9p = console_out.contains("RUST_9P_READ=");
+    if require_9p || exercised_9p {
         assert!(
             console_out.contains("RUST_9P_READ=HOST_9P_PAYLOAD_42"),
             "{console_out}"
         );
         assert_eq!(guest_reply.as_deref(), Some("WRITTEN_BY_RUST_INIT_OVER_9P"));
+    } else {
+        eprintln!(
+            "virtio-9p guest coverage was not exercised; use a 9p-capable kernel and set \
+             RIVEMU_REQUIRE_9P=1"
+        );
     }
 }

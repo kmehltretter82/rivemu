@@ -1,5 +1,9 @@
 # Plan: `rivemu` – a limited, pure-Rust QEMU successor (emulation only)
 
+> Implementation checkboxes and exit evidence are tracked separately. See
+> [`VALIDATION_STATUS.md`](VALIDATION_STATUS.md) for the current verification
+> matrix and outstanding work.
+
 ## 1. Locked Decisions
 
 | Area | Decision |
@@ -58,7 +62,7 @@ rivemu/ (github.com/kmehltretter82/rivemu)
 - **Decoded-block cache:** guest code is decoded once into blocks of pre-decoded instructions (`enum Insn` with operand fields resolved, or a `fn` pointer + packed operands). Keyed by guest physical PC + privilege mode; ends at branches, CSR writes affecting translation, or page boundary.
 - **Fast dispatch:** tight `match` over a compact op enum (Rust compiles to a jump table); hot paths like `addi`, loads/stores and branches get special-cased variants (e.g. `addi rd, x0, imm` → `Li`).
 - **SoftTLB:** per-hart direct-mapped TLB (separate read/write/exec), entry stores host pointer offset → RAM access is one compare + one load. MMIO and misses take the slow path.
-- **Self-modifying code:** code pages tracked in a bitmap; a store to a tracked page invalidates its blocks; `fence.i` / `sfence.vma` flush as required.
+- **Self-modifying code:** decoded caches are generation-tagged and invalidated by guest `fence.i` and SBI remote-fence handling; stores rely on the guest's architectural instruction-stream synchronization.
 - **Interrupt checks** only at block boundaries (plus pending-flag on `wfi`/CSR writes).
 - **Timekeeping:** `mtime` derived from host monotonic clock (default) or instruction count (`-icount` deterministic mode, useful for tests).
 

@@ -917,7 +917,10 @@ mod tests {
         // Slot 1 ECAM offset = 1 << 15: Vendor 0x1b36, Device 0x0010, Class 0x010802
         let slot1_ecam = 1u64 << 15;
         assert_eq!(ecam.read(slot1_ecam, AccessSize::Word), 0x0010_1b36);
-        assert_eq!(ecam.read(slot1_ecam + 0x08, AccessSize::Word) >> 8, 0x010802);
+        assert_eq!(
+            ecam.read(slot1_ecam + 0x08, AccessSize::Word) >> 8,
+            0x010802
+        );
 
         // Slot 1 BAR0 is at offset 0x1_0000 in PCI MMIO window (`0x4001_0000`)
         let bar0 = 0x1_0000u64;

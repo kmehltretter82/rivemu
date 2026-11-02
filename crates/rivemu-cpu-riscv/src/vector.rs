@@ -40,10 +40,10 @@ fn fixed_point_round_shift_u(val: u128, d: u32, vxrm: u64) -> u128 {
     let low_mask = if d > 1 { (1u128 << (d - 1)) - 1 } else { 0 };
     let v_low_nonzero = u128::from((val & low_mask) != 0);
     let r = match vxrm & 3 {
-        0 => v_d_minus_1,                                    // rnu
-        1 => v_d_minus_1 & (v_low_nonzero | v_d),            // rne
-        2 => 0,                                              // rdn
-        _ => (1 ^ v_d) & (v_d_minus_1 | v_low_nonzero),      // rod
+        0 => v_d_minus_1,                               // rnu
+        1 => v_d_minus_1 & (v_low_nonzero | v_d),       // rne
+        2 => 0,                                         // rdn
+        _ => (1 ^ v_d) & (v_d_minus_1 | v_low_nonzero), // rod
     };
     (val >> d).wrapping_add(r)
 }
@@ -58,10 +58,10 @@ fn fixed_point_round_shift_s(val: i128, d: u32, vxrm: u64) -> i128 {
     let low_mask = if d > 1 { (1i128 << (d - 1)) - 1 } else { 0 };
     let v_low_nonzero = u128::from((val & low_mask) != 0);
     let r = match vxrm & 3 {
-        0 => v_d_minus_1,                                    // rnu
-        1 => v_d_minus_1 & (v_low_nonzero | v_d),            // rne
-        2 => 0,                                              // rdn
-        _ => (1 ^ v_d) & (v_d_minus_1 | v_low_nonzero),      // rod
+        0 => v_d_minus_1,                               // rnu
+        1 => v_d_minus_1 & (v_low_nonzero | v_d),       // rne
+        2 => 0,                                         // rdn
+        _ => (1 ^ v_d) & (v_d_minus_1 | v_low_nonzero), // rod
     };
     (val >> d).wrapping_add(r as i128)
 }
@@ -475,7 +475,7 @@ impl Hart {
 
         // 2. Whole-register move (vmv<nr>r.v: f3 == 3, funct6 == 0x27, vm == 1) works even when vill == 1.
         if f3 == 3 && funct6 == 0x27 && vm == 1 {
-            let nregs = (rs1 + 1) as usize;
+            let nregs = rs1 + 1;
             if !matches!(nregs, 1 | 2 | 4 | 8) || (vd % nregs) != 0 || (rs2 % nregs) != 0 {
                 return Err(illegal());
             }
@@ -511,7 +511,7 @@ impl Hart {
         vm: u32,
         vd: usize,
         rs1: usize,
-         vs2: usize,
+        vs2: usize,
         sew_bytes: usize,
         vlmax: usize,
     ) -> Result<(), Exception> {
@@ -533,9 +533,20 @@ impl Hart {
             match width {
                 1 => u64::from(b[off]),
                 2 => u64::from(u16::from_le_bytes([b[off], b[off + 1]])),
-                4 => u64::from(u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])),
+                4 => u64::from(u32::from_le_bytes([
+                    b[off],
+                    b[off + 1],
+                    b[off + 2],
+                    b[off + 3],
+                ])),
                 _ => u64::from_le_bytes([
-                    b[off], b[off + 1], b[off + 2], b[off + 3], b[off + 4], b[off + 5], b[off + 6],
+                    b[off],
+                    b[off + 1],
+                    b[off + 2],
+                    b[off + 3],
+                    b[off + 4],
+                    b[off + 5],
+                    b[off + 6],
                     b[off + 7],
                 ]),
             }
@@ -557,8 +568,14 @@ impl Hart {
                             b[off + 3],
                         ])),
                         _ => u64::from_le_bytes([
-                            b[off], b[off + 1], b[off + 2], b[off + 3], b[off + 4], b[off + 5],
-                            b[off + 6], b[off + 7],
+                            b[off],
+                            b[off + 1],
+                            b[off + 2],
+                            b[off + 3],
+                            b[off + 4],
+                            b[off + 5],
+                            b[off + 6],
+                            b[off + 7],
                         ]),
                     }
                 }
@@ -566,13 +583,8 @@ impl Hart {
                 _ => mask_sew(simm5 as i64 as u64, width),
             }
         };
-        let get_vs1_uimm = |idx: usize, width: usize| -> u64 {
-            if f3 == 3 {
-                uimm5
-            } else {
-                get_vs1(idx, width)
-            }
-        };
+        let get_vs1_uimm =
+            |idx: usize, width: usize| -> u64 { if f3 == 3 { uimm5 } else { get_vs1(idx, width) } };
 
         // Widening sum reductions: vwredsumu.vs (0x30) and vwredsum.vs (0x31).
         if matches!(funct6, 0x30 | 0x31) && f3 == 0 {
@@ -1135,9 +1147,8 @@ impl Hart {
             let old_v = self.v;
             let src_mask_bit =
                 |idx: usize| -> bool { ((old_v[vs2 & 31][idx / 8] >> (idx & 7)) & 1) != 0 };
-            let vm_bit = |idx: usize| -> bool {
-                vm != 0 || ((old_v[0][idx / 8] >> (idx & 7)) & 1) != 0
-            };
+            let vm_bit =
+                |idx: usize| -> bool { vm != 0 || ((old_v[0][idx / 8] >> (idx & 7)) & 1) != 0 };
             match rs1 {
                 1..=3 => {
                     let mut found_one = false;
@@ -1225,8 +1236,14 @@ impl Hart {
                             b[off + 3],
                         ])),
                         _ => u64::from_le_bytes([
-                            b[off], b[off + 1], b[off + 2], b[off + 3], b[off + 4], b[off + 5],
-                            b[off + 6], b[off + 7],
+                            b[off],
+                            b[off + 1],
+                            b[off + 2],
+                            b[off + 3],
+                            b[off + 4],
+                            b[off + 5],
+                            b[off + 6],
+                            b[off + 7],
                         ]),
                     };
                     self.set_v_elem(vd, sew_bytes, dst_idx, val);
@@ -1244,14 +1261,14 @@ impl Hart {
                 let b2 = ((old_v[vs2 & 31][i / 8] >> (i & 7)) & 1) != 0;
                 let b1 = ((old_v[rs1 & 31][i / 8] >> (i & 7)) & 1) != 0;
                 let out = match funct6 {
-                    0x18 => b2 && !b1,  // vmandn.mm
-                    0x19 => b2 && b1,   // vmand.mm
-                    0x1a => b2 || b1,   // vmor.mm
-                    0x1b => b2 ^ b1,    // vmxor.mm
-                    0x1c => b2 || !b1,  // vmorn.mm
+                    0x18 => b2 && !b1,   // vmandn.mm
+                    0x19 => b2 && b1,    // vmand.mm
+                    0x1a => b2 || b1,    // vmor.mm
+                    0x1b => b2 ^ b1,     // vmxor.mm
+                    0x1c => b2 || !b1,   // vmorn.mm
                     0x1d => !(b2 && b1), // vmnand.mm
                     0x1e => !(b2 || b1), // vmnor.mm
-                    _ => !(b2 ^ b1),    // vmxnor.mm
+                    _ => !(b2 ^ b1),     // vmxnor.mm
                 };
                 self.set_v_reg_mask_bit(vd, i, out);
             }
@@ -1269,9 +1286,20 @@ impl Hart {
             match width {
                 1 => u64::from(b[off]),
                 2 => u64::from(u16::from_le_bytes([b[off], b[off + 1]])),
-                4 => u64::from(u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])),
+                4 => u64::from(u32::from_le_bytes([
+                    b[off],
+                    b[off + 1],
+                    b[off + 2],
+                    b[off + 3],
+                ])),
                 _ => u64::from_le_bytes([
-                    b[off], b[off + 1], b[off + 2], b[off + 3], b[off + 4], b[off + 5], b[off + 6],
+                    b[off],
+                    b[off + 1],
+                    b[off + 2],
+                    b[off + 3],
+                    b[off + 4],
+                    b[off + 5],
+                    b[off + 6],
                     b[off + 7],
                 ]),
             }
@@ -1293,13 +1321,14 @@ impl Hart {
             match funct6 {
                 0x08 => {
                     // vaaddu
-                    let res = fixed_point_round_shift_u(u128::from(a) + u128::from(b), 1, vxrm) as u64;
+                    let res =
+                        fixed_point_round_shift_u(u128::from(a) + u128::from(b), 1, vxrm) as u64;
                     self.set_v_elem(vd, sew_bytes, i, res);
                 }
                 0x09 => {
                     // vaadd
-                    let res =
-                        fixed_point_round_shift_s(i128::from(a_s) + i128::from(b_s), 1, vxrm) as u64;
+                    let res = fixed_point_round_shift_s(i128::from(a_s) + i128::from(b_s), 1, vxrm)
+                        as u64;
                     self.set_v_elem(vd, sew_bytes, i, res);
                 }
                 0x0a => {
@@ -1313,8 +1342,8 @@ impl Hart {
                 }
                 0x0b => {
                     // vasub
-                    let res =
-                        fixed_point_round_shift_s(i128::from(a_s) - i128::from(b_s), 1, vxrm) as u64;
+                    let res = fixed_point_round_shift_s(i128::from(a_s) - i128::from(b_s), 1, vxrm)
+                        as u64;
                     self.set_v_elem(vd, sew_bytes, i, res);
                 }
                 0x0e if f3 == 6 => {
@@ -1337,11 +1366,9 @@ impl Hart {
                 }
                 0x20 => {
                     // vdivu
-                    let res = if b == 0 {
-                        mask_sew(u64::MAX, sew_bytes)
-                    } else {
-                        a / b
-                    };
+                    let res = a
+                        .checked_div(b)
+                        .unwrap_or_else(|| mask_sew(u64::MAX, sew_bytes));
                     self.set_v_elem(vd, sew_bytes, i, res);
                 }
                 0x21 => {
@@ -1418,10 +1445,10 @@ impl Hart {
                     }
                     let wide_bytes = sew_bytes * 2;
                     let res: u64 = match funct6 {
-                        0x30 => a.wrapping_add(b),                         // vwaddu.vv / vwaddu.vx
-                        0x31 => (a_s + b_s) as u64,                        // vwadd.vv / vwadd.vx
-                        0x32 => a.wrapping_sub(b),                         // vwsubu.vv / vwsubu.vx
-                        0x33 => (a_s - b_s) as u64,                        // vwsub.vv / vwsub.vx
+                        0x30 => a.wrapping_add(b),  // vwaddu.vv / vwaddu.vx
+                        0x31 => (a_s + b_s) as u64, // vwadd.vv / vwadd.vx
+                        0x32 => a.wrapping_sub(b),  // vwsubu.vv / vwsubu.vx
+                        0x33 => (a_s - b_s) as u64, // vwsub.vv / vwsub.vx
                         0x34 => get_elem(vs2, i, wide_bytes).wrapping_add(b), // vwaddu.wv / vwaddu.wx
                         0x35 => {
                             let w_s = sext_sew(get_elem(vs2, i, wide_bytes), wide_bytes);
@@ -1432,9 +1459,9 @@ impl Hart {
                             let w_s = sext_sew(get_elem(vs2, i, wide_bytes), wide_bytes);
                             w_s.wrapping_sub(b_s) as u64
                         }
-                        0x38 => a.wrapping_mul(b),                         // vwmulu.vv / vwmulu.vx
-                        0x3a => (a_s * (b as i64)) as u64,                 // vwmulsu.vv / vwmulsu.vx
-                        0x3b => (a_s * b_s) as u64,                        // vwmul.vv / vwmul.vx
+                        0x38 => a.wrapping_mul(b), // vwmulu.vv / vwmulu.vx
+                        0x3a => (a_s * (b as i64)) as u64, // vwmulsu.vv / vwmulsu.vx
+                        0x3b => (a_s * b_s) as u64, // vwmul.vv / vwmul.vx
                         0x3c => {
                             let cur = get_elem(vd, i, wide_bytes);
                             cur.wrapping_add(a.wrapping_mul(b))
@@ -1517,10 +1544,14 @@ impl Hart {
                     if self.v_mask_bit(vm, i) {
                         let v = self.v_elem(vs2, sew_bytes, i);
                         acc = match (sew_bytes, funct6) {
-                            (2, 0x01 | 0x03) => u64::from(sf::f16_add(acc as u16, v as u16, rm, &mut fl)),
+                            (2, 0x01 | 0x03) => {
+                                u64::from(sf::f16_add(acc as u16, v as u16, rm, &mut fl))
+                            }
                             (2, 0x05) => u64::from(sf::f16_min(acc as u16, v as u16, &mut fl)),
                             (2, _) => u64::from(sf::f16_max(acc as u16, v as u16, &mut fl)),
-                            (4, 0x01 | 0x03) => u64::from(sf::f32_add(acc as u32, v as u32, rm, &mut fl)),
+                            (4, 0x01 | 0x03) => {
+                                u64::from(sf::f32_add(acc as u32, v as u32, rm, &mut fl))
+                            }
                             (4, 0x05) => u64::from(sf::f32_min(acc as u32, v as u32, &mut fl)),
                             (4, _) => u64::from(sf::f32_max(acc as u32, v as u32, &mut fl)),
                             (_, 0x01 | 0x03) => sf::f64_add(acc, v, rm, &mut fl),
@@ -1545,9 +1576,20 @@ impl Hart {
             match width {
                 1 => u64::from(b[off]),
                 2 => u64::from(u16::from_le_bytes([b[off], b[off + 1]])),
-                4 => u64::from(u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])),
+                4 => u64::from(u32::from_le_bytes([
+                    b[off],
+                    b[off + 1],
+                    b[off + 2],
+                    b[off + 3],
+                ])),
                 _ => u64::from_le_bytes([
-                    b[off], b[off + 1], b[off + 2], b[off + 3], b[off + 4], b[off + 5], b[off + 6],
+                    b[off],
+                    b[off + 1],
+                    b[off + 2],
+                    b[off + 3],
+                    b[off + 4],
+                    b[off + 5],
+                    b[off + 6],
                     b[off + 7],
                 ]),
             }
@@ -1673,9 +1715,9 @@ impl Hart {
                             _ => sf::f64_sqrt(a, rm, &mut fl),
                         },
                         16 => match sew_bytes {
-                            2 => u64::from(sf::f16_classify(a as u16)),
-                            4 => u64::from(sf::f32_classify(a as u32)),
-                            _ => u64::from(sf::f64_classify(a)),
+                            2 => sf::f16_classify(a as u16),
+                            4 => sf::f32_classify(a as u32),
+                            _ => sf::f64_classify(a),
                         },
                         _ => return Err(illegal()),
                     };
@@ -1745,14 +1787,14 @@ impl Hart {
                         _ => 1u64 << 63,
                     };
                     let (m1, m2, addend) = match funct6 {
-                        0x28 => (b, cur, a),                            // vfmadd: +(b * vd) + a
-                        0x29 => (b ^ sign_bit, cur, a ^ sign_bit),      // vfnmadd: -(b * vd) - a
-                        0x2a => (b, cur, a ^ sign_bit),                 // vfmsub: +(b * vd) - a
-                        0x2b => (b ^ sign_bit, cur, a),                 // vfnmsub: -(b * vd) + a
-                        0x2c => (b, a, cur),                            // vfmacc: +(b * a) + vd
-                        0x2d => (b ^ sign_bit, a, cur ^ sign_bit),      // vfnmacc: -(b * a) - vd
-                        0x2e => (b, a, cur ^ sign_bit),                 // vfmsac: +(b * a) - vd
-                        _ => (b ^ sign_bit, a, cur),                    // vfnmsac: -(b * a) + vd
+                        0x28 => (b, cur, a),                       // vfmadd: +(b * vd) + a
+                        0x29 => (b ^ sign_bit, cur, a ^ sign_bit), // vfnmadd: -(b * vd) - a
+                        0x2a => (b, cur, a ^ sign_bit),            // vfmsub: +(b * vd) - a
+                        0x2b => (b ^ sign_bit, cur, a),            // vfnmsub: -(b * vd) + a
+                        0x2c => (b, a, cur),                       // vfmacc: +(b * a) + vd
+                        0x2d => (b ^ sign_bit, a, cur ^ sign_bit), // vfnmacc: -(b * a) - vd
+                        0x2e => (b, a, cur ^ sign_bit),            // vfmsac: +(b * a) - vd
+                        _ => (b ^ sign_bit, a, cur),               // vfnmsac: -(b * a) + vd
                     };
                     let r = match sew_bytes {
                         2 => u64::from(sf::f16_mul_add(
@@ -1775,10 +1817,16 @@ impl Hart {
                         (2, _) if (r as u16 & 0x7c00) == 0x7c00 && (r as u16 & 0x03ff) != 0 => {
                             u64::from(F16_CANONICAL_NAN)
                         }
-                        (4, _) if (r as u32 & 0x7f80_0000) == 0x7f80_0000 && (r as u32 & 0x007f_ffff) != 0 => {
+                        (4, _)
+                            if (r as u32 & 0x7f80_0000) == 0x7f80_0000
+                                && (r as u32 & 0x007f_ffff) != 0 =>
+                        {
                             u64::from(F32_CANONICAL_NAN)
                         }
-                        (8, _) if (r & 0x7ff0_0000_0000_0000) == 0x7ff0_0000_0000_0000 && (r & 0x000f_ffff_ffff_ffff) != 0 => {
+                        (8, _)
+                            if (r & 0x7ff0_0000_0000_0000) == 0x7ff0_0000_0000_0000
+                                && (r & 0x000f_ffff_ffff_ffff) != 0 =>
+                        {
                             F64_CANONICAL_NAN
                         }
                         _ => r,

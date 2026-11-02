@@ -385,9 +385,7 @@ impl Csrs {
             return 0;
         }
         let pmm = match prv {
-            crate::hart::Priv::Machine => {
-                (self.mseccfg & mseccfg::PMM_MASK) >> mseccfg::PMM_SHIFT
-            }
+            crate::hart::Priv::Machine => (self.mseccfg & mseccfg::PMM_MASK) >> mseccfg::PMM_SHIFT,
             crate::hart::Priv::Supervisor => (self.menvcfg & envcfg::PMM_MASK) >> envcfg::PMM_SHIFT,
             crate::hart::Priv::User => (self.senvcfg & envcfg::PMM_MASK) >> envcfg::PMM_SHIFT,
         };

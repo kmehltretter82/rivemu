@@ -181,8 +181,9 @@ impl VirtioVsock {
     fn handle_tx(&mut self, txq: &mut VirtQueue, dma: &DmaRam, event_idx: bool) -> u32 {
         let mut completed = 0;
         while let Some(chain) = txq.pop(dma) {
-            if let Some(bytes) = chain.read_all(dma)
-                && let Some(hdr) = VsockHeader::from_bytes(&bytes)
+            if let Some((bytes, hdr)) = chain
+                .read_all(dma)
+                .and_then(|b| VsockHeader::from_bytes(&b).map(|h| (b, h)))
             {
                 let payload = bytes
                     .get(VSOCK_HDR_SIZE..)

@@ -194,12 +194,12 @@ pub(crate) fn expand(c: u16) -> Option<u32> {
                 (1, 1) => r(0, rdp, rs1p, 0, rs1p, OP32),    // C.ADDW
                 (1, 2) => r(0x01, rdp, rs1p, 0, rs1p, OP),   // C.MUL (Zcb)
                 (1, 3) => match bits(c, 4, 2) {
-                    0 => i(0xff, rs1p, 7, rs1p, OP_IMM),     // C.ZEXT.B (Zcb)
-                    1 => i(0x604, rs1p, 1, rs1p, OP_IMM),    // C.SEXT.B (Zcb)
-                    2 => r(0x04, 0, rs1p, 4, rs1p, OP32),    // C.ZEXT.H (Zcb)
-                    3 => i(0x605, rs1p, 1, rs1p, OP_IMM),    // C.SEXT.H (Zcb)
-                    4 => r(0x04, 0, rs1p, 0, rs1p, OP32),    // C.ZEXT.W (Zcb)
-                    5 => i(-1, rs1p, 4, rs1p, OP_IMM),       // C.NOT (Zcb)
+                    0 => i(0xff, rs1p, 7, rs1p, OP_IMM),  // C.ZEXT.B (Zcb)
+                    1 => i(0x604, rs1p, 1, rs1p, OP_IMM), // C.SEXT.B (Zcb)
+                    2 => r(0x04, 0, rs1p, 4, rs1p, OP32), // C.ZEXT.H (Zcb)
+                    3 => i(0x605, rs1p, 1, rs1p, OP_IMM), // C.SEXT.H (Zcb)
+                    4 => r(0x04, 0, rs1p, 0, rs1p, OP32), // C.ZEXT.W (Zcb)
+                    5 => i(-1, rs1p, 4, rs1p, OP_IMM),    // C.NOT (Zcb)
                     _ => return None,
                 },
                 _ => return None,

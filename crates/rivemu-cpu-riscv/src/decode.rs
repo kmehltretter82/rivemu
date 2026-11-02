@@ -597,9 +597,7 @@ pub fn decode(raw: u32) -> Insn {
                     Op::Sspopchk
                 } else if (raw & 0xffff_f07f) == 0xcdc0_4073 && rd != 0 {
                     Op::Ssrdp
-                } else if (raw & 0xb3c0_707f) == 0x81c0_4073
-                    || (raw & 0xb200_707f) == 0x8200_4073
-                {
+                } else if (raw & 0xb3c0_707f) == 0x81c0_4073 || (raw & 0xb200_707f) == 0x8200_4073 {
                     Op::Mop
                 } else {
                     Op::Illegal

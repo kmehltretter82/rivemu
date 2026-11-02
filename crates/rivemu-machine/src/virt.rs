@@ -876,7 +876,7 @@ impl Machine {
                     yield_slice = true;
                     (0, 0)
                 } else if suspend_type & 0x8000_0000 != 0 {
-                    self.harts[hart_idx].init_smode_boot(a1, a2);
+                    self.harts[hart_idx].resume_smode_nonretentive(a1, a2);
                     self.harts[hart_idx].wfi = true;
                     self.harts[hart_idx].notify_irq();
                     return true;
@@ -1377,6 +1377,7 @@ mod tests {
         m1.harts[0].x[11] = 0xaabb_ccdd_eeff_0011;
         m1.harts[0].x[12] = 0xdead_beef_cafe_babe;
         m1.harts[1].hsm_stopped = true;
+        m1.harts[0].fwft_locks = 3;
         // sc.d x2, x11, (x10): a restored VM must not retain an LR
         // reservation from the machine state that it replaces.
         m1.bus.write(code, AccessSize::Word, 0x18b5_312f).unwrap();
@@ -1414,6 +1415,7 @@ mod tests {
         );
         assert_eq!(m2.harts[0].pc, code);
         assert_eq!(m2.harts[0].x[12], 0xdead_beef_cafe_babe);
+        assert_eq!(m2.harts[0].fwft_locks, 3);
         assert!(m2.harts[1].hsm_stopped);
         assert_eq!(
             m2.bus.read(data, AccessSize::Double).unwrap(),
@@ -1425,6 +1427,30 @@ mod tests {
             m2.bus.read(data, AccessSize::Double).unwrap(),
             0x1122_3344_5566_7788
         );
+    }
+
+    #[test]
+    fn hsm_nonretentive_suspend_preserves_fwft_state() {
+        let mut m = Machine::new(MachineConfig::default()).unwrap();
+        let resume = memmap::DRAM_BASE + 0x2000;
+        let opaque = 0xfeed_face_cafe_babe;
+        m.harts[0].csr.menvcfg |= envcfg::LPE | envcfg::SSE;
+        m.harts[0].fwft_locks = 3;
+        m.harts[0].x[17] = 0x0048_534d;
+        m.harts[0].x[16] = 3;
+        m.harts[0].x[10] = 0x8000_0000;
+        m.harts[0].x[11] = resume;
+        m.harts[0].x[12] = opaque;
+
+        assert!(m.handle_sbi_call(0));
+        assert_eq!(m.harts[0].pc, resume);
+        assert_eq!(m.harts[0].x[10], 0);
+        assert_eq!(m.harts[0].x[11], opaque);
+        assert_eq!(
+            m.harts[0].csr.menvcfg & (envcfg::LPE | envcfg::SSE),
+            envcfg::LPE | envcfg::SSE
+        );
+        assert_eq!(m.harts[0].fwft_locks, 3);
     }
 
     #[test]

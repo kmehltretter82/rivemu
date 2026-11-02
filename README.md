@@ -3,7 +3,7 @@
 A pure-Rust full-system RISC-V (`RV64GC`) emulator with a QEMU-compatible command line (`rivemu-system-riscv64`).
 
 > **Status:** Milestones **P0–P32** complete (see [docs/PLAN.md](docs/PLAN.md) and [docs/FOLLOWUP_PLAN.md](docs/FOLLOWUP_PLAN.md)).
-> Passes all **244/244** official `riscv-tests` (`rv64{ui,um,ua,uf,ud,uc,mi,si}-p` and `rv64u*-v`), 18 differential lockstep suites against Sail 0.16 and `qemu-system-riscv64` (`rivemu-lockstep`), and boots upstream Debian RISC-V 6.12 SMP Linux (`-smp 4`) with OpenSBI, BusyBox, and VirtIO (`blk`, `net`, `console`, `rng`, `9p`, `vsock`, `gpu`, `input`) plus PCIe NVMe on Apple Silicon without a JIT.
+> Passes all **244/244** official `riscv-tests` (`rv64{ui,um,ua,uf,ud,uc,mi,si}-p` and `rv64u*-v`) and boots upstream Debian RISC-V SMP Linux (`-smp 4`) with built-in or external OpenSBI. An Alpine 3.24 disk also boots through serial login and installs packages over DHCP/DNS/HTTPS. Differential suites and the additional 9p, vsock, GPU/input, and NVMe devices are implemented, but their current end-to-end evidence is not uniform; see [the validation matrix](docs/VALIDATION_STATUS.md) for exact verified and outstanding claims.
 
 ## Features
 

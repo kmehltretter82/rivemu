@@ -7,8 +7,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{
+    Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
+};
 use std::sync::{Arc, Mutex};
 
 /// Default MAC address assigned to a `virtio-net` NIC (`52:54:00:12:34:56`).
@@ -158,9 +160,17 @@ struct UserNetInner {
     guest_ip: Ipv4Addr,
     ip_id: u16,
     udp_nat: HashMap<(u16, SocketAddrV4), UdpSocket>,
+    udp_hostfwd_peers: HashMap<(Ipv4Addr, u16, u16), UdpHostFwdPeer>,
     tcp_conns: HashMap<(Ipv4Addr, u16, Ipv4Addr, u16), TcpFlow>,
     tcp_listeners: Vec<(HostFwdRule, TcpListener)>,
+    udp_listeners: Vec<(HostFwdRule, UdpSocket)>,
     next_ephemeral_port: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UdpHostFwdPeer {
+    listener_index: usize,
+    peer: SocketAddrV4,
 }
 
 #[derive(Debug)]
@@ -178,12 +188,24 @@ impl UserNet {
     /// Creates a new user-mode network stack.
     pub fn new(cfg: UserNetConfig) -> Arc<Self> {
         let mut tcp_listeners = Vec::new();
+        let mut udp_listeners = Vec::new();
         for rule in &cfg.hostfwd {
-            if rule.proto == Proto::Tcp {
-                if let Ok(l) = TcpListener::bind(SocketAddrV4::new(rule.host_addr, rule.host_port))
-                {
-                    let _ = l.set_nonblocking(true);
-                    tcp_listeners.push((rule.clone(), l));
+            match rule.proto {
+                Proto::Tcp => {
+                    if let Ok(l) =
+                        TcpListener::bind(SocketAddrV4::new(rule.host_addr, rule.host_port))
+                    {
+                        let _ = l.set_nonblocking(true);
+                        tcp_listeners.push((rule.clone(), l));
+                    }
+                }
+                Proto::Udp => {
+                    if let Ok(s) =
+                        UdpSocket::bind(SocketAddrV4::new(rule.host_addr, rule.host_port))
+                    {
+                        let _ = s.set_nonblocking(true);
+                        udp_listeners.push((rule.clone(), s));
+                    }
                 }
             }
         }
@@ -195,8 +217,10 @@ impl UserNet {
                 guest_ip: GUEST_IP,
                 ip_id: 1,
                 udp_nat: HashMap::new(),
+                udp_hostfwd_peers: HashMap::new(),
                 tcp_conns: HashMap::new(),
                 tcp_listeners,
+                udp_listeners,
                 next_ephemeral_port: 49152,
             }),
         })
@@ -327,10 +351,23 @@ impl UserNetInner {
             return;
         }
 
-        // Local DNS query to 10.0.2.3:53 for "gateway" / "localhost".
+        // Resolve deterministic local names directly and proxy other A queries
+        // through the host resolver advertised behind 10.0.2.3.
         if (dst_ip == DNS_IP || dst_ip == GATEWAY_IP) && dst_port == 53 {
-            if let Some(ans) = try_local_dns(payload) {
+            if let Some(ans) = try_dns(payload) {
                 self.send_udp(dst_ip, 53, src_ip, src_port, &ans);
+                return;
+            }
+        }
+
+        // A datagram sent back to the synthetic source port of a UDP
+        // host-forward peer must leave through the original bound listener.
+        if dst_ip == GATEWAY_IP {
+            let key = (src_ip, src_port, dst_port);
+            if let Some(peer) = self.udp_hostfwd_peers.get(&key).copied() {
+                if let Some((_, listener)) = self.udp_listeners.get(peer.listener_index) {
+                    let _ = listener.send_to(payload, peer.peer);
+                }
                 return;
             }
         }
@@ -559,7 +596,54 @@ impl UserNetInner {
             self.send_udp(from_ip, src_port, dst_ip, dst_port, &data);
         }
 
-        // 2. Poll hostfwd TCP listeners.
+        // 2. Poll hostfwd UDP listeners. Each host peer gets a synthetic
+        // gateway-side source port so guest replies can be routed back through
+        // the same bound socket without exposing the host address directly.
+        let mut udp_incoming = Vec::new();
+        for (listener_index, (rule, listener)) in self.udp_listeners.iter().enumerate() {
+            loop {
+                let mut buf = [0u8; 65507];
+                match listener.recv_from(&mut buf) {
+                    Ok((n, SocketAddr::V4(peer))) => udp_incoming.push((
+                        listener_index,
+                        rule.guest_addr,
+                        rule.guest_port,
+                        peer,
+                        buf[..n].to_vec(),
+                    )),
+                    Ok((_, SocketAddr::V6(_))) => {}
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        for (listener_index, guest_ip, guest_port, peer, data) in udp_incoming {
+            let proxy_port = self
+                .udp_hostfwd_peers
+                .iter()
+                .find_map(|(&(mapped_ip, mapped_port, proxy_port), mapped_peer)| {
+                    (mapped_ip == guest_ip
+                        && mapped_port == guest_port
+                        && mapped_peer.listener_index == listener_index
+                        && mapped_peer.peer == peer)
+                        .then_some(proxy_port)
+                })
+                .unwrap_or_else(|| {
+                    let proxy_port = self.next_ephemeral_port;
+                    self.next_ephemeral_port = self.next_ephemeral_port.wrapping_add(1).max(49152);
+                    self.udp_hostfwd_peers.insert(
+                        (guest_ip, guest_port, proxy_port),
+                        UdpHostFwdPeer {
+                            listener_index,
+                            peer,
+                        },
+                    );
+                    proxy_port
+                });
+            self.send_udp(GATEWAY_IP, proxy_port, guest_ip, guest_port, &data);
+        }
+
+        // 3. Poll hostfwd TCP listeners.
         let mut new_incoming = Vec::new();
         for (rule, listener) in &self.tcp_listeners {
             if let Ok((stream, _)) = listener.accept() {
@@ -595,7 +679,7 @@ impl UserNetInner {
             );
         }
 
-        // 3. Poll active TCP streams.
+        // 4. Poll active TCP streams.
         let keys: Vec<_> = self.tcp_conns.keys().copied().collect();
         for key in keys {
             let (g_ip, g_port, r_ip, r_port) = key;
@@ -720,9 +804,19 @@ impl UserNetInner {
     }
 }
 
-fn try_local_dns(query: &[u8]) -> Option<Vec<u8>> {
-    // Minimal DNS A-record synthesiser for single-question queries.
+#[derive(Debug)]
+struct DnsQuestion {
+    name: String,
+    qtype: u16,
+    qend: usize,
+}
+
+fn parse_dns_question(query: &[u8]) -> Option<DnsQuestion> {
     if query.len() < 12 {
+        return None;
+    }
+    let flags = u16::from_be_bytes([query[2], query[3]]);
+    if flags & 0x8000 != 0 || flags & 0x7800 != 0 {
         return None;
     }
     let qdcount = u16::from_be_bytes([query[4], query[5]]);
@@ -737,10 +831,14 @@ fn try_local_dns(query: &[u8]) -> Option<Vec<u8>> {
         if len == 0 {
             break;
         }
-        if pos + len > query.len() {
+        if len > 63 || pos + len > query.len() {
             return None;
         }
-        labels.push(String::from_utf8_lossy(&query[pos..pos + len]).to_ascii_lowercase());
+        labels.push(
+            std::str::from_utf8(&query[pos..pos + len])
+                .ok()?
+                .to_ascii_lowercase(),
+        );
         pos += len;
     }
     if pos + 4 > query.len() {
@@ -752,20 +850,34 @@ fn try_local_dns(query: &[u8]) -> Option<Vec<u8>> {
     if qclass != 1 {
         return None;
     }
-    let name = labels.join(".");
-    let ip = match name.as_str() {
-        "gateway" | "host.containers.internal" => GATEWAY_IP,
-        "localhost" => Ipv4Addr::LOCALHOST,
-        _ => return None,
+    Some(DnsQuestion {
+        name: labels.join("."),
+        qtype,
+        qend,
+    })
+}
+
+fn build_dns_response(
+    query: &[u8],
+    question: &DnsQuestion,
+    answers: &[Ipv4Addr],
+    rcode: u16,
+) -> Vec<u8> {
+    let answers = if rcode == 0 && question.qtype == 1 {
+        answers
+    } else {
+        &[]
     };
-    let mut resp = Vec::with_capacity(qend + 16);
+    let request_flags = u16::from_be_bytes([query[2], query[3]]);
+    let response_flags = 0x8000 | (request_flags & 0x0100) | 0x0080 | (rcode & 0x000f);
+    let mut resp = Vec::with_capacity(question.qend + answers.len() * 16);
     resp.extend_from_slice(&query[0..2]); // ID
-    resp.extend_from_slice(&0x8180u16.to_be_bytes()); // Standard response, no error
+    resp.extend_from_slice(&response_flags.to_be_bytes());
     resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
-    resp.extend_from_slice(&u16::from(qtype == 1).to_be_bytes()); // ANCOUNT
+    resp.extend_from_slice(&(answers.len() as u16).to_be_bytes());
     resp.extend_from_slice(&0u32.to_be_bytes()); // NSCOUNT, ARCOUNT
-    resp.extend_from_slice(&query[12..qend]);
-    if qtype == 1 {
+    resp.extend_from_slice(&query[12..question.qend]);
+    for ip in answers {
         resp.extend_from_slice(&0xc00cu16.to_be_bytes()); // Name pointer to offset 12
         resp.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
         resp.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
@@ -773,7 +885,46 @@ fn try_local_dns(query: &[u8]) -> Option<Vec<u8>> {
         resp.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH 4
         resp.extend_from_slice(&ip.octets());
     }
-    Some(resp)
+    resp
+}
+
+fn try_dns(query: &[u8]) -> Option<Vec<u8>> {
+    try_dns_with(query, |name| {
+        let mut answers: Vec<Ipv4Addr> = (name, 0)
+            .to_socket_addrs()
+            .map_err(|_| ())?
+            .filter_map(|addr| match addr {
+                SocketAddr::V4(addr) => Some(*addr.ip()),
+                SocketAddr::V6(_) => None,
+            })
+            .collect();
+        answers.sort_unstable();
+        answers.dedup();
+        answers.truncate(8);
+        Ok(answers)
+    })
+}
+
+fn try_dns_with<F>(query: &[u8], resolve: F) -> Option<Vec<u8>>
+where
+    F: FnOnce(&str) -> Result<Vec<Ipv4Addr>, ()>,
+{
+    let question = parse_dns_question(query)?;
+    let local_answer = match question.name.as_str() {
+        "gateway" | "host.containers.internal" => Some(GATEWAY_IP),
+        "localhost" => Some(Ipv4Addr::LOCALHOST),
+        _ => None,
+    };
+    if question.qtype != 1 {
+        return Some(build_dns_response(query, &question, &[], 0));
+    }
+    if let Some(ip) = local_answer {
+        return Some(build_dns_response(query, &question, &[ip], 0));
+    }
+    match resolve(&question.name) {
+        Ok(answers) => Some(build_dns_response(query, &question, &answers, 0)),
+        Err(()) => Some(build_dns_response(query, &question, &[], 2)),
+    }
 }
 
 fn internet_checksum(data: &[u8]) -> u16 {
@@ -805,6 +956,56 @@ fn tcp_udp_checksum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, segment: &[u8]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn udp_frame(
+        src_ip: Ipv4Addr,
+        src_port: u16,
+        dst_ip: Ipv4Addr,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let udp_len = (8 + payload.len()) as u16;
+        let mut ip = [0u8; 20];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&(20 + udp_len).to_be_bytes());
+        ip[8] = 64;
+        ip[9] = IPPROTO_UDP;
+        ip[12..16].copy_from_slice(&src_ip.octets());
+        ip[16..20].copy_from_slice(&dst_ip.octets());
+        let checksum = internet_checksum(&ip);
+        ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+        let mut frame = Vec::with_capacity(14 + 20 + udp_len as usize);
+        frame.extend_from_slice(&GATEWAY_MAC);
+        frame.extend_from_slice(&DEFAULT_GUEST_MAC);
+        frame.extend_from_slice(&ETH_P_IP.to_be_bytes());
+        frame.extend_from_slice(&ip);
+        frame.extend_from_slice(&src_port.to_be_bytes());
+        frame.extend_from_slice(&dst_port.to_be_bytes());
+        frame.extend_from_slice(&udp_len.to_be_bytes());
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn dns_query(name: &str, qtype: u16) -> Vec<u8> {
+        let mut query = Vec::new();
+        query.extend_from_slice(&0x1234u16.to_be_bytes());
+        query.extend_from_slice(&0x0100u16.to_be_bytes());
+        query.extend_from_slice(&1u16.to_be_bytes());
+        query.extend_from_slice(&0u16.to_be_bytes());
+        query.extend_from_slice(&0u16.to_be_bytes());
+        query.extend_from_slice(&0u16.to_be_bytes());
+        for label in name.split('.') {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0);
+        query.extend_from_slice(&qtype.to_be_bytes());
+        query.extend_from_slice(&1u16.to_be_bytes());
+        query
+    }
 
     #[test]
     fn hostfwd_parsing() {
@@ -823,6 +1024,90 @@ mod tests {
         assert_eq!(r2.proto, Proto::Udp);
         assert_eq!(r2.host_port, 5353);
         assert_eq!(r2.guest_port, 53);
+    }
+
+    #[test]
+    fn udp_hostfwd_roundtrip() {
+        let net = UserNet::new(UserNetConfig {
+            mac: DEFAULT_GUEST_MAC,
+            hostfwd: vec![HostFwdRule {
+                proto: Proto::Udp,
+                host_addr: Ipv4Addr::LOCALHOST,
+                host_port: 0,
+                guest_addr: GUEST_IP,
+                guest_port: 5555,
+            }],
+        });
+        let bound_port = {
+            let state = net.inner.lock().unwrap();
+            let addr = state.udp_listeners[0].1.local_addr().unwrap();
+            match addr {
+                SocketAddr::V4(addr) => addr.port(),
+                SocketAddr::V6(_) => panic!("expected IPv4 UDP listener"),
+            }
+        };
+        let host = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        host.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        host.send_to(
+            b"HOST_TO_GUEST",
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, bound_port),
+        )
+        .unwrap();
+
+        let incoming = (0..100)
+            .find_map(|_| {
+                net.poll();
+                net.recv_packet().or_else(|| {
+                    std::thread::sleep(Duration::from_millis(1));
+                    None
+                })
+            })
+            .expect("hostfwd packet destined for guest");
+        assert_eq!(incoming[23], IPPROTO_UDP);
+        assert_eq!(&incoming[26..30], &GATEWAY_IP.octets());
+        assert_eq!(&incoming[30..34], &GUEST_IP.octets());
+        let proxy_port = u16::from_be_bytes([incoming[34], incoming[35]]);
+        assert_eq!(u16::from_be_bytes([incoming[36], incoming[37]]), 5555);
+        assert_eq!(&incoming[42..], b"HOST_TO_GUEST");
+
+        net.send_packet(&udp_frame(
+            GUEST_IP,
+            5555,
+            GATEWAY_IP,
+            proxy_port,
+            b"GUEST_TO_HOST",
+        ));
+        let mut response = [0u8; 64];
+        let (len, peer) = host.recv_from(&mut response).unwrap();
+        assert_eq!(&response[..len], b"GUEST_TO_HOST");
+        assert_eq!(peer.port(), bound_port);
+    }
+
+    #[test]
+    fn dns_proxies_non_local_a_queries_and_reports_failures() {
+        let query = dns_query("packages.example", 1);
+        let response = try_dns_with(&query, |name| {
+            assert_eq!(name, "packages.example");
+            Ok(vec![
+                Ipv4Addr::new(192, 0, 2, 10),
+                Ipv4Addr::new(198, 51, 100, 20),
+            ])
+        })
+        .unwrap();
+        assert_eq!(&response[0..2], &0x1234u16.to_be_bytes());
+        assert_eq!(u16::from_be_bytes([response[2], response[3]]), 0x8180);
+        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 2);
+        assert_eq!(&response[response.len() - 4..], &[198, 51, 100, 20]);
+
+        let failed = try_dns_with(&query, |_| Err(())).unwrap();
+        assert_eq!(u16::from_be_bytes([failed[2], failed[3]]) & 0x000f, 2);
+        assert_eq!(u16::from_be_bytes([failed[6], failed[7]]), 0);
+
+        let local = try_dns_with(&dns_query("gateway", 1), |_| {
+            panic!("local names must not call the host resolver")
+        })
+        .unwrap();
+        assert_eq!(&local[local.len() - 4..], &GATEWAY_IP.octets());
     }
 
     #[test]

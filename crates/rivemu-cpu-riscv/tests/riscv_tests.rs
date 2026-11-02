@@ -491,8 +491,12 @@ fn zicbom_permits_read_only_targets_and_reports_store_fault_causes() {
     // 3-level Sv39 page table:
     // - CODE (0x8000_0000) is V|R|X|A (0x4b).
     // - DATA (0x8000_2000) starts as read-only V|R|A (0x43, W=0, D=0).
-    bus.write(ROOT_PT + 2 * 8, AccessSize::Double, ((L1_PT >> 12) << 10) | 1)
-        .unwrap();
+    bus.write(
+        ROOT_PT + 2 * 8,
+        AccessSize::Double,
+        ((L1_PT >> 12) << 10) | 1,
+    )
+    .unwrap();
     bus.write(L1_PT, AccessSize::Double, ((L0_PT >> 12) << 10) | 1)
         .unwrap();
     bus.write(L0_PT, AccessSize::Double, ((CODE >> 12) << 10) | 0x4b)
@@ -586,12 +590,18 @@ fn sfence_vma_respects_asid_global_and_superpages() {
     const L0_PT1: u64 = 0x8001_2000;
     const L0_G_PT1: u64 = 0x8001_3000;
 
-    bus.write(PA_LOCAL_1, AccessSize::Word, 0x1111_1111).unwrap();
-    bus.write(PA_LOCAL_2, AccessSize::Word, 0x2222_2222).unwrap();
-    bus.write(PA_GLOBAL_1, AccessSize::Word, 0xaaaa_1111).unwrap();
-    bus.write(PA_GLOBAL_2, AccessSize::Word, 0xaaaa_2222).unwrap();
-    bus.write(PA_NONLEAF_1, AccessSize::Word, 0xbbbb_1111).unwrap();
-    bus.write(PA_NONLEAF_2, AccessSize::Word, 0xbbbb_2222).unwrap();
+    bus.write(PA_LOCAL_1, AccessSize::Word, 0x1111_1111)
+        .unwrap();
+    bus.write(PA_LOCAL_2, AccessSize::Word, 0x2222_2222)
+        .unwrap();
+    bus.write(PA_GLOBAL_1, AccessSize::Word, 0xaaaa_1111)
+        .unwrap();
+    bus.write(PA_GLOBAL_2, AccessSize::Word, 0xaaaa_2222)
+        .unwrap();
+    bus.write(PA_NONLEAF_1, AccessSize::Word, 0xbbbb_1111)
+        .unwrap();
+    bus.write(PA_NONLEAF_2, AccessSize::Word, 0xbbbb_2222)
+        .unwrap();
 
     // Instructions at CODE:
     //   0x00: lwu x1, 0(x10)          (0x0005_6083)
@@ -610,8 +620,12 @@ fn sfence_vma_respects_asid_global_and_superpages() {
     // L1_PT1[0] -> L0_PT1 (non-global branch)
     // L1_PT1[1] -> L0_G_PT1 with non-leaf G=1 (0x21)
     // L1_PT1[2] -> 2 MiB superpage at 0x8020_0000 (initially mapped to 0x8020_0000)
-    bus.write(ROOT_PT1 + 2 * 8, AccessSize::Double, ((L1_PT1 >> 12) << 10) | 0x01)
-        .unwrap();
+    bus.write(
+        ROOT_PT1 + 2 * 8,
+        AccessSize::Double,
+        ((L1_PT1 >> 12) << 10) | 0x01,
+    )
+    .unwrap();
     bus.write(L1_PT1, AccessSize::Double, ((L0_PT1 >> 12) << 10) | 0x01)
         .unwrap();
     bus.write(
@@ -780,8 +794,10 @@ fn sfence_vma_respects_asid_global_and_superpages() {
     // load from VA_SUPER_A (0x8040_1000), remap L1_PT1[2] -> PA 0x8000_0000, and
     // execute `sfence.vma x10, x0` with x10 = VA_SUPER_B (0x8040_5000, a different
     // 4 KiB page inside the same 2 MiB superpage).
-    bus.write(0x8020_1000, AccessSize::Word, 0x5555_1111).unwrap();
-    bus.write(0x8000_1000, AccessSize::Word, 0x5555_2222).unwrap();
+    bus.write(0x8020_1000, AccessSize::Word, 0x5555_1111)
+        .unwrap();
+    bus.write(0x8000_1000, AccessSize::Word, 0x5555_2222)
+        .unwrap();
     h.pc = CODE;
     h.x[10] = VA_SUPER_A;
     h.step(&bus);
@@ -910,8 +926,12 @@ fn sv48_four_level_walk_superpages_and_canonical_check() {
         ((L1_POS_PT >> 12) << 10) | 0x01,
     )
     .unwrap();
-    bus.write(L1_POS_PT, AccessSize::Double, ((L0_POS_PT >> 12) << 10) | 0x01)
-        .unwrap();
+    bus.write(
+        L1_POS_PT,
+        AccessSize::Double,
+        ((L0_POS_PT >> 12) << 10) | 0x01,
+    )
+    .unwrap();
     bus.write(
         L0_POS_PT + 2 * 8,
         AccessSize::Double,
@@ -1001,7 +1021,8 @@ fn pmp_m_mode_straddle_of_unlocked_subpage_entry_faults() {
     // Configure pmp0 as an UNLOCKED (L=0) 4-byte NA4 entry at [DATA + 12, DATA + 15],
     // and pmp1 as a catch-all NAPOT R|W|X entry.
     h.csr_write(csr::PMPADDR0, (DATA + 12) >> 2).unwrap();
-    h.csr_write(csr::PMPADDR0 + 1, 0x003f_ffff_ffff_ffff).unwrap();
+    h.csr_write(csr::PMPADDR0 + 1, 0x003f_ffff_ffff_ffff)
+        .unwrap();
     h.csr_write(csr::PMPCFG0, (0x1fu64 << 8) | 0x10).unwrap();
 
     // 1. 8-byte M-mode load at DATA + 8 straddles unlocked pmp0 [DATA + 12, DATA + 15]:
@@ -1022,8 +1043,8 @@ fn pmp_m_mode_straddle_of_unlocked_subpage_entry_faults() {
 
 #[test]
 fn sscofpmf_and_smcntrpmf_filtering_overflow_scountovf_and_lcofi_interrupt() {
-    use rivemu_cpu_riscv::csr::{self, hpmevent, irq, status};
     use rivemu_cpu_riscv::Priv;
+    use rivemu_cpu_riscv::csr::{self, hpmevent, irq, status};
 
     let mut bus = AddressSpace::new();
     bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(2 * MIB).unwrap()))
@@ -1034,7 +1055,8 @@ fn sscofpmf_and_smcntrpmf_filtering_overflow_scountovf_and_lcofi_interrupt() {
 
     // 4 NOPs at CODE, 1 NOP at STVEC
     for i in 0..4 {
-        bus.write(CODE + i * 4, AccessSize::Word, 0x0000_0013).unwrap();
+        bus.write(CODE + i * 4, AccessSize::Word, 0x0000_0013)
+            .unwrap();
     }
     bus.write(STVEC, AccessSize::Word, 0x0000_0013).unwrap();
 
@@ -1055,8 +1077,11 @@ fn sscofpmf_and_smcntrpmf_filtering_overflow_scountovf_and_lcofi_interrupt() {
     // 2. Configure mhpmcounter3 (event = instructions, MINH = 1, SINH = 0) at u64::MAX - 1,
     // and mhpmcounter4 (event = cycles, SINH = 1) at 100.
     h.prv = Priv::Machine;
-    h.csr_write(csr::MHPMEVENT3, hpmevent::MINH | hpmevent::EVENT_INSTRUCTIONS)
-        .unwrap();
+    h.csr_write(
+        csr::MHPMEVENT3,
+        hpmevent::MINH | hpmevent::EVENT_INSTRUCTIONS,
+    )
+    .unwrap();
     h.csr_write(csr::MHPMCOUNTER3, u64::MAX - 1).unwrap();
     h.csr_write(csr::MHPMEVENT3 + 1, hpmevent::SINH | hpmevent::EVENT_CYCLES)
         .unwrap();
@@ -1202,7 +1227,14 @@ fn zacas_zabha_and_zalasr_atomic_extensions() {
     const MTVEC: u64 = 0x8000_1000;
 
     let encode_amo = |f5: u32, aq: u32, rl: u32, rs2: u32, rs1: u32, f3: u32, rd: u32| -> u32 {
-        (f5 << 27) | (aq << 26) | (rl << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | 0x2f
+        (f5 << 27)
+            | (aq << 26)
+            | (rl << 25)
+            | (rs2 << 20)
+            | (rs1 << 15)
+            | (f3 << 12)
+            | (rd << 7)
+            | 0x2f
     };
 
     let insns: &[u32] = &[
@@ -1444,7 +1476,8 @@ fn macro_op_fusion_and_direct_offset_soft_tlb() {
 
     // At TARGET (0x8000_0100): sd x6, 0(x5); ld x9, 0(x5) (exercises Direct-Offset SoftTLB)
     bus.write(TARGET, AccessSize::Word, 0x0062_b023).unwrap();
-    bus.write(TARGET + 4, AccessSize::Word, 0x0002_b483).unwrap();
+    bus.write(TARGET + 4, AccessSize::Word, 0x0002_b483)
+        .unwrap();
 
     // Run with Hart::run(budget = 12) which executes all 5 fused pairs in 5 fused dispatches + 2 memory ops:
     let mut h_fused = Hart::new(0, Arc::new(FrozenTimebase(0)));
@@ -2002,10 +2035,7 @@ fn smepmp_and_smstateen_semantics() {
 
     // 1. Smstateen / Ssstateen:
     // By default, mstateen0 has M0_MASK (SE | ENVCFG | CONTEXT | SRMCFG) enabled:
-    assert_eq!(
-        h.csr_read(csr::MSTATEEN0).unwrap(),
-        csr::stateen::M0_MASK
-    );
+    assert_eq!(h.csr_read(csr::MSTATEEN0).unwrap(), csr::stateen::M0_MASK);
     h.prv = Priv::Supervisor;
     assert!(h.csr_read(csr::SENVCFG).is_some());
     assert_eq!(h.csr_read(csr::SSTATEEN0).unwrap(), 0);
@@ -2042,10 +2072,7 @@ fn smepmp_and_smstateen_semantics() {
     // Reset hart, set RLB=1 before locking any entry, then lock entry 0 and modify it while RLB=1:
     h.reset(CODE);
     h.csr_write(csr::MSECCFG, csr::mseccfg::RLB).unwrap();
-    assert_eq!(
-        h.csr_read(csr::MSECCFG).unwrap(),
-        csr::mseccfg::RLB
-    );
+    assert_eq!(h.csr_read(csr::MSECCFG).unwrap(), csr::mseccfg::RLB);
     h.csr_write(csr::PMPADDR0, 0x8000_1000 >> 2).unwrap();
     h.csr_write(csr::PMPCFG0, 0x8d).unwrap(); // L=1, TOR, R=1, X=1
     assert_eq!(h.csr_read(csr::PMPCFG0).unwrap() & 0xff, 0x8d);
@@ -2252,8 +2279,12 @@ fn decoded_basic_block_cache_execution_and_mid_block_trap_accuracy() {
     //   MTVEC: wfi                   (0x1050_0073)
     let trap_block: &[u32] = &[0x00b0_0613, 0x0160_0693, 0x0007_b703, 0x0630_0613];
     for (i, &w) in trap_block.iter().enumerate() {
-        bus.write(CODE + 0x100 + (i as u64) * 4, AccessSize::Word, u64::from(w))
-            .unwrap();
+        bus.write(
+            CODE + 0x100 + (i as u64) * 4,
+            AccessSize::Word,
+            u64::from(w),
+        )
+        .unwrap();
     }
     bus.write(MTVEC, AccessSize::Word, 0x1050_0073).unwrap();
 
@@ -2270,6 +2301,60 @@ fn decoded_basic_block_cache_execution_and_mid_block_trap_accuracy() {
     assert_eq!(h.csr.mcause, cause::LOAD_ACCESS);
     assert_eq!(h.csr.mepc, CODE + 0x108);
     assert_eq!(h.csr.mtval, 0xdead_0000);
+}
+
+#[test]
+fn decoded_basic_block_cache_stops_at_noncontiguous_virtual_page_boundary() {
+    use rivemu_cpu_riscv::{Priv, csr};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+
+    const VA_CODE: u64 = 0x4000_0000;
+    const PA_PAGE0: u64 = 0x8000_0000;
+    const PA_ADJACENT: u64 = 0x8000_1000;
+    const PA_PAGE1: u64 = 0x8000_2000;
+    const ROOT_PT: u64 = 0x8001_0000;
+    const L1_PT: u64 = 0x8001_1000;
+    const L0_PT: u64 = 0x8001_2000;
+
+    // Map consecutive virtual pages to noncontiguous physical pages.
+    bus.write(ROOT_PT + 8, AccessSize::Double, ((L1_PT >> 12) << 10) | 1)
+        .unwrap();
+    bus.write(L1_PT, AccessSize::Double, ((L0_PT >> 12) << 10) | 1)
+        .unwrap();
+    bus.write(L0_PT, AccessSize::Double, ((PA_PAGE0 >> 12) << 10) | 0xcf)
+        .unwrap();
+    bus.write(
+        L0_PT + 8,
+        AccessSize::Double,
+        ((PA_PAGE1 >> 12) << 10) | 0xcf,
+    )
+    .unwrap();
+
+    // The block starts with `addi a0, zero, 1` at the end of the first page.
+    // The next virtual page contains `addi a0, a0, 2`, while the physically
+    // adjacent (but unmapped) page contains `addi a0, a0, 4`. A block decoder
+    // that crosses the virtual boundary by incrementing the old PA executes
+    // the wrong instruction and leaves a0 == 5 instead of 3.
+    bus.write(PA_PAGE0 + 0xffc, AccessSize::Word, 0x0010_0513)
+        .unwrap();
+    bus.write(PA_ADJACENT, AccessSize::Word, 0x0045_0513)
+        .unwrap();
+    bus.write(PA_PAGE1, AccessSize::Word, 0x0025_0513).unwrap();
+    bus.write(PA_PAGE1 + 4, AccessSize::Word, 0x1050_0073)
+        .unwrap(); // wfi
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(VA_CODE + 0xffc);
+    h.prv = Priv::Supervisor;
+    h.csr_write(csr::SATP, (8u64 << 60) | (ROOT_PT >> 12))
+        .unwrap();
+
+    assert_eq!(h.run(&bus, 3), 3);
+    assert_eq!(h.x[10], 3);
+    assert!(h.wfi);
 }
 
 #[test]
@@ -2851,14 +2936,20 @@ fn rvv_vector_configuration_memory_alu_mask_and_fp_semantics() {
         vmv_x_s_a5_v4,
     ];
     for (idx, &insn) in prog.iter().enumerate() {
-        bus.write(CODE + 4 + (idx as u64) * 4, AccessSize::Word, u64::from(insn))
-            .unwrap();
+        bus.write(
+            CODE + 4 + (idx as u64) * 4,
+            AccessSize::Word,
+            u64::from(insn),
+        )
+        .unwrap();
     }
     for _ in 0..prog.len() {
         h.step(&bus);
     }
     for i in 0..4 {
-        let got = bus.read(DATA + 64 + (i as u64) * 8, AccessSize::Double).unwrap();
+        let got = bus
+            .read(DATA + 64 + (i as u64) * 8, AccessSize::Double)
+            .unwrap();
         assert_eq!(got, a_vals[i] + b_vals[i]);
     }
     // vredsum.vs sums v3 = [11, 22, 33, 44] (= 110) + v1[0] (10) = 120:
@@ -2873,8 +2964,12 @@ fn rvv_vector_configuration_memory_alu_mask_and_fp_semantics() {
     let vfirst_a7: u32 = (0x10 << 26) | (1 << 25) | (17 << 15) | (2 << 12) | (17 << 7) | 0x57;
     let base_pc = h.pc;
     for (idx, &insn) in [vmseq_v0, vcpop_a6, vfirst_a7].iter().enumerate() {
-        bus.write(base_pc + (idx as u64) * 4, AccessSize::Word, u64::from(insn))
-            .unwrap();
+        bus.write(
+            base_pc + (idx as u64) * 4,
+            AccessSize::Word,
+            u64::from(insn),
+        )
+        .unwrap();
     }
     for _ in 0..3 {
         h.step(&bus);
@@ -2888,8 +2983,12 @@ fn rvv_vector_configuration_memory_alu_mask_and_fp_semantics() {
     for i in 0..4 {
         bus.write(DATA + (i as u64) * 8, AccessSize::Double, f1[i].to_bits())
             .unwrap();
-        bus.write(DATA + 32 + (i as u64) * 8, AccessSize::Double, f2[i].to_bits())
-            .unwrap();
+        bus.write(
+            DATA + 32 + (i as u64) * 8,
+            AccessSize::Double,
+            f2[i].to_bits(),
+        )
+        .unwrap();
     }
     // vfadd.vv v5, v2, v1: funct6=0x00, vm=1, vs2=2, vs1=1, f3=1 (OPFVV), vd=5, op=0x57
     let vfadd_v5 = (1 << 25) | (2 << 20) | (1 << 15) | (1 << 12) | (5 << 7) | 0x57;
@@ -2897,17 +2996,21 @@ fn rvv_vector_configuration_memory_alu_mask_and_fp_semantics() {
     let vse64_v5 = (1 << 25) | (14 << 15) | (7 << 12) | (5 << 7) | 0x27;
     let base_pc = h.pc;
     for (idx, &insn) in [vle64_v1, vle64_v2, vfadd_v5, vse64_v5].iter().enumerate() {
-        bus.write(base_pc + (idx as u64) * 4, AccessSize::Word, u64::from(insn))
-            .unwrap();
+        bus.write(
+            base_pc + (idx as u64) * 4,
+            AccessSize::Word,
+            u64::from(insn),
+        )
+        .unwrap();
     }
     for _ in 0..4 {
         h.step(&bus);
     }
     for i in 0..4 {
-        let got = f64::from_bits(bus.read(DATA + 64 + (i as u64) * 8, AccessSize::Double).unwrap());
+        let got = f64::from_bits(
+            bus.read(DATA + 64 + (i as u64) * 8, AccessSize::Double)
+                .unwrap(),
+        );
         assert_eq!(got, f1[i] + f2[i]);
     }
 }
-
-
-
