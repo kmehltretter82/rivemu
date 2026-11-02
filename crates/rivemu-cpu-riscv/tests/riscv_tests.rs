@@ -3032,3 +3032,103 @@ fn rvv_vector_configuration_memory_alu_mask_and_fp_semantics() {
         assert_eq!(got, f1[i] + f2[i]);
     }
 }
+
+/// RVV 1.0 7.8: field `f` of a segment access uses the register group at
+/// `vd + f * ceil(EMUL)`. 3.7: a trapping vector memory access leaves the
+/// faulting element index in `vstart`. Reserved register groupings raise an
+/// illegal-instruction exception, as in the Sail model.
+#[test]
+fn rvv_segment_groups_vstart_on_fault_and_reserved_memory_encodings() {
+    use rivemu_cpu_riscv::{cause, csr::status};
+
+    // 1 MiB of RAM: 0x8000_0000..0x8010_0000; accesses beyond it fault.
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    const CODE: u64 = 0x8000_0000;
+    const SRC: u64 = 0x8000_2000;
+    const DST: u64 = 0x8000_3000;
+    const MTVEC: u64 = 0x8000_4000;
+    const RAM_END: u64 = 0x8010_0000;
+
+    // vsetvli t0, a1, e32, m2 (vtype 0x11)
+    const VSETVLI_E32_M2: u32 = (0x11 << 20) | (11 << 15) | (7 << 12) | (5 << 7) | 0x57;
+    // v{l,s}seg2e32.v vreg, (a0) and vle32.v
+    let vlseg2e32 = |vd: u32| (1 << 29) | (1 << 25) | (10 << 15) | (6 << 12) | (vd << 7) | 0x07;
+    let vsseg2e32 = |vs3: u32| (1 << 29) | (1 << 25) | (12 << 15) | (6 << 12) | (vs3 << 7) | 0x27;
+    let vle32 = |vd: u32, vm: u32| (vm << 25) | (10 << 15) | (6 << 12) | (vd << 7) | 0x07;
+    let vlseg8e32 = |vd: u32| (7 << 29) | (1 << 25) | (10 << 15) | (6 << 12) | (vd << 7) | 0x07;
+
+    // Each instruction gets its own slot: rewriting one address would hit
+    // the decoded-instruction cache without a `fence.i`.
+    let slot = std::cell::Cell::new(0u64);
+    let run = |h: &mut Hart, bus: &AddressSpace, insn: u32| {
+        let pc = CODE + 4 * slot.replace(slot.get() + 1);
+        bus.write(pc, AccessSize::Word, u64::from(insn)).unwrap();
+        h.pc = pc;
+        h.step(bus);
+    };
+    let words = |h: &Hart, reg: usize| -> Vec<u32> {
+        h.v[reg]
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mtvec = MTVEC;
+    h.csr.mstatus |= 1 << status::VS_SHIFT;
+    h.x[11] = 16;
+    run(&mut h, &bus, VSETVLI_E32_M2);
+    assert_eq!(h.csr.vl, 16);
+
+    // 1. vlseg2e32.v v4 at LMUL=2: field 0 -> v4..v5, field 1 -> v6..v7.
+    for k in 0..32u64 {
+        bus.write(SRC + 4 * k, AccessSize::Word, k).unwrap();
+    }
+    h.x[10] = SRC;
+    run(&mut h, &bus, vlseg2e32(4));
+    assert_eq!(h.pc, CODE + 8);
+    assert_eq!(words(&h, 4), [0, 2, 4, 6, 8, 10, 12, 14]);
+    assert_eq!(words(&h, 5), [16, 18, 20, 22, 24, 26, 28, 30]);
+    assert_eq!(words(&h, 6), [1, 3, 5, 7, 9, 11, 13, 15]);
+    assert_eq!(words(&h, 7), [17, 19, 21, 23, 25, 27, 29, 31]);
+
+    // 2. vsseg2e32.v v4 interleaves the fields back into memory order.
+    h.x[12] = DST;
+    run(&mut h, &bus, vsseg2e32(4));
+    assert_eq!(h.pc, CODE + 12);
+    for k in 0..32u64 {
+        assert_eq!(bus.read(DST + 4 * k, AccessSize::Word).unwrap(), k);
+    }
+
+    // 3. vle32.v v8 whose element 5 lies past the end of RAM: the load
+    //    faults, vstart = 5, and elements 0..5 have been written.
+    h.v[8] = [0; 32];
+    h.v[9] = [0; 32];
+    for k in 0..5u64 {
+        bus.write(RAM_END - 20 + 4 * k, AccessSize::Word, 0x100 + k)
+            .unwrap();
+    }
+    h.x[10] = RAM_END - 20;
+    run(&mut h, &bus, vle32(8, 1));
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr.mcause, cause::LOAD_ACCESS);
+    assert_eq!(h.csr.vstart, 5);
+    assert_eq!(words(&h, 8)[..5], [0x100, 0x101, 0x102, 0x103, 0x104]);
+
+    // 4. Reserved encodings raise ILLEGAL_INSN (Sail `illegal_load`):
+    h.csr.vstart = 0;
+    h.x[10] = SRC;
+    for (what, insn) in [
+        ("vd not aligned to EMUL=2", vlseg2e32(5)),
+        ("nf * EMUL = 16 > 8", vlseg8e32(8)),
+        ("fields run past v31", vlseg2e32(30)),
+        ("masked load into v0", vle32(0, 0)),
+    ] {
+        run(&mut h, &bus, insn);
+        assert_eq!(h.pc, MTVEC, "{what}");
+        assert_eq!(h.csr.mcause, cause::ILLEGAL_INSN, "{what}");
+    }
+}

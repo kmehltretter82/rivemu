@@ -31,6 +31,108 @@ fn sext_sew(val: u64, sew_bytes: usize) -> i64 {
 }
 
 #[inline]
+/// log2(LMUL) from `vtype.vlmul`, or `None` for the reserved encoding 4.
+const fn lmul_pow(vtype: u64) -> Option<i32> {
+    match vtype & 7 {
+        0 => Some(0),
+        1 => Some(1),
+        2 => Some(2),
+        3 => Some(3),
+        5 => Some(-3),
+        6 => Some(-2),
+        7 => Some(-1),
+        _ => None,
+    }
+}
+
+/// log2 of an element width in bytes (the EEW/SEW ratio is the same in bits).
+const fn width_pow(bytes: usize) -> i32 {
+    bytes.trailing_zeros() as i32
+}
+
+/// Registers in a group of log2 multiplier `pow`; fractional groups use one.
+const fn group_regs(pow: i32) -> usize {
+    if pow <= 0 { 1 } else { 1 << pow }
+}
+
+/// `reg` is a valid register-group base for log2 multiplier `pow`.
+const fn valid_reg_group(reg: usize, pow: i32) -> bool {
+    reg % group_regs(pow) == 0
+}
+
+/// Segment accesses: `nf * EMUL <= 8` and the last field ends at or below v31.
+const fn valid_segment(reg: usize, nf: usize, pow: i32) -> bool {
+    let size_ok = if pow < 0 {
+        nf / (1 << -pow) <= 8
+    } else {
+        (nf << pow) <= 8
+    };
+    size_ok && reg + nf * group_regs(pow) <= 32
+}
+
+/// RVV 1.0 section 5.2 overlap rule between a source group `rs` and a
+/// destination group `rd` with different EMULs (Sail `valid_reg_overlap`).
+const fn valid_reg_overlap(rs: usize, rd: usize, pow_rs: i32, pow_rd: i32) -> bool {
+    let rs_group = group_regs(pow_rs);
+    let rd_group = group_regs(pow_rd);
+    if rs % rs_group != 0 || rd % rd_group != 0 {
+        return false;
+    }
+    if pow_rs < pow_rd {
+        rs + rs_group <= rd
+            || rs >= rd + rd_group
+            || (rs + rs_group == rd + rd_group && pow_rs >= 0)
+    } else if pow_rs > pow_rd {
+        rd <= rs || rd >= rs + rs_group
+    } else {
+        true
+    }
+}
+
+/// `rs` does not overlap any of the `nf` fields starting at `rd`
+/// (Sail `valid_disjoint_reg_groups_segmented`).
+const fn valid_disjoint_segmented(
+    rs: usize,
+    rd: usize,
+    pow_rs: i32,
+    pow_rd: i32,
+    nf: usize,
+) -> bool {
+    let rs_group = group_regs(pow_rs);
+    let rd_group = group_regs(pow_rd);
+    if rs % rs_group != 0 || rd % rd_group != 0 {
+        return false;
+    }
+    rs + rs_group <= rd || rd + rd_group * nf <= rs
+}
+
+/// Source groups of different EEW may not overlap (Sail
+/// `valid_src_overlap_segmented`).
+const fn valid_src_overlap_segmented(
+    rs1: usize,
+    eew1: usize,
+    pow1: i32,
+    rs2: usize,
+    eew2: usize,
+    pow2: i32,
+    nf: usize,
+) -> bool {
+    if eew1 == eew2 {
+        valid_reg_group(rs1, pow1) && valid_reg_group(rs2, pow2)
+    } else {
+        valid_disjoint_segmented(rs1, rs2, pow1, pow2, nf)
+    }
+}
+
+const fn access_size(bytes: usize) -> AccessSize {
+    match bytes {
+        1 => AccessSize::Byte,
+        2 => AccessSize::Half,
+        4 => AccessSize::Word,
+        _ => AccessSize::Double,
+    }
+}
+
 fn fixed_point_round_shift_u(val: u128, d: u32, vxrm: u64) -> u128 {
     if d == 0 {
         return val;
@@ -221,7 +323,9 @@ impl Hart {
             let start = self.csr.vstart as usize;
             for i in start..total_elems {
                 let addr = base_addr.wrapping_add((i * eew_bytes) as u64);
-                let val = self.load(bus, addr, access_size)?;
+                let val = self.load(bus, addr, access_size).inspect_err(|_| {
+                    self.vector_trap_at(start, i);
+                })?;
                 self.set_v_elem(vd, eew_bytes, i, val);
             }
             self.csr.vstart = 0;
@@ -241,7 +345,9 @@ impl Hart {
             let start = self.csr.vstart as usize;
             for i in start..evl {
                 let addr = base_addr.wrapping_add(i as u64);
-                let val = self.load(bus, addr, AccessSize::Byte)?;
+                let val = self
+                    .load(bus, addr, AccessSize::Byte)
+                    .inspect_err(|_| self.vector_trap_at(start, i))?;
                 self.set_v_elem(vd, 1, i, val);
             }
             self.csr.vstart = 0;
@@ -253,21 +359,46 @@ impl Hart {
         let Some((sew_bytes, _)) = self.vtype_params() else {
             return Err(illegal());
         };
+        let lmul = lmul_pow(self.csr.vtype).ok_or_else(illegal)?;
         let is_ff = mop == 0 && rs2 == 0x10;
         if mop == 0 && !matches!(rs2, 0x00 | 0x10) {
             return Err(illegal());
         }
-        let data_bytes = if matches!(mop, 1 | 3) {
-            sew_bytes
+        let indexed = matches!(mop, 1 | 3);
+        // Data EEW/EMUL: SEW/LMUL for indexed accesses, otherwise the encoded
+        // width with EMUL = (EEW / SEW) * LMUL. Segment field `f` occupies the
+        // register group starting at `vd + f * ceil(EMUL)` (RVV 1.0 7.8).
+        let (data_bytes, data_pow) = if indexed {
+            (sew_bytes, lmul)
         } else {
-            eew_bytes
+            (
+                eew_bytes,
+                width_pow(eew_bytes) - width_pow(sew_bytes) + lmul,
+            )
         };
-        let data_size = match data_bytes {
-            1 => AccessSize::Byte,
-            2 => AccessSize::Half,
-            4 => AccessSize::Word,
-            _ => AccessSize::Double,
+        // Reserved encodings, checked in the same way as the Sail model.
+        let reserved = if indexed {
+            let index_pow = width_pow(eew_bytes) - width_pow(sew_bytes) + lmul;
+            !(-3..=3).contains(&index_pow)
+                || (vm == 0 && vd == 0)
+                || (vm == 0 && rs2 == 0)
+                || !valid_segment(vd, nf, data_pow)
+                || if nf == 1 {
+                    !valid_reg_overlap(rs2, vd, index_pow, data_pow)
+                } else {
+                    !valid_disjoint_segmented(rs2, vd, index_pow, data_pow, nf)
+                }
+        } else {
+            !(-3..=3).contains(&data_pow)
+                || (vm == 0 && vd == 0)
+                || !valid_segment(vd, nf, data_pow)
+                || !valid_reg_group(vd, data_pow)
         };
+        if reserved {
+            return Err(illegal());
+        }
+        let field_regs = group_regs(data_pow);
+        let data_size = access_size(data_bytes);
         let stride = self.x[rs2] as i64;
         let vl = self.csr.vl as usize;
         let start = self.csr.vstart as usize;
@@ -279,17 +410,13 @@ impl Hart {
             let elem_base = match mop {
                 0 => base_addr.wrapping_add(((i * nf) * data_bytes) as u64),
                 2 => base_addr.wrapping_add((i as i64).wrapping_mul(stride) as u64),
-                1 | 3 => {
-                    let idx_off = self.v_elem(rs2, eew_bytes, i);
-                    base_addr.wrapping_add(idx_off)
-                }
-                _ => return Err(illegal()),
+                _ => base_addr.wrapping_add(self.v_elem(rs2, eew_bytes, i)),
             };
             for seg in 0..nf {
                 let addr = elem_base.wrapping_add((seg * data_bytes) as u64);
                 match self.load(bus, addr, data_size) {
                     Ok(val) => {
-                        self.set_v_elem((vd + seg) & 31, data_bytes, i, val);
+                        self.set_v_elem(vd + seg * field_regs, data_bytes, i, val);
                     }
                     Err(e) => {
                         if is_ff && i > 0 {
@@ -298,6 +425,7 @@ impl Hart {
                             self.csr.mstatus |= status::VS;
                             return Ok(());
                         }
+                        self.vector_trap_at(start, i);
                         return Err(e);
                     }
                 }
@@ -306,6 +434,17 @@ impl Hart {
         self.csr.vstart = 0;
         self.csr.mstatus |= status::VS;
         Ok(())
+    }
+
+    /// Records a synchronous exception on element `i` of a vector memory
+    /// access that started at element `start`: `vstart` names the faulting
+    /// element (RVV 1.0 3.7) so the access can resume after the trap, and
+    /// `mstatus.VS` becomes dirty if earlier elements were already written.
+    fn vector_trap_at(&mut self, start: usize, i: usize) {
+        self.csr.vstart = i as u64;
+        if i > start {
+            self.csr.mstatus |= status::VS;
+        }
     }
 
     fn exec_vstore(&mut self, bus: &AddressSpace, insn: &Insn) -> Result<(), Exception> {
@@ -337,7 +476,8 @@ impl Hart {
             for i in start..total_bytes {
                 let addr = base_addr.wrapping_add(i as u64);
                 let val = self.v_elem(vs3, 1, i);
-                self.store(bus, addr, AccessSize::Byte, val)?;
+                self.store(bus, addr, AccessSize::Byte, val)
+                    .inspect_err(|_| self.csr.vstart = i as u64)?;
             }
             self.csr.vstart = 0;
             return Ok(());
@@ -356,7 +496,8 @@ impl Hart {
             for i in start..evl {
                 let addr = base_addr.wrapping_add(i as u64);
                 let val = self.v_elem(vs3, 1, i);
-                self.store(bus, addr, AccessSize::Byte, val)?;
+                self.store(bus, addr, AccessSize::Byte, val)
+                    .inspect_err(|_| self.csr.vstart = i as u64)?;
             }
             self.csr.vstart = 0;
             return Ok(());
@@ -366,20 +507,38 @@ impl Hart {
         let Some((sew_bytes, _)) = self.vtype_params() else {
             return Err(illegal());
         };
+        let lmul = lmul_pow(self.csr.vtype).ok_or_else(illegal)?;
         if mop == 0 && rs2 != 0x00 {
             return Err(illegal());
         }
-        let data_bytes = if matches!(mop, 1 | 3) {
-            sew_bytes
+        let indexed = matches!(mop, 1 | 3);
+        let (data_bytes, data_pow) = if indexed {
+            (sew_bytes, lmul)
         } else {
-            eew_bytes
+            (
+                eew_bytes,
+                width_pow(eew_bytes) - width_pow(sew_bytes) + lmul,
+            )
         };
-        let data_size = match data_bytes {
-            1 => AccessSize::Byte,
-            2 => AccessSize::Half,
-            4 => AccessSize::Word,
-            _ => AccessSize::Double,
+        let reserved = if indexed {
+            let index_pow = width_pow(eew_bytes) - width_pow(sew_bytes) + lmul;
+            !(-3..=3).contains(&index_pow)
+                || !valid_segment(vs3, nf, data_pow)
+                || !valid_src_overlap_segmented(
+                    rs2, eew_bytes, index_pow, vs3, sew_bytes, data_pow, nf,
+                )
+                || (vm == 0 && (rs2 == 0 || vs3 == 0))
+        } else {
+            !(-3..=3).contains(&data_pow)
+                || !valid_segment(vs3, nf, data_pow)
+                || !valid_reg_group(vs3, data_pow)
+                || (vm == 0 && vs3 == 0)
         };
+        if reserved {
+            return Err(illegal());
+        }
+        let field_regs = group_regs(data_pow);
+        let data_size = access_size(data_bytes);
         let stride = self.x[rs2] as i64;
         let vl = self.csr.vl as usize;
         let start = self.csr.vstart as usize;
@@ -391,16 +550,13 @@ impl Hart {
             let elem_base = match mop {
                 0 => base_addr.wrapping_add(((i * nf) * data_bytes) as u64),
                 2 => base_addr.wrapping_add((i as i64).wrapping_mul(stride) as u64),
-                1 | 3 => {
-                    let idx_off = self.v_elem(rs2, eew_bytes, i);
-                    base_addr.wrapping_add(idx_off)
-                }
-                _ => return Err(illegal()),
+                _ => base_addr.wrapping_add(self.v_elem(rs2, eew_bytes, i)),
             };
             for seg in 0..nf {
                 let addr = elem_base.wrapping_add((seg * data_bytes) as u64);
-                let val = self.v_elem((vs3 + seg) & 31, data_bytes, i);
-                self.store(bus, addr, data_size, val)?;
+                let val = self.v_elem(vs3 + seg * field_regs, data_bytes, i);
+                self.store(bus, addr, data_size, val)
+                    .inspect_err(|_| self.csr.vstart = i as u64)?;
             }
         }
         self.csr.vstart = 0;
