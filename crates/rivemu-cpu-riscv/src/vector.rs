@@ -1601,7 +1601,7 @@ impl Hart {
                 }
                 0x21 => {
                     // vdiv
-                    let min_s = -(1i64 << (sew_bits - 1));
+                    let min_s = i64::MIN >> (64 - sew_bits);
                     let res = if b_s == 0 {
                         -1i64 as u64
                     } else if a_s == min_s && b_s == -1 {
@@ -1618,7 +1618,7 @@ impl Hart {
                 }
                 0x23 => {
                     // vrem
-                    let min_s = -(1i64 << (sew_bits - 1));
+                    let min_s = i64::MIN >> (64 - sew_bits);
                     let res = if b_s == 0 {
                         a_s as u64
                     } else if a_s == min_s && b_s == -1 {

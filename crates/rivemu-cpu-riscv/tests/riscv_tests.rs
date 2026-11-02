@@ -3149,3 +3149,44 @@ fn rvv_segment_groups_vstart_on_fault_and_reserved_memory_encodings() {
     assert_eq!(h.csr.vtype, 0x08);
     assert_eq!(h.csr.vl, 16);
 }
+
+/// RVV 1.0 11.11: signed division overflow (most-negative / -1) returns the
+/// dividend for `vdiv` and 0 for `vrem`. At SEW = 64 the most-negative value
+/// is i64::MIN, which a naive negation overflows (it panicked in debug
+/// builds).
+#[test]
+fn rvv_signed_division_overflow_at_sew64() {
+    use rivemu_cpu_riscv::csr::status;
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    const CODE: u64 = 0x8000_0000;
+    // vsetvli t0, a1, e64, m1 (vtype 0x18); vdiv.vv v3, v1, v2; vrem.vv v4, v1, v2
+    let prog: [u32; 3] = [
+        (0x18 << 20) | (11 << 15) | (7 << 12) | (5 << 7) | 0x57,
+        (0x21 << 26) | (1 << 25) | (1 << 20) | (2 << 15) | (2 << 12) | (3 << 7) | 0x57,
+        (0x23 << 26) | (1 << 25) | (1 << 20) | (2 << 15) | (2 << 12) | (4 << 7) | 0x57,
+    ];
+    for (i, insn) in prog.iter().enumerate() {
+        bus.write(CODE + 4 * i as u64, AccessSize::Word, u64::from(*insn))
+            .unwrap();
+    }
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mstatus |= 1 << status::VS_SHIFT;
+    h.x[11] = 4;
+    for lane in 0..4 {
+        h.v[1][lane * 8..lane * 8 + 8].copy_from_slice(&i64::MIN.to_le_bytes());
+        h.v[2][lane * 8..lane * 8 + 8].copy_from_slice(&(-1i64).to_le_bytes());
+    }
+    for _ in 0..3 {
+        h.step(&bus);
+    }
+    assert_eq!(h.pc, CODE + 12);
+    for lane in 0..4 {
+        let q = i64::from_le_bytes(h.v[3][lane * 8..lane * 8 + 8].try_into().unwrap());
+        let r = i64::from_le_bytes(h.v[4][lane * 8..lane * 8 + 8].try_into().unwrap());
+        assert_eq!((q, r), (i64::MIN, 0), "lane {lane}");
+    }
+}
