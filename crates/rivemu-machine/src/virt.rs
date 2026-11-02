@@ -171,6 +171,8 @@ pub struct MachineConfig {
     pub strict_pmp: bool,
     /// Service RISC-V Semihosting calls (`-semihosting`); off by default, as in QEMU.
     pub semihosting: bool,
+    /// Implement Smdbltrp (`-cpu rv64,smdbltrp=on`); off by default, as in QEMU and Sail.
+    pub smdbltrp: bool,
 }
 
 impl Default for MachineConfig {
@@ -192,6 +194,7 @@ impl Default for MachineConfig {
             svade: false,
             strict_pmp: false,
             semihosting: false,
+            smdbltrp: false,
         }
     }
 }
@@ -267,6 +270,10 @@ pub struct BootInfo {
     pub dtb: Option<Vec<u8>>,
 }
 
+/// Exit status reported when a hart enters the Smdbltrp critical-error state
+/// (`EX_SOFTWARE`).
+pub const CRITICAL_ERROR_EXIT_STATUS: i32 = 70;
+
 /// An assembled `virt` machine.
 #[derive(Debug)]
 pub struct Machine {
@@ -302,6 +309,9 @@ pub struct Machine {
     pub framebuffer: Arc<Framebuffer>,
     /// Shared host `evdev` input event hub (used by `virtio-input`, HMP `sendkey`, and VNC).
     pub input: Arc<InputHub>,
+    /// Host side (CID 2) of every `virtio-vsock` device: inspect what the guest
+    /// sent and inject packets.
+    pub vsock: Arc<VsockHostEndpoint>,
     /// Host monotonic timebase.
     pub timebase: Arc<HostTimebase>,
     /// Instruction-counted timebase when `-icount` is enabled.
@@ -409,6 +419,7 @@ impl Machine {
                 h.set_svade(config.svade);
                 h.strict_pmp = config.strict_pmp;
                 h.semihosting = config.semihosting;
+                h.smdbltrp = config.smdbltrp;
                 h.update_pmp_state();
                 h
             })
@@ -652,6 +663,7 @@ impl Machine {
                 plic_ndev: PLIC_NUM_SOURCES as u32 - 1,
                 virtio: virtio_fdt,
                 svade: config.svade,
+                smdbltrp: config.smdbltrp,
             }),
         };
         let fdt_top = ram_end.min(3072 * MIB);
@@ -716,6 +728,7 @@ impl Machine {
             pflash: [pflash0, pflash1],
             framebuffer,
             input,
+            vsock: vsock_endpoint,
             timebase,
             icount,
         })
@@ -738,6 +751,17 @@ impl Machine {
             let mut rem = QUANTUM;
             while rem > 0 {
                 let ran = self.harts[i].run(&self.bus, rem);
+                if self.harts[i].critical_error {
+                    eprintln!(
+                        "rivemu: hart {i} entered the critical-error state (a trap to M-mode \
+                         with mstatus.MDT = 1, pc = {:#x})",
+                        self.harts[i].pc
+                    );
+                    self.harts[i].critical_error = false;
+                    self.harts[i].hsm_stopped = true;
+                    self.power
+                        .request(PowerEvent::Poweroff(CRITICAL_ERROR_EXIT_STATUS));
+                }
                 if let Some(ic) = &self.icount {
                     ic.advance(ran);
                 }

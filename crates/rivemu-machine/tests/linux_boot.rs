@@ -454,6 +454,7 @@ fn main() {
         svade: true,
         strict_pmp: true,
         semihosting: false,
+        smdbltrp: false,
     })
     .expect("machine init");
 

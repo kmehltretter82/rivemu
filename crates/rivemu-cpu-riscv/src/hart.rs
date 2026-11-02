@@ -318,6 +318,15 @@ pub struct Hart {
     pub semihosting: bool,
     /// Whether the hart is parked in the SBI HSM `STOPPED` state.
     pub hsm_stopped: bool,
+    /// Implement Smdbltrp (`-cpu rv64,smdbltrp=on`). Off by default, as in
+    /// Sail and QEMU's `rv64` model: software that predates Smdbltrp, such
+    /// as riscv-tests, takes M-mode traps before clearing the MDT bit that
+    /// Smdbltrp sets at reset. When off, `mstatus.MDT` is read-only zero.
+    pub smdbltrp: bool,
+    /// Smdbltrp critical-error state: a trap to M-mode arrived while
+    /// `mstatus.MDT` was 1. The hart stops without updating any architectural
+    /// state (there is no Smrnmi to take the trap instead).
+    pub critical_error: bool,
     /// Per-hart SBI FWFT locks: bit 0 for landing pads, bit 1 for shadow stacks.
     pub fwft_locks: u8,
     /// Trap on any unaligned scalar load or store (`LOAD_MISALIGNED` / `STORE_MISALIGNED`).
@@ -391,6 +400,8 @@ impl Hart {
             pending_semihost: false,
             semihosting: false,
             hsm_stopped: false,
+            smdbltrp: false,
+            critical_error: false,
             fwft_locks: 0,
             strict_align: false,
             svade: false,
@@ -425,6 +436,11 @@ impl Hart {
         self.v = [[0; 32]; 32];
         self.prv = Priv::Machine;
         self.csr = Csrs::default();
+        // Smdbltrp: "Upon reset, the MDT field is set to 1."
+        if self.smdbltrp {
+            self.csr.mstatus |= status::MDT;
+        }
+        self.critical_error = false;
         if self.svade {
             self.csr.menvcfg &= !csr::envcfg::ADUE;
         }
@@ -450,7 +466,10 @@ impl Hart {
         self.prv = Priv::Supervisor;
         self.x[10] = self.id;
         self.x[11] = opaque;
+        // Entering S-mode directly stands in for firmware that ended with
+        // MRET, which clears MDT.
         self.csr.mstatus = (2 << 32) | (2 << 34);
+        self.critical_error = false;
         self.csr.medeleg = 0xb1ff | (1 << cause::SW_CHECK);
         self.csr.mideleg = irq::S_MASK;
         self.csr.mcounteren = 0xffff_ffff;
@@ -551,7 +570,7 @@ impl Hart {
     pub fn run(&mut self, bus: &AddressSpace, budget: u64) -> u64 {
         self.hit_breakpoint = false;
         self.yield_slice = false;
-        if self.hsm_stopped {
+        if self.hsm_stopped || self.critical_error {
             return 0;
         }
         self.take_pending_interrupt();
@@ -1122,6 +1141,13 @@ impl Hart {
         } else {
             (code, interrupt, tval, delegated_to_s)
         };
+        // Smdbltrp: a trap into M-mode while MDT = 1 is an unexpected trap.
+        // Without Smrnmi "the hart enters a critical-error state without
+        // updating any architectural state, including the pc".
+        if self.smdbltrp && !to_s && self.csr.mstatus & status::MDT != 0 {
+            self.critical_error = true;
+            return;
+        }
         let cause = code | (u64::from(interrupt) << 63);
         let save_elp = self.elp && self.csr.landing_pad_enabled(old_prv);
         self.elp = false;
@@ -1158,6 +1184,10 @@ impl Hart {
             *s |= (self.prv as u64) << status::MPP_SHIFT;
             if save_elp {
                 *s |= status::MPELP;
+            }
+            // Smdbltrp: taking a trap into M-mode sets MDT.
+            if self.smdbltrp {
+                *s |= status::MDT;
             }
             self.prv = Priv::Machine;
             self.pc = trap_vector(self.csr.mtvec, code, interrupt);
@@ -2613,6 +2643,9 @@ impl Hart {
                 let mut m = status::M_WRITABLE;
                 if self.csr.menvcfg & envcfg::DTE == 0 {
                     m &= !status::SDT;
+                }
+                if !self.smdbltrp {
+                    m &= !status::MDT;
                 }
                 let mut n = (self.csr.mstatus & !m) | (v & m);
                 if v & m & status::SDT != 0 {

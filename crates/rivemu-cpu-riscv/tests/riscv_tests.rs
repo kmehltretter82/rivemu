@@ -2642,7 +2642,10 @@ fn ssdbltrp_and_smdbltrp_double_trap_semantics() {
     bus.write(STVEC, AccessSize::Word, 0x0010_0073).unwrap();
 
     let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.smdbltrp = true;
     h.reset(CODE);
+    // Smdbltrp sets MDT at reset; this test starts from MDT = 0.
+    h.csr.mstatus &= !status::MDT;
     h.csr_write(csr::STVEC, STVEC).unwrap();
     h.csr_write(csr::MTVEC, MTVEC).unwrap();
     h.csr_write(
@@ -3285,4 +3288,61 @@ fn semihosting_sequence_traps_unless_enabled() {
             assert_eq!(h.pc, 0x8000_0100);
         }
     }
+}
+
+/// Smdbltrp (`-cpu rv64,smdbltrp=on`): MDT is 1 at reset, taking a trap into
+/// M-mode sets it, MRET clears it, and a trap into M-mode while MDT = 1 is an
+/// unexpected trap that stops the hart without updating architectural state
+/// (Sail 0.16 `machine_trap_set_mdt`). Without the option MDT is read-only 0.
+#[test]
+fn smdbltrp_reset_value_trap_entry_and_critical_error() {
+    use rivemu_cpu_riscv::csr::{self, status};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    // 0x00: ecall; 0x100 (mtvec): ecall again, without clearing MDT.
+    bus.write(0x8000_0000, AccessSize::Word, 0x0000_0073)
+        .unwrap();
+    bus.write(0x8000_0100, AccessSize::Word, 0x0000_0073)
+        .unwrap();
+
+    // Default hart: MDT is read-only zero and traps do not set it.
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(0x8000_0000);
+    assert_eq!(h.csr.mstatus & status::MDT, 0);
+    h.csr_write(csr::MSTATUS, h.csr.mstatus | status::MDT)
+        .unwrap();
+    assert_eq!(h.csr.mstatus & status::MDT, 0, "MDT is read-only 0");
+    h.csr.mtvec = 0x8000_0100;
+    h.step(&bus);
+    assert_eq!(h.pc, 0x8000_0100);
+    h.step(&bus);
+    assert_eq!(h.pc, 0x8000_0100, "nested trap is delivered normally");
+    assert!(!h.critical_error);
+
+    // Smdbltrp hart: MDT = 1 at reset, so the first M-mode trap is unexpected.
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.smdbltrp = true;
+    h.reset(0x8000_0000);
+    assert_ne!(h.csr.mstatus & status::MDT, 0, "MDT = 1 at reset");
+    h.csr.mtvec = 0x8000_0100;
+    h.step(&bus);
+    assert!(h.critical_error);
+    assert_eq!(h.pc, 0x8000_0000, "no architectural state is updated");
+    assert_eq!(h.csr.mcause, 0);
+
+    // After software clears MDT, a trap sets it and the next trap is unexpected.
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.smdbltrp = true;
+    h.reset(0x8000_0000);
+    h.csr.mtvec = 0x8000_0100;
+    h.csr_write(csr::MSTATUS, h.csr.mstatus & !status::MDT)
+        .unwrap();
+    h.step(&bus);
+    assert_eq!(h.pc, 0x8000_0100);
+    assert_ne!(h.csr.mstatus & status::MDT, 0, "trap entry sets MDT");
+    h.step(&bus);
+    assert!(h.critical_error);
+    assert_eq!(h.pc, 0x8000_0100);
 }

@@ -17,9 +17,11 @@ pub(crate) struct FdtParams<'a> {
     /// Advertise Svade (missing A/D bits fault) instead of Svadu (hardware
     /// A/D updating, enabled at reset through `menvcfg.ADUE`).
     pub(crate) svade: bool,
+    /// Advertise Smdbltrp (only when the harts implement it).
+    pub(crate) smdbltrp: bool,
 }
 
-const ISA_TEMPLATE: &str = "rv64imafdcv_zabha_zacas_zalasr_zawrs_zba_zbb_zbc_zbkb_zbkc_zbkx_zbs_zca_zcb_zcd_zcmop_zfa_zfbfmin_zfh_zfhmin_zicbom_zicbop_zicboz_zicfilp_zicfiss_zicntr_zicond_zicsr_zifencei_zihintpause_zimop_zknd_zkne_zknh_zkr_zksed_zksh_zkt_sdtrig_smcntrpmf_smdbltrp_smepmp_smmpm_smnpm_smstateen_sscofpmf_ssdbltrp_ssnpm_ssqosid_ssstateen_sstc_{AD}_svinval_svnapot_svpbmt_svrsw60t59b_svukte_svvptc";
+const ISA_TEMPLATE: &str = "rv64imafdcv_zabha_zacas_zalasr_zawrs_zba_zbb_zbc_zbkb_zbkc_zbkx_zbs_zca_zcb_zcd_zcmop_zfa_zfbfmin_zfh_zfhmin_zicbom_zicbop_zicboz_zicfilp_zicfiss_zicntr_zicond_zicsr_zifencei_zihintpause_zimop_zknd_zkne_zknh_zkr_zksed_zksh_zkt_sdtrig_smcntrpmf_{DBL}smepmp_smmpm_smnpm_smstateen_sscofpmf_ssdbltrp_ssnpm_ssqosid_ssstateen_sstc_{AD}_svinval_svnapot_svpbmt_svrsw60t59b_svukte_svvptc";
 const ISA_EXTENSIONS: &[&str] = &[
     "i",
     "m",
@@ -89,8 +91,14 @@ const ISA_EXTENSIONS: &[&str] = &[
 pub(crate) fn build(p: &FdtParams<'_>) -> Vec<u8> {
     // Exactly one A/D-bit scheme, matching the reset value of menvcfg.ADUE.
     let ad_scheme = if p.svade { "svade" } else { "svadu" };
-    let isa = ISA_TEMPLATE.replace("{AD}", ad_scheme);
-    let mut extensions: Vec<&str> = ISA_EXTENSIONS.to_vec();
+    let isa = ISA_TEMPLATE
+        .replace("{AD}", ad_scheme)
+        .replace("{DBL}", if p.smdbltrp { "smdbltrp_" } else { "" });
+    let mut extensions: Vec<&str> = ISA_EXTENSIONS
+        .iter()
+        .copied()
+        .filter(|e| p.smdbltrp || *e != "smdbltrp")
+        .collect();
     let at = extensions
         .iter()
         .position(|e| *e == "svinval")

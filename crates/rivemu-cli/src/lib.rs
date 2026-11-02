@@ -236,6 +236,8 @@ pub struct Options {
     pub strict_pmp: bool,
     /// `-semihosting` / `-semihosting-config enable=on`: service RISC-V Semihosting calls.
     pub semihosting: bool,
+    /// `-cpu rv64,smdbltrp=on`: implement Smdbltrp.
+    pub smdbltrp: bool,
 }
 
 impl Default for Options {
@@ -280,6 +282,7 @@ impl Default for Options {
             svade: false,
             strict_pmp: false,
             semihosting: false,
+            smdbltrp: false,
         }
     }
 }
@@ -386,6 +389,7 @@ where
                                 "model" => {}
                                 "strict-align" | "strict_align" => o.strict_align = flag(val),
                                 "svade" => o.svade = flag(val),
+                                "smdbltrp" => o.smdbltrp = flag(val),
                                 "pmp" | "strict-pmp" => o.strict_pmp = flag(val),
                                 "strict" => {
                                     let on = flag(val);
@@ -901,6 +905,7 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
         svade: o.svade,
         strict_pmp: o.strict_pmp,
         semihosting: o.semihosting,
+        smdbltrp: o.smdbltrp,
     })
 }
 
