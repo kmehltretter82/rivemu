@@ -30,6 +30,8 @@ fn run_test(path: &Path) -> Result<u64, String> {
     let mut hart = Hart::new(0, Arc::new(FrozenTimebase(0)));
     hart.reset(elf.entry);
     let mut executed = 0;
+    // Console output from the "v" environment (assertion messages, for example).
+    let mut console = String::new();
     while executed < MAX_INSNS {
         executed += hart.run(&bus, 1000).max(1);
         let v = bus.read(tohost, AccessSize::Double).unwrap();
@@ -37,20 +39,36 @@ fn run_test(path: &Path) -> Result<u64, String> {
             continue;
         }
         if v >> 48 == 0x0101 {
-            // Character output from the "v" environment.
+            console.push(char::from(v as u8));
             bus.write(tohost, AccessSize::Double, 0).unwrap();
             continue;
         }
         return if v == 1 {
             Ok(executed)
         } else {
-            Err(format!("failed test case #{} (pc={:#x})", v >> 1, hart.pc))
+            Err(format!(
+                "failed test case #{} (pc={:#x}){}",
+                v >> 1,
+                hart.pc,
+                console_suffix(&console)
+            ))
         };
     }
     Err(format!(
-        "timeout after {MAX_INSNS} instructions (pc={:#x})",
-        hart.pc
+        "timeout after {MAX_INSNS} instructions (pc={:#x}){}",
+        hart.pc,
+        console_suffix(&console)
     ))
+}
+
+/// Formats captured "v" environment console output for a failure message.
+fn console_suffix(console: &str) -> String {
+    let console = console.trim();
+    if console.is_empty() {
+        String::new()
+    } else {
+        format!("; console: {console:?}")
+    }
 }
 
 #[test]
