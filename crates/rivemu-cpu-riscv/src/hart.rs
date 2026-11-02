@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rivemu_core::{AccessSize, Timebase};
-use rivemu_mem::AddressSpace;
+use rivemu_mem::{AddressSpace, RegionKind};
 
 use crate::csr::{self, Csrs, envcfg, irq, status};
 use crate::decode::{Insn, Op, amo, decode, decode_compressed};
@@ -291,6 +291,8 @@ pub struct Hart {
     yield_slice: bool,
     /// The current instruction wrote `minstret` (suppresses its increment).
     instret_written: bool,
+    /// The current instruction wrote `mcycle` (suppresses its increment).
+    cycle_written: bool,
     /// The current instruction wrote an `icount` trigger in `tdata1`.
     icount_written: bool,
     /// Bitmask of `mhpmcounter3..31` written by the current instruction.
@@ -388,6 +390,7 @@ impl Hart {
             check_irq: true,
             yield_slice: false,
             instret_written: false,
+            cycle_written: false,
             icount_written: false,
             hpm_written_mask: 0,
             log_flags: LogFlags::default(),
@@ -478,6 +481,13 @@ impl Hart {
             envcfg::STCE | envcfg::PBMTE | envcfg::CBIE_MASK | envcfg::CBCFE | envcfg::CBZE;
         self.csr.senvcfg = envcfg::CBIE_MASK | envcfg::CBCFE | envcfg::CBZE;
         self.csr.mseccfg = csr::mseccfg::SSEED;
+        // Like OpenSBI's mstatus_init: give S-mode its stateen-gated state.
+        self.csr.mstateen = [
+            csr::stateen::M0_MASK,
+            csr::stateen::M1_3_MASK,
+            csr::stateen::M1_3_MASK,
+            csr::stateen::M1_3_MASK,
+        ];
         self.csr.pmpaddr[0] = (1 << 54) - 1;
         self.csr.pmpcfg[0] = 0x1f;
         self.update_pmp_state();
@@ -620,10 +630,15 @@ impl Hart {
         n
     }
 
+    /// Advances `minstret` and `mcycle` by `delta` retired instructions,
+    /// honouring `mcountinhibit.IR`/`.CY` and the Smcntrpmf mode filters.
     #[inline]
-    fn bump_minstret(&mut self, delta: u64) {
+    fn bump_counters(&mut self, delta: u64) {
         if self.csr.mcountinhibit & 4 == 0 && !self.mode_inhibited(self.csr.minstretcfg) {
             self.csr.minstret = self.csr.minstret.wrapping_add(delta);
+        }
+        if self.csr.mcountinhibit & 1 == 0 && !self.mode_inhibited(self.csr.mcyclecfg) {
+            self.csr.mcycle = self.csr.mcycle.wrapping_add(delta);
         }
     }
 
@@ -664,7 +679,7 @@ impl Hart {
                 Ok(()) => {
                     if self.check_irq || self.wfi || self.yield_slice {
                         let done = (i + 1) as u64;
-                        self.bump_minstret(done);
+                        self.bump_counters(done);
                         if self.check_irq {
                             self.take_pending_interrupt();
                         }
@@ -674,9 +689,10 @@ impl Hart {
                 Err(e) => {
                     let retired = i as u64;
                     if retired > 0 {
-                        self.bump_minstret(retired);
+                        self.bump_counters(retired);
                     }
                     self.instret_written = false;
+                    self.cycle_written = false;
                     self.hpm_written_mask = 0;
                     self.trap(e.cause, false, e.tval);
                     return retired + 1;
@@ -684,7 +700,7 @@ impl Hart {
             }
         }
         let done = limit as u64;
-        self.bump_minstret(done);
+        self.bump_counters(done);
         done
     }
 
@@ -769,20 +785,20 @@ impl Hart {
             } => {
                 self.x[rd as usize] = pc.wrapping_add(offset as u64);
                 self.pc = pc.wrapping_add(u64::from(total_len));
-                self.bump_minstret(2);
+                self.bump_counters(2);
                 true
             }
             FusedOp::LuiAddi { rd, total_len, imm } | FusedOp::LuiAddiw { rd, total_len, imm } => {
                 self.x[rd as usize] = imm;
                 self.pc = pc.wrapping_add(u64::from(total_len));
-                self.bump_minstret(2);
+                self.bump_counters(2);
                 true
             }
             FusedOp::ZextW { rd, rs1, total_len } => {
                 let v = u64::from(self.x[rs1 as usize] as u32);
                 self.x[rd as usize] = v;
                 self.pc = pc.wrapping_add(u64::from(total_len));
-                self.bump_minstret(2);
+                self.bump_counters(2);
                 true
             }
             FusedOp::AuipcJalr {
@@ -795,7 +811,7 @@ impl Hart {
                 self.x[t_reg as usize] = pc.wrapping_add(auipc_imm as i64 as u64);
                 self.set_x(link_rd, pc.wrapping_add(u64::from(total_len)));
                 self.pc = pc.wrapping_add(jalr_offset as u64) & !1;
-                self.bump_minstret(2);
+                self.bump_counters(2);
                 true
             }
         }
@@ -807,6 +823,7 @@ impl Hart {
             self.log_exec_cpu();
         }
         self.instret_written = false;
+        self.cycle_written = false;
         self.icount_written = false;
         self.hpm_written_mask = 0;
         let step_prv = self.prv;
@@ -819,12 +836,19 @@ impl Hart {
         };
         match result {
             Ok(()) => {
-                // An explicit write to minstret suppresses that instruction's increment.
+                // An explicit write to minstret or mcycle suppresses that
+                // instruction's increment of the written counter.
                 if self.csr.mcountinhibit & 4 == 0
                     && !self.mode_inhibited(self.csr.minstretcfg)
                     && !std::mem::take(&mut self.instret_written)
                 {
                     self.csr.minstret = self.csr.minstret.wrapping_add(1);
+                }
+                if self.csr.mcountinhibit & 1 == 0
+                    && !self.mode_inhibited(self.csr.mcyclecfg)
+                    && !std::mem::take(&mut self.cycle_written)
+                {
+                    self.csr.mcycle = self.csr.mcycle.wrapping_add(1);
                 }
                 if self.csr.active_hpm_mask != 0 {
                     self.step_hpm_counters();
@@ -837,6 +861,7 @@ impl Hart {
             }
             Err(e) => {
                 self.instret_written = false;
+                self.cycle_written = false;
                 self.icount_written = false;
                 self.hpm_written_mask = 0;
                 self.trap(e.cause, false, e.tval);
@@ -1041,6 +1066,23 @@ impl Hart {
             }
         }
         Ok(())
+    }
+
+    /// PMA check for the cache block at `pa`, after the PMP check (Sail
+    /// `phys_access_check`): cbo.clean/flush/inval need a readable or
+    /// writable region and cbo.zero needs RAM; otherwise the instruction
+    /// raises a store/AMO access fault (Zicbom/Zicboz).
+    fn cbo_pma_check(bus: &AddressSpace, pa: u64, va: u64, zero: bool) -> Result<(), Exception> {
+        let ok = match bus.find(pa).map(|r| &r.kind) {
+            None => false,
+            Some(RegionKind::Ram(_)) => true,
+            Some(RegionKind::Rom(_) | RegionKind::Mmio(_)) => !zero,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(Exception::new(cause::STORE_ACCESS, va))
+        }
     }
 
     #[inline]
@@ -1950,6 +1992,7 @@ impl Hart {
                     .translate(bus, base_va, Access::CacheBom)
                     .map_err(|e| Exception::new(e.cause, va))?;
                 self.check_pmp_access(va, pa, 64, Access::CacheBom)?;
+                Self::cbo_pma_check(bus, pa, va, false)?;
                 self.invalidate_reservation(pa);
                 bus.invalidate_cache_line(pa, AccessSize::Double);
             }
@@ -1968,6 +2011,7 @@ impl Hart {
                     .translate(bus, base_va, Access::CacheBom)
                     .map_err(|e| Exception::new(e.cause, va))?;
                 self.check_pmp_access(va, pa, 64, Access::CacheBom)?;
+                Self::cbo_pma_check(bus, pa, va, false)?;
                 self.invalidate_reservation(pa);
                 bus.invalidate_cache_line(pa, AccessSize::Double);
             }
@@ -1986,6 +2030,7 @@ impl Hart {
                     .translate(bus, base_va, Access::Store)
                     .map_err(|e| Exception::new(e.cause, va))?;
                 self.check_pmp_access(va, pa, 64, Access::Store)?;
+                Self::cbo_pma_check(bus, pa, va, true)?;
                 self.invalidate_reservation(pa);
                 bus.invalidate_cache_line(pa, AccessSize::Double);
                 for off in (0..64u64).step_by(8) {
@@ -2361,7 +2406,8 @@ impl Hart {
                     return None;
                 }
                 match num {
-                    csr::CYCLE | csr::INSTRET => c.minstret,
+                    csr::CYCLE => c.mcycle,
+                    csr::INSTRET => c.minstret,
                     csr::TIME => self.timebase.now(),
                     _ => c.mhpmcounter[(num - csr::HPMCOUNTER3) as usize],
                 }
@@ -2476,7 +2522,8 @@ impl Hart {
             csr::TDATA3 => c.tdata3[c.tselect as usize],
             csr::TINFO => csr::trig::TINFO_VAL,
             csr::MCONTEXT => c.mcontext,
-            csr::MCYCLE | csr::MINSTRET => c.minstret,
+            csr::MCYCLE => c.mcycle,
+            csr::MINSTRET => c.minstret,
             csr::MHPMCOUNTER3..=csr::MHPMCOUNTER31 => {
                 c.mhpmcounter[(num - csr::MHPMCOUNTER3) as usize]
             }
@@ -2828,7 +2875,11 @@ impl Hart {
             csr::MCONTEXT => {
                 self.csr.mcontext = v & 0x1fff;
             }
-            csr::MCYCLE | csr::MINSTRET => {
+            csr::MCYCLE => {
+                self.csr.mcycle = v;
+                self.cycle_written = true;
+            }
+            csr::MINSTRET => {
                 self.csr.minstret = v;
                 self.instret_written = true;
             }

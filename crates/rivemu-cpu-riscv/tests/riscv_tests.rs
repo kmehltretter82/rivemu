@@ -1720,6 +1720,8 @@ fn svukte_zjpm_and_zicfilp_semantics() {
         .unwrap();
     let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
     h.reset(0x8002_1000);
+    // Firmware enables the stateen-gated S-mode state (mstateen resets to 0).
+    h.csr_write(csr::MSTATEEN0, csr::stateen::M0_MASK).unwrap();
     h.csr.mtvec = 0x8000_0800;
     const PT_ROOT: u64 = 0x8002_0000;
     const CODE_PA: u64 = 0x8002_1000;
@@ -2032,6 +2034,103 @@ fn svnapot_sv57_and_zawrs_semantics() {
     assert_eq!(h.csr.mtval, 0x00d0_0073);
 }
 
+/// Zicbom/Zicboz: a cache-block operation on physical memory with no PMA
+/// region raises a store/AMO access fault (Sail `phys_access_check`). Found by
+/// riscv-arch-test Sv_Zicbo_*_zicbom_exceptions (cp_leaf_PTE_to_nonexistent_pa):
+/// rivemu checked PMP only, so cbo.clean/flush/inval silently succeeded.
+#[test]
+fn cbo_to_unmapped_physical_memory_raises_store_access_fault() {
+    use rivemu_cpu_riscv::{cause, csr};
+
+    const CODE: u64 = 0x8000_0000;
+    const MTVEC: u64 = 0x8000_0800;
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    // cbo.clean, cbo.flush, cbo.inval, cbo.zero (a0)
+    let insns: [u64; 4] = [0x0015_200f, 0x0025_200f, 0x0005_200f, 0x0045_200f];
+    for (i, &w) in insns.iter().enumerate() {
+        bus.write(CODE + i as u64 * 4, AccessSize::Word, w).unwrap();
+    }
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    for i in 0..insns.len() as u64 {
+        let pc = CODE + i * 4;
+        h.reset(pc);
+        h.csr.mtvec = MTVEC;
+        h.x[10] = 0x123;
+        h.step(&bus);
+        assert_eq!(h.pc, MTVEC, "insn {i}");
+        assert_eq!(
+            h.csr_read(csr::MCAUSE),
+            Some(cause::STORE_ACCESS),
+            "insn {i}"
+        );
+        assert_eq!(h.csr_read(csr::MTVAL), Some(0x123), "insn {i}");
+
+        h.reset(pc);
+        h.x[10] = CODE + 0x1000;
+        h.step(&bus);
+        assert_eq!(h.pc, pc + 4, "insn {i}");
+    }
+}
+
+/// `mcycle` and `minstret` are separate counters (privileged spec 3.1.10/3.1.12):
+/// `mcountinhibit.CY` and `.IR` stop one each, Smcntrpmf filters them with
+/// `mcyclecfg` and `minstretcfg`, and writing one leaves the other alone. Found by
+/// riscv-arch-test Sm_mcsr_cntr (cp_inhibit_mcycle): rivemu returned `minstret`
+/// for `mcycle`, so `mcycle` kept counting with CY = 1.
+#[test]
+fn mcycle_and_minstret_are_separate_counters() {
+    use rivemu_cpu_riscv::csr;
+
+    const CODE: u64 = 0x8000_0000;
+    const CSRW_MCYCLE_X5: u64 = 0xb002_9073; // csrrw x0, mcycle, x5
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    for i in 0..64 {
+        bus.write(CODE + i * 4, AccessSize::Word, 0x0000_0013)
+            .unwrap(); // nop
+    }
+    bus.write(CODE + 0x200, AccessSize::Word, CSRW_MCYCLE_X5)
+        .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+
+    // CY = 1 stops mcycle only (single-step path).
+    h.csr_write(csr::MCOUNTINHIBIT, 1).unwrap();
+    for _ in 0..5 {
+        h.step(&bus);
+    }
+    assert_eq!(h.csr_read(csr::MCYCLE), Some(0));
+    assert_eq!(h.csr_read(csr::MINSTRET), Some(5));
+
+    // IR = 1 stops minstret only (basic-block path).
+    h.csr_write(csr::MCOUNTINHIBIT, 4).unwrap();
+    assert_eq!(h.run(&bus, 8), 8);
+    assert_eq!(h.csr_read(csr::MCYCLE), Some(8));
+    assert_eq!(h.csr_read(csr::MINSTRET), Some(5));
+
+    // Writing mcycle leaves minstret alone, and the written value is not
+    // incremented by the writing instruction.
+    h.csr_write(csr::MCOUNTINHIBIT, 0).unwrap();
+    h.pc = CODE + 0x200;
+    h.x[5] = 100;
+    h.step(&bus);
+    assert_eq!(h.csr_read(csr::MCYCLE), Some(100));
+    assert_eq!(h.csr_read(csr::MINSTRET), Some(6));
+
+    // Smcntrpmf: mcyclecfg.MINH stops mcycle in M-mode while minstret counts.
+    h.csr_write(csr::MCYCLECFG, csr::hpmevent::MINH).unwrap();
+    h.pc = CODE;
+    for _ in 0..3 {
+        h.step(&bus);
+    }
+    assert_eq!(h.csr_read(csr::MCYCLE), Some(100));
+    assert_eq!(h.csr_read(csr::MINSTRET), Some(9));
+}
+
 #[test]
 fn smepmp_and_smstateen_semantics() {
     use rivemu_cpu_riscv::{Priv, cause, csr};
@@ -2052,8 +2151,23 @@ fn smepmp_and_smstateen_semantics() {
     h.csr.mtvec = 0x8000_0100;
 
     // 1. Smstateen / Ssstateen:
-    // By default, mstateen0 has M0_MASK (SE | ENVCFG | CONTEXT | SRMCFG) enabled:
+    // "On reset, all writable mstateen bits are initialized by the hardware
+    // to zeros", so S-mode cannot reach the gated state until M-mode enables
+    // it. All of M0_MASK (SE | ENVCFG | CONTEXT | SRMCFG) is writable.
+    for n in 0..4 {
+        assert_eq!(h.csr_read(csr::MSTATEEN0 + n).unwrap(), 0);
+    }
+    h.prv = Priv::Supervisor;
+    assert!(h.csr_read(csr::SENVCFG).is_none());
+    assert!(h.csr_read(csr::SSTATEEN0).is_none());
+    h.prv = Priv::Machine;
+    h.csr_write(csr::MSTATEEN0, u64::MAX).unwrap();
     assert_eq!(h.csr_read(csr::MSTATEEN0).unwrap(), csr::stateen::M0_MASK);
+    // Direct S-mode boot stands in for firmware and enables them.
+    let mut booted = Hart::new(1, Arc::new(FrozenTimebase(0)));
+    booted.init_smode_boot(CODE, 0);
+    assert_eq!(booted.csr.mstateen[0], csr::stateen::M0_MASK);
+    assert!(booted.csr_read(csr::SENVCFG).is_some());
     h.prv = Priv::Supervisor;
     assert!(h.csr_read(csr::SENVCFG).is_some());
     assert_eq!(h.csr_read(csr::SSTATEEN0).unwrap(), 0);
@@ -2583,6 +2697,8 @@ fn svrsw60t59b_smmpm_ssqosid_and_zicbop_semantics() {
 
     let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
     h.reset(CODE);
+    // Firmware enables the stateen-gated S-mode state (mstateen resets to 0).
+    h.csr_write(csr::MSTATEEN0, csr::stateen::M0_MASK).unwrap();
     h.csr_write(csr::MTVEC, MTVEC).unwrap();
     h.csr_write(csr::SATP, (8u64 << 60) | (PT_ROOT >> 12))
         .unwrap();

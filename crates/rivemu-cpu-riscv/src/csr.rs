@@ -355,6 +355,9 @@ pub struct Csrs {
     pub mcontext: u64,
     pub active_trigger_mask: u8,
     pub minstret: u64,
+    /// `mcycle`. One cycle per retired instruction, but inhibited, filtered
+    /// and written independently of `minstret`.
+    pub mcycle: u64,
 }
 
 impl Csrs {
@@ -483,12 +486,10 @@ impl Default for Csrs {
             vtype: 1 << 63,
             ssp: 0,
             mseccfg: 0,
-            mstateen: [
-                stateen::M0_MASK,
-                stateen::M1_3_MASK,
-                stateen::M1_3_MASK,
-                stateen::M1_3_MASK,
-            ],
+            // Smstateen: "On reset, all writable mstateen bits are
+            // initialized by the hardware to zeros." Firmware (or
+            // Hart::init_smode_boot, which stands in for it) enables them.
+            mstateen: [0; 4],
             sstateen: [0; 4],
             pmpcfg: [0; PMP_ENTRIES],
             pmpaddr: [0; PMP_ENTRIES],
@@ -500,6 +501,7 @@ impl Default for Csrs {
             mcontext: 0,
             active_trigger_mask: 0,
             minstret: 0,
+            mcycle: 0,
         }
     }
 }

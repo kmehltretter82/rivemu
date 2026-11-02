@@ -13,7 +13,10 @@ use rivemu_virtio::{NvmeCq, NvmeSnapshot, NvmeSq, VirtQueue, VirtioPciSnapshot};
 
 use crate::virt::{Machine, memmap};
 
-const SNAPSHOT_MAGIC: &[u8; 8] = b"RIVSNAP2";
+/// Current format. RIVSNAP3 added `mcycle` after the PMP state of each hart.
+const SNAPSHOT_MAGIC: &[u8; 8] = b"RIVSNAP3";
+/// Previous format, still accepted: `mcycle` was not separate from `minstret`.
+const SNAPSHOT_MAGIC_V2: &[u8; 8] = b"RIVSNAP2";
 
 impl Machine {
     /// Saves the complete VM state (CPUs, devices, and non-zero 4 KiB RAM
@@ -107,6 +110,7 @@ impl Machine {
             for &addr in &h.csr.pmpaddr {
                 write_u64(&mut w, addr)?;
             }
+            write_u64(&mut w, h.csr.mcycle)?;
         }
 
         // CLINT
@@ -210,7 +214,8 @@ impl Machine {
         let mut r = BufReader::with_capacity(256 * 1024, File::open(path)?);
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
-        if &magic != SNAPSHOT_MAGIC {
+        let v2 = &magic == SNAPSHOT_MAGIC_V2;
+        if &magic != SNAPSHOT_MAGIC && !v2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid rivemu snapshot magic",
@@ -330,6 +335,11 @@ impl Machine {
             for addr in &mut h.csr.pmpaddr {
                 *addr = read_u64(&mut r)?;
             }
+            h.csr.mcycle = if v2 {
+                h.csr.minstret
+            } else {
+                read_u64(&mut r)?
+            };
             h.update_pmp_state();
             h.pending_sbi = false;
             h.pending_semihost = false;
