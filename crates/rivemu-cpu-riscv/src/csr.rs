@@ -447,7 +447,13 @@ impl Default for Csrs {
             mip: 0,
             mtvec: 0,
             mcounteren: 0,
-            menvcfg: envcfg::CBIE_MASK | envcfg::CBCFE | envcfg::CBZE | envcfg::PBMTE,
+            // ADUE = 1: hardware A/D updating (Svadu) is enabled at reset,
+            // matching what the MMU does unless Svade is selected.
+            menvcfg: envcfg::CBIE_MASK
+                | envcfg::CBCFE
+                | envcfg::CBZE
+                | envcfg::PBMTE
+                | envcfg::ADUE,
             mcountinhibit: 0,
             mcyclecfg: 0,
             minstretcfg: 0,

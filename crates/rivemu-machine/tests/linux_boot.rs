@@ -453,6 +453,7 @@ fn main() {
         strict_align: true,
         svade: true,
         strict_pmp: true,
+        semihosting: false,
     })
     .expect("machine init");
 

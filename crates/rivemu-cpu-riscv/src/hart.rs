@@ -310,6 +310,12 @@ pub struct Hart {
     pub pending_sbi: bool,
     /// Set when an `ebreak` matches the RISC-V Semihosting magic sequence.
     pub pending_semihost: bool,
+    /// Service RISC-V Semihosting calls (`-semihosting`). When `false`, the
+    /// magic sequence's `ebreak` raises a breakpoint exception like any other
+    /// `ebreak`, as on QEMU without `-semihosting` or on hardware without a
+    /// debugger. OpenSBI probes for semihosting this way and, when the probe
+    /// succeeds, uses the semihosting console instead of the UART.
+    pub semihosting: bool,
     /// Whether the hart is parked in the SBI HSM `STOPPED` state.
     pub hsm_stopped: bool,
     /// Per-hart SBI FWFT locks: bit 0 for landing pads, bit 1 for shadow stacks.
@@ -383,6 +389,7 @@ impl Hart {
             handle_sbi: false,
             pending_sbi: false,
             pending_semihost: false,
+            semihosting: false,
             hsm_stopped: false,
             fwft_locks: 0,
             strict_align: false,
@@ -397,6 +404,19 @@ impl Hart {
         }
     }
 
+    /// Selects Svade (`true`: missing A/D bits raise page faults) or Svadu
+    /// (`false`: hardware updates them) as the reset scheme by setting the
+    /// reset value of `menvcfg.ADUE`. Software can still change `ADUE`;
+    /// the MMU follows the current `ADUE` value.
+    pub fn set_svade(&mut self, svade: bool) {
+        self.svade = svade;
+        if svade {
+            self.csr.menvcfg &= !csr::envcfg::ADUE;
+        } else {
+            self.csr.menvcfg |= csr::envcfg::ADUE;
+        }
+    }
+
     /// Resets architectural state and starts execution at `pc`.
     pub fn reset(&mut self, pc: u64) {
         self.pc = pc;
@@ -405,6 +425,9 @@ impl Hart {
         self.v = [[0; 32]; 32];
         self.prv = Priv::Machine;
         self.csr = Csrs::default();
+        if self.svade {
+            self.csr.menvcfg &= !csr::envcfg::ADUE;
+        }
         self.wfi = false;
         self.reservation = None;
         self.flush_tlb();
@@ -1496,7 +1519,7 @@ impl Hart {
                 }
             }
             Op::Ebreak => {
-                if insn.len == 4 && self.is_semihost_sequence(bus, pc) {
+                if self.semihosting && insn.len == 4 && self.is_semihost_sequence(bus, pc) {
                     self.pending_semihost = true;
                     self.yield_slice = true;
                 } else {

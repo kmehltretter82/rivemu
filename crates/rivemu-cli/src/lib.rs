@@ -234,6 +234,8 @@ pub struct Options {
     pub svade: bool,
     /// Enforce strict PMP rules (deny S/U-mode access even when all PMP entries are `OFF`).
     pub strict_pmp: bool,
+    /// `-semihosting` / `-semihosting-config enable=on`: service RISC-V Semihosting calls.
+    pub semihosting: bool,
 }
 
 impl Default for Options {
@@ -277,6 +279,7 @@ impl Default for Options {
             strict_align: false,
             svade: false,
             strict_pmp: false,
+            semihosting: false,
         }
     }
 }
@@ -531,6 +534,11 @@ where
                 o.strict_align = true;
                 o.svade = true;
                 o.strict_pmp = true;
+            }
+            "semihosting" => o.semihosting = true,
+            "semihosting-config" => {
+                let v = value()?;
+                o.semihosting = !v.split(',').any(|item| item == "enable=off");
             }
             _ => return Err(CliError::InvalidOption(name)),
         }
@@ -892,6 +900,7 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
         strict_align: o.strict_align,
         svade: o.svade,
         strict_pmp: o.strict_pmp,
+        semihosting: o.semihosting,
     })
 }
 
@@ -942,6 +951,7 @@ Debugging:
 
 Misc:
   -no-reboot                        exit instead of rebooting
+  -semihosting                      service RISC-V Semihosting calls (off by default)
   -no-shutdown                      stop instead of exiting on guest shutdown
   -name string                      guest name
   -h|-help                          display this help and exit

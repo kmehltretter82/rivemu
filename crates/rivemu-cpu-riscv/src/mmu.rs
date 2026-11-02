@@ -635,11 +635,12 @@ impl Hart {
                 }
                 ((ppn | ((va >> 12) & low_mask)) << 12, (9 * level) as u8)
             };
-            // Svade vs Svadu: when Svade is active (`self.svade` and `menvcfg.ADUE == 0`),
-            // missing A (or D on a store / shadow-stack store) raises a page fault instead of updating the PTE.
+            // Svade vs Svadu: with `menvcfg.ADUE == 0`, a missing A bit (or D on
+            // a store / shadow-stack store) raises a page fault instead of
+            // updating the PTE ("the implementation behaves as though Svadu
+            // were not implemented"; Sail `hw_updates_pte`).
             let needs_dirty = matches!(acc, Access::Store | Access::ShadowStackStore);
-            if self.svade
-                && self.csr.menvcfg & envcfg::ADUE == 0
+            if self.csr.menvcfg & envcfg::ADUE == 0
                 && (pte & pte::A == 0 || (needs_dirty && pte & pte::D == 0))
             {
                 return Err(acc.page_fault(va));

@@ -169,6 +169,8 @@ pub struct MachineConfig {
     pub svade: bool,
     /// Enforce strict PMP rules (deny S/U-mode access even when all PMP entries are `OFF`).
     pub strict_pmp: bool,
+    /// Service RISC-V Semihosting calls (`-semihosting`); off by default, as in QEMU.
+    pub semihosting: bool,
 }
 
 impl Default for MachineConfig {
@@ -189,6 +191,7 @@ impl Default for MachineConfig {
             strict_align: false,
             svade: false,
             strict_pmp: false,
+            semihosting: false,
         }
     }
 }
@@ -403,8 +406,9 @@ impl Machine {
             .map(|i| {
                 let mut h = Hart::new(u64::from(i), tb.clone());
                 h.strict_align = config.strict_align;
-                h.svade = config.svade;
+                h.set_svade(config.svade);
                 h.strict_pmp = config.strict_pmp;
+                h.semihosting = config.semihosting;
                 h.update_pmp_state();
                 h
             })
@@ -647,6 +651,7 @@ impl Machine {
                 initrd: boot.initrd,
                 plic_ndev: PLIC_NUM_SOURCES as u32 - 1,
                 virtio: virtio_fdt,
+                svade: config.svade,
             }),
         };
         let fdt_top = ram_end.min(3072 * MIB);
@@ -1355,6 +1360,7 @@ mod tests {
         let kernel = TempFile::new("semihost", &raw);
         let mut m = Machine::new(MachineConfig {
             kernel: Some(kernel.0.clone()),
+            semihosting: true,
             ..Default::default()
         })
         .unwrap();

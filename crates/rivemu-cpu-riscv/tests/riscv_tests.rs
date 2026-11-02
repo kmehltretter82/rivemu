@@ -3190,3 +3190,99 @@ fn rvv_signed_division_overflow_at_sew64() {
         assert_eq!((q, r), (i64::MIN, 0), "lane {lane}");
     }
 }
+
+/// Privileged spec (Svadu): with `menvcfg.ADUE = 0` "the implementation
+/// behaves as though Svadu were not implemented", so a missing A bit (or a
+/// missing D bit on a store) raises a page fault. A default hart resets with
+/// ADUE = 1 and updates A/D in hardware; clearing ADUE must switch it to
+/// Svade behaviour (Sail 0.16 `hw_updates_pte`).
+#[test]
+fn menvcfg_adue_selects_hardware_ad_updates_or_page_faults() {
+    use rivemu_cpu_riscv::csr::envcfg;
+    use rivemu_cpu_riscv::{Priv, cause};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    // Sv39 1 GiB leaf (VA 0x8000_0000 -> PA 0x8000_0000), V|R|W|X, A = D = 0.
+    let root_pt = 0x8001_0000u64;
+    let pte_addr = root_pt + 2 * 8;
+    let pte_base = (0x80000u64 << 10) | 0x0f;
+    bus.write(pte_addr, AccessSize::Double, pte_base).unwrap();
+    // lw x1, 0(x10)
+    bus.write(0x8000_0000, AccessSize::Word, 0x0005_2083)
+        .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(0x8000_0000);
+    assert_ne!(h.csr.menvcfg & envcfg::ADUE, 0, "ADUE = 1 at reset");
+    let enter_s = |h: &mut Hart| {
+        h.prv = Priv::Supervisor;
+        h.csr.satp = (8u64 << 60) | (root_pt >> 12);
+        h.csr.medeleg = 0xffff;
+        h.csr.stvec = 0x8000_0200;
+        h.x[10] = 0x8000_2000;
+        h.pc = 0x8000_0000;
+        h.invalidate_tlb();
+    };
+
+    // ADUE = 1: the fetch and load succeed and hardware sets A.
+    enter_s(&mut h);
+    h.step(&bus);
+    assert_eq!(h.pc, 0x8000_0004);
+    assert_ne!(
+        bus.read(pte_addr, AccessSize::Double).unwrap() & (1 << 6),
+        0
+    );
+
+    // ADUE = 0: the same access with A = 0 raises an instruction page fault.
+    bus.write(pte_addr, AccessSize::Double, pte_base).unwrap();
+    h.csr.menvcfg &= !envcfg::ADUE;
+    enter_s(&mut h);
+    h.step(&bus);
+    assert_eq!(h.csr.scause, cause::INSN_PAGE_FAULT);
+    assert_eq!(bus.read(pte_addr, AccessSize::Double).unwrap(), pte_base);
+
+    // Selecting Svade (strict mode) makes ADUE = 0 the reset value.
+    h.set_svade(true);
+    h.reset(0x8000_0000);
+    assert_eq!(h.csr.menvcfg & envcfg::ADUE, 0);
+}
+
+/// The RISC-V Semihosting sequence `slli x0, x0, 0x1f; ebreak; srai x0, x0, 7`
+/// is serviced only when semihosting is enabled (`-semihosting`). Otherwise
+/// its `ebreak` raises a breakpoint exception, as on QEMU without
+/// `-semihosting`: OpenSBI probes for semihosting this way and switches its
+/// console away from the UART when the probe does not trap.
+#[test]
+fn semihosting_sequence_traps_unless_enabled() {
+    use rivemu_cpu_riscv::cause;
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    for (i, w) in [0x01f0_1013u64, 0x0010_0073, 0x4070_5013]
+        .into_iter()
+        .enumerate()
+    {
+        bus.write(0x8000_0000 + 4 * i as u64, AccessSize::Word, w)
+            .unwrap();
+    }
+    for enabled in [false, true] {
+        let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+        h.reset(0x8000_0000);
+        h.csr.mtvec = 0x8000_0100;
+        h.semihosting = enabled;
+        h.step(&bus);
+        h.step(&bus);
+        if enabled {
+            assert!(h.pending_semihost);
+            assert_eq!(h.csr.mcause, 0);
+        } else {
+            assert!(!h.pending_semihost);
+            assert_eq!(h.csr.mcause, cause::BREAKPOINT);
+            assert_eq!(h.csr.mepc, 0x8000_0004);
+            assert_eq!(h.pc, 0x8000_0100);
+        }
+    }
+}
