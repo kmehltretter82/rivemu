@@ -133,6 +133,58 @@ const fn access_size(bytes: usize) -> AccessSize {
     }
 }
 
+/// Reserved register usage of single-width arithmetic and merge/move
+/// instructions (RVV 1.0 sections 3.4.2 and 5.3; Sail `illegal_normal`,
+/// `illegal_vd_masked`, `illegal_vd_unmasked`, `valid_reg_group`):
+/// operand groups must be aligned to LMUL, and a masked instruction may not
+/// write v0. Widening, narrowing, mask-producing, reduction and permutation
+/// instructions have other rules and are not checked here.
+fn single_width_reserved(
+    f3: u32,
+    funct6: u32,
+    vm: u32,
+    vd: usize,
+    vs1: usize,
+    vs2: usize,
+    lmul: i32,
+) -> bool {
+    let vector_vs1 = matches!(f3, 0..=2);
+    let normal = match f3 {
+        // OPIVV, OPIVI, OPIVX
+        0 | 3 | 4 => matches!(
+            funct6,
+            0x00 | 0x02 | 0x03 | 0x04..=0x07 | 0x09..=0x0b | 0x20..=0x23 | 0x25 | 0x27..=0x2b
+        ),
+        // OPMVV, OPMVX
+        2 | 6 => matches!(
+            funct6,
+            0x08..=0x0b | 0x20..=0x27 | 0x29 | 0x2b | 0x2d | 0x2f
+        ),
+        // OPFVV, OPFVF
+        1 | 5 => matches!(
+            funct6,
+            0x00 | 0x02 | 0x04 | 0x06 | 0x08..=0x0a | 0x20 | 0x21 | 0x24 | 0x27..=0x2f
+        ),
+        _ => false,
+    };
+    if normal {
+        return (vm == 0 && vd == 0)
+            || !valid_reg_group(vd, lmul)
+            || !valid_reg_group(vs2, lmul)
+            || (vector_vs1 && !valid_reg_group(vs1, lmul));
+    }
+    // vmerge / vmv.v.{v,x,i} (OPIV*) and vfmerge / vfmv.v.f (OPFVF).
+    if funct6 == 0x17 && matches!(f3, 0 | 3 | 4 | 5) {
+        let bad_vs1 = f3 == 0 && !valid_reg_group(vs1, lmul);
+        return if vm == 0 {
+            vd == 0 || !valid_reg_group(vd, lmul) || !valid_reg_group(vs2, lmul) || bad_vs1
+        } else {
+            vs2 != 0 || !valid_reg_group(vd, lmul) || bad_vs1
+        };
+    }
+    false
+}
+
 fn fixed_point_round_shift_u(val: u128, d: u32, vxrm: u64) -> u128 {
     if d == 0 {
         return val;
@@ -600,6 +652,22 @@ impl Hart {
                     _ => None,
                 }
             };
+            // `vsetvl{i} x0, x0, vtype` keeps vl and is reserved when the
+            // SEW/LMUL ratio would change or vtype was invalid; set vill
+            // in that case, as the Sail model does (RVV 1.0 6.2).
+            let keeps_vl = (raw >> 30) != 0b11 && rs1 == 0 && vd == 0;
+            let old_vtype = self.csr.vtype;
+            let ratio_kept = match (lmul_pow(old_vtype), lmul_pow(zimm)) {
+                (Some(old_lmul), Some(new_lmul)) if old_vtype >> 63 == 0 => {
+                    old_lmul - ((old_vtype >> 3) & 7) as i32 == new_lmul - vsew as i32
+                }
+                _ => false,
+            };
+            let vlmax_opt = if keeps_vl && !ratio_kept {
+                None
+            } else {
+                vlmax_opt
+            };
             let Some(vlmax) = vlmax_opt else {
                 self.csr.vtype = 1 << 63;
                 self.csr.vl = 0;
@@ -647,6 +715,10 @@ impl Hart {
             return Err(illegal());
         };
         if self.csr.vstart != 0 {
+            return Err(illegal());
+        }
+        let lmul = lmul_pow(self.csr.vtype).ok_or_else(illegal)?;
+        if single_width_reserved(f3, funct6, vm, vd, rs1, rs2, lmul) {
             return Err(illegal());
         }
 

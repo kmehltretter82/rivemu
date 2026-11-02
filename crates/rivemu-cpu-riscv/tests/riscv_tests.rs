@@ -3058,6 +3058,7 @@ fn rvv_segment_groups_vstart_on_fault_and_reserved_memory_encodings() {
     let vsseg2e32 = |vs3: u32| (1 << 29) | (1 << 25) | (12 << 15) | (6 << 12) | (vs3 << 7) | 0x27;
     let vle32 = |vd: u32, vm: u32| (vm << 25) | (10 << 15) | (6 << 12) | (vd << 7) | 0x07;
     let vlseg8e32 = |vd: u32| (7 << 29) | (1 << 25) | (10 << 15) | (6 << 12) | (vd << 7) | 0x07;
+    let vse32_v0_masked: u32 = (12 << 15) | (6 << 12) | 0x27;
 
     // Each instruction gets its own slot: rewriting one address would hit
     // the decoded-instruction cache without a `fence.i`.
@@ -3126,9 +3127,25 @@ fn rvv_segment_groups_vstart_on_fault_and_reserved_memory_encodings() {
         ("nf * EMUL = 16 > 8", vlseg8e32(8)),
         ("fields run past v31", vlseg2e32(30)),
         ("masked load into v0", vle32(0, 0)),
+        // v0 would be read both as the mask (EEW=1) and as EEW=32 data.
+        ("masked store of v0", vse32_v0_masked),
     ] {
         run(&mut h, &bus, insn);
         assert_eq!(h.pc, MTVEC, "{what}");
         assert_eq!(h.csr.mcause, cause::ILLEGAL_INSN, "{what}");
     }
+
+    // 5. `vsetvli x0, x0, e32, m1` keeps vl only if SEW/LMUL is unchanged.
+    //    From e32/m2 the ratio changes: reserved, so vill is set and vl = 0.
+    const VSETVLI_X0_X0_E32_M1: u32 = (0x10 << 20) | (7 << 12) | 0x57;
+    const VSETVLI_X0_X0_E16_M1: u32 = (0x08 << 20) | (7 << 12) | 0x57;
+    run(&mut h, &bus, VSETVLI_E32_M2);
+    run(&mut h, &bus, VSETVLI_X0_X0_E32_M1);
+    assert_eq!(h.csr.vtype, 1 << 63);
+    assert_eq!(h.csr.vl, 0);
+    // From e32/m2 to e16/m1 the ratio is unchanged: vl is kept.
+    run(&mut h, &bus, VSETVLI_E32_M2);
+    run(&mut h, &bus, VSETVLI_X0_X0_E16_M1);
+    assert_eq!(h.csr.vtype, 0x08);
+    assert_eq!(h.csr.vl, 16);
 }
