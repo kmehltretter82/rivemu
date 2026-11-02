@@ -1,0 +1,7 @@
+name: rivemu-rv64
+compiler_exe: clang-20
+objdump_exe: llvm-objdump-20
+ref_model_exe: sail_riscv_sim
+udb_config: rivemu-rv64.yaml
+linker_script: link.ld
+dut_include_dir: .
