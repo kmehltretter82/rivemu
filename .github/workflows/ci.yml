@@ -49,6 +49,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Guest Rust PID 1 in tests/linux_boot.rs (required, not skipped).
+          targets: riscv64gc-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - uses: actions/cache@v4
         with:

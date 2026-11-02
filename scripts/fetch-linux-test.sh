@@ -19,6 +19,7 @@ OPENSBI_URL="https://github.com/riscv-software-src/opensbi/releases/download/v1.
 OPENSBI_TARBALL_SHA256="97a6f53276495203c25db8ce0f707936af96f0bfa0df5da9e50c426c12667164"
 OPENSBI_FW_DYNAMIC_SHA256="4be292368f8c24371101f1b1048ede17284210545378994b193852d779d59bfe"
 DEBIAN_KERNEL_SHA256="8898c27a38f0bfcc3d9a4b0687ee752c4a2b3028576f919ba8955d2cbd6d4722"
+DEBIAN_INITRD_SHA256="d67a00121f695898895ad41cb47ee4d21cecf07ed05a767a23c61d6897d0a844"
 
 sha256() {
     if command -v sha256sum >/dev/null 2>&1; then
@@ -88,7 +89,7 @@ if [[ ! -f "$OUT/rootfs.cpio" ]]; then
         echo "Fetching Debian riscv64 cdrom/initrd.gz..."
         curl -fsSL "$DEBIAN_IMAGES/cdrom/initrd.gz" -o "$initrd_gz"
     fi
-    verify "$initrd_gz" "" "debian-cdrom-initrd.gz"
+    verify "$initrd_gz" "$DEBIAN_INITRD_SHA256" "debian-cdrom-initrd.gz"
 
     echo "Building BusyBox + VirtIO rootfs.cpio..."
     work="$(mktemp -d)"
