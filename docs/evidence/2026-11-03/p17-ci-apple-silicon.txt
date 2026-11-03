@@ -12,6 +12,13 @@
 # aedb252   41590487482    9.014 (10.185)     10.363 (10.935)     24.320 / 29.177
 # eabd681   41593624316    7.148 ( 7.391)      7.564 ( 8.126)     18.750 / 20.673
 # 7860b3a   41594273005    7.943 ( 8.732)      7.610 ( 9.346)     21.235 / 25.211
+# 27ddcbf   41608020067    8.963 (14.82 )      9.96  (12.70 )     24.49  / 28.00
+# c2ffc78   41619541764    7.899 (11.269)      8.860 (10.828)     21.424 / 22.416
+# 8247296   41623958358    8.794 (10.729)      9.313 (11.680)     23.952 / 27.209
+# 21acfa8   41636562098    6.224 ( 7.670)      7.026 (11.401)     25.361 / 29.304
+#   (21acfa8: superblocks, fetch fast TLB; see p17-superblocks.txt. Its SMP4 p95
+#   is the round-1 samples, 10.0 to 11.4 s, in a slow period of the runner that
+#   shows in base too.)
 #
 # Runner speed varies between jobs: base SMP1 ranged from 18.75 to 24.32 s. Within a job,
 # head/base was 0.38 (eabd681) and 0.37 (7860b3a) for SMP1, 0.37 and 0.30 for SMP4.
