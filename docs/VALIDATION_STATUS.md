@@ -23,6 +23,7 @@ overlap. Findings, causes and fixes are in
 | Expanded `Suite::Vector` (random LMUL/SEW/mask, segments, indexed, reserved encodings) | `rivemu-lockstep` `3c57b83` | 256 blocks pass against Sail and QEMU after three RVV fixes. |
 | Boot lockstep P16/P26 (OpenSBI v1.7 + Linux 6.12 vs QEMU 11.1.3) | `rivemu-lockstep/docs/evidence/2026-11-02-boot-lockstep/run13-pass-30M-steps.log` | **30,000,000 instructions, 0 divergences** with `--check-csrs` (3M in run 10, 10M in run 12). Each earlier run stopped at a harness configuration difference or a rivemu bug (semihosting, `mstateen` reset); all are fixed. |
 | Trace-driven boot lockstep to the shell prompt | `rivemu-lockstep/docs/evidence/2026-11-03-boot-trace/` | OpenSBI + Linux 6.12 + BusyBox from the firmware entry to `~ # `: 3/3 runs, 358.6–362.8 M instructions each, 0 divergences; CI job `boot-trace` in rivemu-lockstep. |
+| H extension (`-cpu rv64,h=on`) | `rivemu-lockstep/docs/evidence/2026-11-03-h-extension/`; `crates/rivemu-cpu-riscv/tests/hypervisor.rs` | A 160-check test firmware (`rivemu-lockstep/firmware/h_test.S`) passes on QEMU 11.1.3 alone, on rivemu alone, and in trace lockstep (43,107 instructions, 61 exceptions, 4 interrupts, 0 divergences). OpenSBI + Linux with H on both sides reaches the shell prompt in lockstep with 0 divergences (364.9 M instructions). Two injected H bugs are each caught at the first trap they affect. QEMU differs from the spec in ten places around H (for example `mstatus.MPV` is not writable); the firmware's spec build adds 19 checks there, which the Sail model 0.16 and rivemu pass and QEMU fails 11 of. 11 rivemu unit tests cover the same ground. |
 | P17 on Apple Silicon | `evidence/2026-11-03/p17-ci-apple-silicon.txt` | CI `p17-bench (macos-latest)`, `eabd681`: 7.15 s SMP1 / 7.56 s SMP4 medians (targets 8 / 10 s); base 18.75 / 20.67 s. |
 | Sail multi-worker startup | `rivemu-lockstep/docs/evidence/2026-11-02-sail-startup/` | 25/25 clean 6-worker campaigns without the startup lock (was 17/24). |
 | CI hygiene | GitHub Actions on both PRs | `cargo fmt --check`, `clippy -D warnings`, MSRV 1.85, and `cargo deny` (rivemu) pass. rivemu-lockstep now has CI, including the differential suites. |
@@ -90,9 +91,10 @@ built-in-SBI Linux test both pass with the fix.
 | `riscv-arch-test` privileged subset | Verified 2026-11-02 | 418/418 (`tests/arch-test/README.md`). |
 | Guest PMU/perf | Verified 2026-11-02 (counting) | `linux_devices`: `riscv-pmu-sbi` probes 16 firmware and 31 hardware counters, and `perf_event_open` counts instructions. PMU overflow interrupts are not asserted. |
 | Boot lockstep P16/P26 | **Verified to the shell prompt**, 2026-11-03 | `rivemu-lockstep boot-trace` (QEMU at full speed with a trace plugin; rivemu checks every instruction, mirrors QEMU's interrupts, and takes QEMU's results for device-dependent reads): OpenSBI v1.7 + Linux 6.12 + BusyBox from the firmware entry to `~ # `, three runs of 358.6 M to 362.8 M instructions with 12,129 to 13,077 interrupts, **0 divergences** (`rivemu-lockstep/docs/evidence/2026-11-03-boot-trace/`). An injected `sraiw` bug is caught after 18.2 M instructions. The GDB-stepped `boot` mode reached 30,000,000 instructions with `--check-csrs` on 2026-11-02. Limits: one hart; rivemu runs through `Hart::step`, so the block and inline fast paths are covered by the equivalence tests, riscv-arch-test and the Linux E2E tests instead. |
+| H extension | **Implemented; verified against QEMU and the Sail model**, 2026-11-03 | See the 2026-11-03 table above. Not covered: a KVM guest under Linux; guest external interrupts (GEILEN = 0, no AIA); `htinst`/`mtinst` are always written as 0 (allowed); Sail runs the firmware standalone, not in lockstep; the third-party `riscv-hyp-tests` suite was not run (building it was not permitted in the cloud session). |
 | P27-P32 Sail/QEMU differential claims | Verified per suite 2026-11-02 | All 18 suites pass against Sail and against QEMU with `--step-check`. The Vector suite needed rework first; it had ignored its RNG. |
 | Benchmarks | Partial | The repeated exact-boundary P17 boot benchmark is retained. No CoreMark, Dhrystone, or criterion history was found. |
-| CI hygiene | Partial | `git diff --check` passes, and the changed lockstep Sail file passes targeted `rustfmt --check`. Repo-wide formatting checks fail on broad existing drift, while `clippy -D warnings` stops on five untouched `qemu_rust` vector warnings and three unchanged lockstep QEMU-test warnings. `cargo-deny` is not installed. No broad unrelated rewrite was made. |
+| CI hygiene | Verified 2026-11-02 | Both repositories pass `cargo fmt --check` and `clippy --all-targets -D warnings` in CI, rivemu also MSRV 1.85 and `cargo deny check`, and rivemu-lockstep runs `cargo deny` through `cargo-deny-action`. In the cloud session `cargo-deny` could not be installed locally, so its results come from CI only. |
 
 ## Retained validation transcripts
 
@@ -166,7 +168,9 @@ Ranked; details in [`REVIEW-20261102.md`](REVIEW-20261102.md) §6.
    takes 17–18 s.
 2. Trace lockstep: SMP (trace every hart), and a mode that runs rivemu's
    block path (`Hart::run`) instead of `Hart::step` between records.
-3. H extension (RVA23S64). Zama16b is implemented, and the README claims RVA23U64 only.
+3. H extension: boot a KVM guest under Linux (needs a KVM-enabled kernel
+   and a VMM in the image); guest external interrupts (AIA/IMSIC); run
+   `riscv-hyp-tests`.
 4. riscv-arch-test runs in CI (job `arch-test`, 1251/1251 in run 41568117929; the ELFs are cached by configuration).
 5. `linux_devices` now runs in CI (job `linux-devices`; the images build in
    about 20 min and are then cached).
