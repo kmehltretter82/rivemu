@@ -1,0 +1,12 @@
+# valgrind --tool=callgrind on a deterministic boot: rivemu -icount shift=3 -smp 1, Linux 6.12 + OpenSBI v1.7 to RIVEMU_SMOKE_OK + poweroff
+# (312.89 M guest instructions; RIVEMU_STATS). Host instructions executed (Ir), cumulative changes:
+head 89,164,554,897 smoke_ok=1
+bb4k 85,556,224,450 smoke_ok=1
+nocopy 84,629,596,015 smoke_ok=1
+fasttlb 66,460,246,915 smoke_ok=1
+bbfirst 63,828,863,495 smoke_ok=1
+# head    = 06e2df9
+# bb4k    = + 4096-entry block cache with folded index
+# nocopy  = + execute blocks without copying the cache entry
+# fasttlb = + load/store fast TLB (and RAM offsets for bare/M-mode accesses)
+# bbfirst = + try blocks before fused pairs (the committed state)

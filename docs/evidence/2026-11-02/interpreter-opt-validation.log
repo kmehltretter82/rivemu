@@ -1,0 +1,30 @@
+== binary b4bac5e7a0fa2860190b22f3de3d744e98b1e624e8c4005f51d846166a8c18db  target/release/rivemu-system-riscv64
+== cpu (riscv-tests required)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== workspace
+workspace done
+== clippy
+clippy done
+== ACT priv
+total: 418
+PASS: 418
+FAIL: 0
+TIMEOUT: 0
+== ACT rv64i
+total: 833
+PASS: 833
+FAIL: 0
+TIMEOUT: 0
+== linux devices
+test guest_reboot_resets_the_machine_and_boots_again ... ok
+test nvme_namespace_reads_and_writes_from_linux ... ok
+test sbi_pmu_counts_guest_instructions ... ok
+test snapshot_v2_restores_pci_nvme_into_a_fresh_machine ... ok
+test virtio_gpu_scanout_and_input_devices_work_from_linux ... ok
+test virtio_vsock_guest_connects_to_host_cid ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 53.54s
+done

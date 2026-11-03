@@ -1,0 +1,43 @@
+# scripts/bench-boot.sh 5 {1,4} base=... head=... opt=...
+# Same inputs as boot-bench-pmp-cache.txt (Linux 6.12 images/linux-src + OpenSBI v1.7, boot to RIVEMU_SMOKE_OK + poweroff).
+# base = 0946319 (branch base)                        sha256 fbc3f694e17b3737...
+# head = 06e2df9 (with the PMP page cache)             sha256 8c58910cff20a6fc...
+# opt  = 06e2df9 + decode-cache, fast-TLB and block-first changes (next commit) sha256 b4bac5e7a0fa2860...
+# Interleaved runs on an otherwise idle machine (fresh container).
+# host: 4 vCPU, 6.18.44-fc-v230; Tue Nov  3 01:34:26 UTC 2026; load: 0.25 0.07 0.02
+run 1 base smp=1 13.199453351s
+run 1 head smp=1 9.509075837s
+run 1 opt smp=1 7.839852387s
+run 2 base smp=1 12.540189747s
+run 2 head smp=1 9.661124714s
+run 2 opt smp=1 7.499388360s
+run 3 base smp=1 11.476628203s
+run 3 head smp=1 9.028819944s
+run 3 opt smp=1 8.306492657s
+run 4 base smp=1 10.344430676s
+run 4 head smp=1 8.855638261s
+run 4 opt smp=1 7.320130644s
+run 5 base smp=1 10.838014251s
+run 5 head smp=1 9.814295005s
+run 5 opt smp=1 7.397317774s
+base smp=1 n=5 median=11.48s min=10.34s max=13.20s
+head smp=1 n=5 median=9.51s min=8.86s max=9.81s
+opt smp=1 n=5 median=7.50s min=7.32s max=8.31s
+run 1 base smp=4 14.454062461s
+run 1 head smp=4 13.119795916s
+run 1 opt smp=4 9.253642077s
+run 2 base smp=4 15.580111412s
+run 2 head smp=4 13.606381366s
+run 2 opt smp=4 9.934917004s
+run 3 base smp=4 16.792317715s
+run 3 head smp=4 14.098113545s
+run 3 opt smp=4 9.572529249s
+run 4 base smp=4 16.914431959s
+run 4 head smp=4 14.033936136s
+run 4 opt smp=4 10.130424938s
+run 5 base smp=4 17.611289683s
+run 5 head smp=4 14.112458864s
+run 5 opt smp=4 9.046058218s
+base smp=4 n=5 median=16.79s min=14.45s max=17.61s
+head smp=4 n=5 median=14.03s min=13.12s max=14.11s
+opt smp=4 n=5 median=9.57s min=9.05s max=10.13s

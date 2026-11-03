@@ -148,6 +148,64 @@ impl PmpCache {
     }
 }
 
+/// Entries per access type in [`FastTlb`] (direct-mapped by virtual page).
+const FAST_TLB_SIZE: usize = 256;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FastTlbEntry {
+    /// `(va >> 12) + 1` (0 means invalid).
+    tag: u64,
+    /// [`Hart::fast_tlb_ctx`] when the entry was filled.
+    ctx: u64,
+    /// Physical address of the page.
+    pa_page: u64,
+    /// Byte offset of the page within `AddressSpace::fast_ram`.
+    ram_page_off: u64,
+    /// [`FastTlb::epoch`] when the entry was filled.
+    epoch: u32,
+}
+
+/// Fast path for scalar loads and stores to RAM: one direct-mapped table per
+/// access type, from virtual page to RAM offset.
+///
+/// An entry is filled only after the full translation (privilege, PTE
+/// permissions, A/D, Svukte, PMP) allowed that access type on that page, the
+/// page is plain RAM (`PBMT == 0`), and no PMP boundary lies inside a page.
+/// A hit is valid only for the same translation context ([`Hart::fast_tlb_ctx`]:
+/// privilege, `MPRV`, `MPP`, `SUM`, `MXR`, `senvcfg.UKTE`). Everything else
+/// the full path depends on invalidates the whole table:
+/// - `sfence.vma`, any TLB flush, and remote fences;
+/// - writes to `satp` (the table is not ASID-tagged) and `menvcfg`;
+/// - PMP changes.
+#[derive(Clone, Debug)]
+pub(crate) struct FastTlb {
+    load: Box<[FastTlbEntry; FAST_TLB_SIZE]>,
+    store: Box<[FastTlbEntry; FAST_TLB_SIZE]>,
+    epoch: u32,
+}
+
+impl Default for FastTlb {
+    fn default() -> Self {
+        Self {
+            load: Box::new([FastTlbEntry::default(); FAST_TLB_SIZE]),
+            store: Box::new([FastTlbEntry::default(); FAST_TLB_SIZE]),
+            epoch: 1,
+        }
+    }
+}
+
+impl FastTlb {
+    #[inline]
+    pub(crate) fn invalidate(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.load.fill(FastTlbEntry::default());
+            self.store.fill(FastTlbEntry::default());
+            self.epoch = 1;
+        }
+    }
+}
+
 /// Direct-mapped TLB caching leaf translations. Permissions are re-checked
 /// on every hit, so privilege/MPRV/SUM/MXR changes need no flush.
 #[derive(Clone, Debug)]
@@ -155,6 +213,8 @@ pub(crate) struct Tlb {
     entries: Box<[TlbEntry; TLB_SIZE]>,
     epoch: u32,
     has_superpages: bool,
+    /// Load/store fast path; invalidated with every flush and `sfence.vma`.
+    pub(crate) fast: FastTlb,
 }
 
 impl Default for Tlb {
@@ -163,6 +223,7 @@ impl Default for Tlb {
             entries: Box::new([TlbEntry::default(); TLB_SIZE]),
             epoch: 1,
             has_superpages: false,
+            fast: FastTlb::default(),
         }
     }
 }
@@ -170,6 +231,7 @@ impl Default for Tlb {
 impl Tlb {
     #[inline]
     pub(crate) fn flush(&mut self) {
+        self.fast.invalidate();
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             self.entries.fill(TlbEntry::default());
@@ -181,6 +243,7 @@ impl Tlb {
     /// Selective TLB invalidation for `sfence.vma` / `sinval.vma` per RISC-V
     /// Privileged Spec Section 12.2.1.
     pub(crate) fn sfence_vma(&mut self, rs1_idx: u8, rs2_idx: u8, va: u64, asid: u64) {
+        self.fast.invalidate();
         let target_asid = (asid & 0xffff) as u16;
         let vpn = va >> 12;
         match (rs1_idx != 0, rs2_idx != 0) {
@@ -335,6 +398,7 @@ impl Hart {
         self.pmp_enforced = !full_open_entry0 && (any_active || self.strict_pmp || mseccfg_active);
         self.pmp_subpage = self.pmp_enforced && subpage;
         self.pmp_cache.invalidate();
+        self.tlb.fast.invalidate();
     }
 
     /// Returns the inclusive physical address range `(lo, hi_inclusive)` matched
@@ -429,6 +493,56 @@ impl Hart {
         }
     }
 
+    /// Everything outside the TLB contents that decides whether a cached
+    /// translation still permits an access: privilege, `MPRV`/`MPP`,
+    /// `SUM`, `MXR` and `senvcfg.UKTE` (bit 8, moved to bit 0, which is
+    /// reserved in `mstatus`).
+    #[inline]
+    pub(crate) fn fast_tlb_ctx(&self) -> u64 {
+        (self.csr.mstatus & (status::MPRV | status::MPP | status::SUM | status::MXR))
+            | ((self.csr.senvcfg & envcfg::UKTE) >> 8)
+            | ((self.prv as u64) << 62)
+    }
+
+    /// RAM offset for a load from `va` (within one page) on a fast-TLB hit.
+    #[inline]
+    pub(crate) fn fast_load_ram_off(&self, va: u64) -> Option<u64> {
+        let e = &self.tlb.fast.load[((va >> 12) as usize) & (FAST_TLB_SIZE - 1)];
+        (e.tag == (va >> 12) + 1 && e.epoch == self.tlb.fast.epoch && e.ctx == self.fast_tlb_ctx())
+            .then_some(e.ram_page_off | (va & 0xfff))
+    }
+
+    /// `(pa, ram_off)` for a store to `va` (within one page) on a fast-TLB hit.
+    #[inline]
+    pub(crate) fn fast_store_ram_off(&self, va: u64) -> Option<(u64, u64)> {
+        let e = &self.tlb.fast.store[((va >> 12) as usize) & (FAST_TLB_SIZE - 1)];
+        (e.tag == (va >> 12) + 1 && e.epoch == self.tlb.fast.epoch && e.ctx == self.fast_tlb_ctx())
+            .then_some((e.pa_page | (va & 0xfff), e.ram_page_off | (va & 0xfff)))
+    }
+
+    /// Records a translation that the full path allowed. `ram_off` is the
+    /// value [`Self::translate_with_ram_off`] returned (`u64::MAX` for
+    /// anything but plain RAM).
+    #[inline]
+    pub(crate) fn fast_tlb_fill(&mut self, va: u64, pa: u64, ram_off: u64, store: bool) {
+        if ram_off == u64::MAX || self.pmp_subpage {
+            return;
+        }
+        let e = FastTlbEntry {
+            tag: (va >> 12) + 1,
+            ctx: self.fast_tlb_ctx(),
+            pa_page: pa & !0xfff,
+            ram_page_off: ram_off & !0xfff,
+            epoch: self.tlb.fast.epoch,
+        };
+        let idx = ((va >> 12) as usize) & (FAST_TLB_SIZE - 1);
+        if store {
+            self.tlb.fast.store[idx] = e;
+        } else {
+            self.tlb.fast.load[idx] = e;
+        }
+    }
+
     /// [`Self::pmp_check`] for a 1-byte access, cached per physical page
     /// (see [`PmpCache`]) unless a PMP entry boundary lies inside a page.
     #[inline]
@@ -495,7 +609,13 @@ impl Hart {
             {
                 return Err(acc.access_fault(va));
             }
-            return Ok((va, u64::MAX));
+            if self.pmp_subpage {
+                return Ok((va, u64::MAX));
+            }
+            let ram_off = bus
+                .fast_ram_page_offset(va & !0xfff)
+                .map_or(u64::MAX, |o| o | (va & 0xfff));
+            return Ok((va, ram_off));
         }
         if prv == Priv::User && (self.csr.senvcfg & envcfg::UKTE) != 0 && (va >> 63) != 0 {
             return Err(acc.page_fault(va));

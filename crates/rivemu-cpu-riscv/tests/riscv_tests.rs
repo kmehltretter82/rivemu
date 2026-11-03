@@ -2034,6 +2034,93 @@ fn svnapot_sv57_and_zawrs_semantics() {
     assert_eq!(h.csr.mtval, 0x00d0_0073);
 }
 
+/// The load/store fast TLB must not outlive the context it was filled in:
+/// clearing `mstatus.SUM` and switching `satp` to another ASID whose mapping is
+/// read-only must both take effect on the next access to an already-cached page.
+#[test]
+fn fast_tlb_follows_sum_and_satp_changes() {
+    use rivemu_cpu_riscv::{Priv, cause, csr};
+
+    const CODE: u64 = 0x8000_0000;
+    const MTVEC: u64 = 0x8000_0800;
+    const ROOT_A: u64 = 0x8002_0000;
+    const ROOT_B: u64 = 0x8003_0000;
+    const DATA_OFF: u64 = 0x1_0000;
+    const DATA_VA: u64 = 0x4000_0000 + DATA_OFF; // gigapage 1 -> PA 0x8000_0000
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    bus.write(CODE, AccessSize::Word, 0x0005_3583).unwrap(); // ld x11, 0(x10)
+    bus.write(CODE + 4, AccessSize::Word, 0x00c5_3023).unwrap(); // sd x12, 0(x10)
+    let giga = 0x8_0000u64 << 10; // PPN of 0x8000_0000
+    // Code: gigapage 2, identity, S-only RWX. Data: gigapage 1, U.
+    for root in [ROOT_A, ROOT_B] {
+        bus.write(root + 2 * 8, AccessSize::Double, giga | 0xcf)
+            .unwrap();
+    }
+    bus.write(ROOT_A + 8, AccessSize::Double, giga | 0xd7)
+        .unwrap(); // U|R|W|A|D
+    bus.write(ROOT_B + 8, AccessSize::Double, giga | 0x53)
+        .unwrap(); // U|R|A
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mtvec = MTVEC;
+    let satp = |root: u64, asid: u64| (8u64 << 60) | (asid << 44) | (root >> 12);
+    let m_write = |h: &mut Hart, num: u16, v: u64| {
+        h.prv = Priv::Machine;
+        h.csr_write(num, v).unwrap();
+    };
+    let run_s = |h: &mut Hart, pc: u64, value: u64| {
+        h.prv = Priv::Supervisor;
+        h.pc = pc;
+        h.x[10] = DATA_VA;
+        h.x[12] = value;
+        h.step(&bus);
+    };
+    let sum = csr::status::SUM;
+
+    // Root A, SUM = 1: store and load twice each. The first access walks the
+    // page table; the second hits the TLB and fills the fast path.
+    m_write(&mut h, csr::SATP, satp(ROOT_A, 1));
+    m_write(&mut h, csr::MSTATUS, sum);
+    for _ in 0..2 {
+        run_s(&mut h, CODE + 4, 0x1111);
+        assert_eq!(h.pc, CODE + 8);
+        run_s(&mut h, CODE, 0);
+        assert_eq!(h.x[11], 0x1111);
+    }
+
+    // SUM = 0: S-mode may no longer touch the U page.
+    m_write(&mut h, csr::MSTATUS, 0);
+    run_s(&mut h, CODE + 4, 0x9999);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE), Some(cause::STORE_PAGE_FAULT));
+    m_write(&mut h, csr::MSTATUS, 0);
+    run_s(&mut h, CODE, 0);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE), Some(cause::LOAD_PAGE_FAULT));
+
+    // Root B (ASID 2), SUM = 1: the page is read-only, so the cached store
+    // permission must be gone.
+    m_write(&mut h, csr::MSTATUS, sum);
+    m_write(&mut h, csr::SATP, satp(ROOT_B, 2));
+    run_s(&mut h, CODE + 4, 0x2222);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE), Some(cause::STORE_PAGE_FAULT));
+    run_s(&mut h, CODE, 0);
+    assert_eq!(h.x[11], 0x1111);
+
+    // Back to root A: writable again.
+    m_write(&mut h, csr::SATP, satp(ROOT_A, 1));
+    run_s(&mut h, CODE + 4, 0x3333);
+    assert_eq!(h.pc, CODE + 8);
+    assert_eq!(
+        bus.read(CODE + DATA_OFF, AccessSize::Double).unwrap(),
+        0x3333
+    );
+}
+
 /// PMP verdicts are cached per 4 KiB page while all PMP boundaries are
 /// page-aligned. A PMP write must invalidate them, and M-mode and S/U-mode
 /// verdicts must not share a cache slot.

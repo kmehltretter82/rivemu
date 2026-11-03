@@ -102,7 +102,18 @@ impl HartIrqs {
 }
 
 const ICACHE_SIZE: usize = 8192;
-const BBCACHE_SIZE: usize = 1024;
+const BBCACHE_SIZE: usize = 4096;
+
+/// Direct-mapped index into a decode cache of `size` entries: the physical
+/// address above the 2-byte instruction alignment, folded with the bits above
+/// it. Without the fold, blocks at the same offset in every `2 * size`-byte
+/// window collide. A Linux 6.12 boot took 7.8 M conflict misses (96% of all
+/// misses) in the old 1024-entry, unfolded block cache. Tags hold the full
+/// address, so the index function does not affect correctness.
+#[inline]
+fn decode_cache_index(pa: u64, size: usize) -> usize {
+    (((pa >> 1) ^ (pa >> 13)) as usize) & (size - 1)
+}
 const BB_MAX_INSNS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,7 +154,7 @@ const fn bb_op_kind(op: Op) -> BbOpKind {
     }
 }
 
-/// Decoded basic-block cache entry indexed by `(pa >> 1) & (BBCACHE_SIZE - 1)`.
+/// Decoded basic-block cache entry, indexed by `decode_cache_index(pa, BBCACHE_SIZE)`.
 #[derive(Clone, Copy, Debug)]
 struct BbCacheEntry {
     /// `(pa << 16) | icache_gen` (0 means invalid).
@@ -606,16 +617,20 @@ impl Hart {
                 && self.csr.active_trigger_mask == 0
                 && self.watchpoints.is_empty()
             {
-                if self.try_step_fused(bus) {
-                    n += 2;
-                    continue;
-                }
+                // Blocks first: they run up to BB_MAX_INSNS instructions per
+                // dispatch, and a fusible pair inside a block just runs as two
+                // ordinary instructions with the same result. Fused pairs
+                // still help where no block of 2+ instructions starts.
                 let bb_steps = self.try_step_bb(bus, budget - n);
                 if bb_steps > 0 {
                     n += bb_steps;
                     if self.wfi || self.yield_slice {
                         break;
                     }
+                    continue;
+                }
+                if self.try_step_fused(bus) {
+                    n += 2;
                     continue;
                 }
             }
@@ -664,20 +679,24 @@ impl Hart {
         if pa >> 48 != 0 {
             return 0;
         }
-        let bb_idx = ((pa >> 1) as usize) & (BBCACHE_SIZE - 1);
+        let bb_idx = decode_cache_index(pa, BBCACHE_SIZE);
         let tag = (pa << 16) | u64::from(self.icache_gen);
-        let entry = if self.bbcache[bb_idx].tag == tag {
-            self.bbcache[bb_idx]
+        let avail = if self.bbcache[bb_idx].tag == tag {
+            usize::from(self.bbcache[bb_idx].len)
         } else {
             self.populate_bbcache_same_page(bus, pc, pa, bb_idx, tag)
         };
-        let avail = usize::from(entry.len);
         if avail < 2 {
             return 0;
         }
         let limit = avail.min(max_insns as usize);
-        for (i, insn) in entry.insns[..limit].iter().enumerate() {
-            match self.execute(bus, insn) {
+        // Read each instruction from the cache entry in place instead of
+        // copying the whole entry (about 176 bytes) per block. Nothing a
+        // block can contain invalidates the cache: fence.i, CSR accesses and
+        // the other flushing instructions end a block (`BbOpKind::Abort`).
+        for i in 0..limit {
+            let insn = self.bbcache[bb_idx].insns[i];
+            match self.execute(bus, &insn) {
                 Ok(()) => {
                     if self.check_irq || self.wfi || self.yield_slice {
                         let done = (i + 1) as u64;
@@ -714,7 +733,7 @@ impl Hart {
         pa: u64,
         bb_idx: usize,
         tag: u64,
-    ) -> BbCacheEntry {
+    ) -> usize {
         let mut insns = [Insn::ILLEGAL; BB_MAX_INSNS];
         let mut len = 0usize;
         let mut cur_pc = pc;
@@ -745,7 +764,7 @@ impl Hart {
             insns,
         };
         self.bbcache[bb_idx] = entry;
-        entry
+        len
     }
 
     #[inline]
@@ -768,7 +787,7 @@ impl Hart {
         if pa >> 48 != 0 {
             return false;
         }
-        let idx = ((pa >> 1) as usize) & (ICACHE_SIZE - 1);
+        let idx = decode_cache_index(pa, ICACHE_SIZE);
         let tag = (pa << 16) | u64::from(self.icache_gen);
         let fused = if self.icache[idx].tag == tag {
             self.icache[idx].fused
@@ -1261,7 +1280,7 @@ impl Hart {
                 pa
             };
             if pa >> 48 == 0 {
-                let idx = ((pa >> 1) as usize) & (ICACHE_SIZE - 1);
+                let idx = decode_cache_index(pa, ICACHE_SIZE);
                 let tag = (pa << 16) | u64::from(self.icache_gen);
                 let entry = &self.icache[idx];
                 if entry.tag == tag {
@@ -1372,10 +1391,16 @@ impl Hart {
         if (va & 0xfff) + n > 0x1000 {
             return self.load_page_cross(bus, va, n);
         }
+        if let Some(off) = self.fast_load_ram_off(va) {
+            if let Some(v) = bus.read_fast_ram(off, size) {
+                return Ok(v);
+            }
+        }
         let (pa, ram_page_off) = self.translate_with_ram_off(bus, va, Access::Load)?;
         self.check_pmp_access(va, pa, n, Access::Load)?;
         if ram_page_off != u64::MAX {
             if let Some(v) = bus.read_fast_ram(ram_page_off | (pa & 0xfff), size) {
+                self.fast_tlb_fill(va, pa, ram_page_off, false);
                 return Ok(v);
             }
         }
@@ -1414,6 +1439,12 @@ impl Hart {
         if (va & 0xfff) + n > 0x1000 {
             return self.store_page_cross(bus, va, n, value);
         }
+        if let Some((pa, off)) = self.fast_store_ram_off(va) {
+            self.invalidate_reservation(pa);
+            if bus.write_fast_ram(pa, off, size, value).is_some() {
+                return Ok(());
+            }
+        }
         let (pa, ram_page_off) = self.translate_with_ram_off(bus, va, Access::Store)?;
         self.check_pmp_access(va, pa, n, Access::Store)?;
         self.invalidate_reservation(pa);
@@ -1422,6 +1453,7 @@ impl Hart {
                 .write_fast_ram(pa, ram_page_off | (pa & 0xfff), size, value)
                 .is_some()
         {
+            self.fast_tlb_fill(va, pa, ram_page_off, true);
             return Ok(());
         }
         if pa < 0x8000_0000 {
@@ -2669,6 +2701,8 @@ impl Hart {
                         self.flush_tlb();
                     } else {
                         self.fetch_vpn = 0;
+                        // The main TLB is ASID-tagged; the fast path is not.
+                        self.tlb.fast.invalidate();
                     }
                 }
             }
