@@ -390,6 +390,144 @@ fn block_insn(insn: Insn) -> Insn {
     }
 }
 
+/// A general-purpose register number that the compiler knows is below 32:
+/// indexing `Hart::x` with it needs neither a mask nor a bounds check (the
+/// block loop indexes it two or three times per instruction).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum Reg {
+    R0,
+    R1,
+    R2,
+    R3,
+    R4,
+    R5,
+    R6,
+    R7,
+    R8,
+    R9,
+    R10,
+    R11,
+    R12,
+    R13,
+    R14,
+    R15,
+    R16,
+    R17,
+    R18,
+    R19,
+    R20,
+    R21,
+    R22,
+    R23,
+    R24,
+    R25,
+    R26,
+    R27,
+    R28,
+    R29,
+    R30,
+    R31,
+}
+
+impl Reg {
+    const ALL: [Reg; 32] = [
+        Reg::R0,
+        Reg::R1,
+        Reg::R2,
+        Reg::R3,
+        Reg::R4,
+        Reg::R5,
+        Reg::R6,
+        Reg::R7,
+        Reg::R8,
+        Reg::R9,
+        Reg::R10,
+        Reg::R11,
+        Reg::R12,
+        Reg::R13,
+        Reg::R14,
+        Reg::R15,
+        Reg::R16,
+        Reg::R17,
+        Reg::R18,
+        Reg::R19,
+        Reg::R20,
+        Reg::R21,
+        Reg::R22,
+        Reg::R23,
+        Reg::R24,
+        Reg::R25,
+        Reg::R26,
+        Reg::R27,
+        Reg::R28,
+        Reg::R29,
+        Reg::R30,
+        Reg::R31,
+    ];
+
+    /// The register `v & 31`.
+    #[inline]
+    const fn of(v: u8) -> Self {
+        Self::ALL[(v & 31) as usize]
+    }
+
+    #[inline(always)]
+    const fn i(self) -> usize {
+        self as usize
+    }
+}
+
+/// A decoded instruction as the block arena holds it: [`Insn`] with the
+/// integer register fields typed as [`Reg`] (same size, 16 bytes).
+#[derive(Clone, Copy, Debug)]
+struct BlockInsn {
+    imm: i32,
+    raw: u32,
+    op: Op,
+    rd: Reg,
+    rs1: Reg,
+    rs2: Reg,
+    rs3: u8,
+    funct: u8,
+    dbl: bool,
+    len: u8,
+}
+
+impl BlockInsn {
+    fn new(i: Insn) -> Self {
+        Self {
+            imm: i.imm,
+            raw: i.raw,
+            op: i.op,
+            rd: Reg::of(i.rd),
+            rs1: Reg::of(i.rs1),
+            rs2: Reg::of(i.rs2),
+            rs3: i.rs3,
+            funct: i.funct,
+            dbl: i.dbl,
+            len: i.len,
+        }
+    }
+
+    /// The [`Insn`] for `execute` (instructions that do not run inline).
+    #[inline]
+    fn insn(&self) -> Insn {
+        Insn {
+            op: self.op,
+            rd: self.rd as u8,
+            rs1: self.rs1 as u8,
+            rs2: self.rs2 as u8,
+            rs3: self.rs3,
+            funct: self.funct,
+            dbl: self.dbl,
+            len: self.len,
+            imm: self.imm,
+            raw: self.raw,
+        }
+    }
+}
+
 /// Decoded basic-block index entry, indexed by
 /// `decode_cache_index(pa, BBCACHE_SIZE)`. The instructions are
 /// `bb_arena[start..start + len]`.
@@ -521,7 +659,7 @@ pub struct Hart {
     pub(crate) pmp_cache: PmpCache,
     icache: Box<[IcacheEntry; ICACHE_SIZE]>,
     bbcache: Box<[BbCacheEntry; BBCACHE_SIZE]>,
-    bb_arena: Vec<Insn>,
+    bb_arena: Vec<BlockInsn>,
     icache_gen: u16,
     /// Cached instruction-fetch page: `(pc >> 12) + 1` (0 = invalid).
     fetch_vpn: u64,
@@ -1107,7 +1245,7 @@ impl Hart {
     fn run_block(
         &mut self,
         bus: &AddressSpace,
-        insns: &[Insn],
+        insns: &[BlockInsn],
         mem: Option<FastMem<'_>>,
     ) -> (u64, bool) {
         // The PC stays in a local while inline instructions run and is
@@ -1140,7 +1278,7 @@ impl Hart {
                 Inline::Slow => {}
             }
             self.pc = pc;
-            match self.execute(bus, insn) {
+            match self.execute(bus, &insn.insn()) {
                 Ok(()) => {
                     pc = self.pc;
                     if self.check_irq || self.wfi || self.yield_slice {
@@ -1179,13 +1317,13 @@ impl Hart {
     fn exec_inline(
         &mut self,
         bus: &AddressSpace,
-        insn: &Insn,
+        insn: &BlockInsn,
         mem: Option<FastMem<'_>>,
         pc: u64,
     ) -> Inline {
         let next = pc.wrapping_add(u64::from(insn.len));
-        let rs1 = self.x[usize::from(insn.rs1 & 31)];
-        let rs2 = self.x[usize::from(insn.rs2 & 31)];
+        let rs1 = self.x[insn.rs1.i()];
+        let rs2 = self.x[insn.rs2.i()];
         let imm = insn.imm as u64;
         let rd = insn.rd;
         let v = match insn.op {
@@ -1275,13 +1413,13 @@ impl Hart {
                 };
             }
             Op::Jal => {
-                self.set_x(rd, next);
+                self.set_x(rd as u8, next);
                 return Inline::Jump(pc.wrapping_add(imm));
             }
             // Blocks run only with landing pads disabled (see `run`), so
             // Jalr never sets `elp` here.
             Op::Jalr => {
-                self.set_x(rd, next);
+                self.set_x(rd as u8, next);
                 return Inline::Jump(rs1.wrapping_add(imm) & !1);
             }
             // One arm per opcode, so that each inlined access has a
@@ -1340,8 +1478,8 @@ impl Hart {
             },
         };
         // Blocks store operations that write x0 as `Nop` (`block_insn`).
-        debug_assert!(rd != 0);
-        self.x[usize::from(rd & 31)] = v;
+        debug_assert!(rd != Reg::R0);
+        self.x[rd.i()] = v;
         Inline::Next(next)
     }
 
@@ -1354,7 +1492,7 @@ impl Hart {
     #[inline(always)]
     fn exec_load_inline(
         &mut self,
-        insn: &Insn,
+        insn: &BlockInsn,
         mem: Option<FastMem<'_>>,
         rs1: u64,
         size: AccessSize,
@@ -1373,7 +1511,9 @@ impl Hart {
         let Some(v) = m.ram.read_aligned(e.ram_page_off | (va & 0xfff), size) else {
             return false;
         };
-        self.set_x(insn.rd, ext(v));
+        if insn.rd != Reg::R0 {
+            self.x[insn.rd.i()] = ext(v);
+        }
         true
     }
 
@@ -1382,7 +1522,7 @@ impl Hart {
     fn exec_store_inline(
         &mut self,
         bus: &AddressSpace,
-        insn: &Insn,
+        insn: &BlockInsn,
         mem: Option<FastMem<'_>>,
         rs1: u64,
         rs2: u64,
@@ -1468,17 +1608,17 @@ impl Hart {
             match bb_op_kind(insn.op) {
                 BbOpKind::Abort => break,
                 BbOpKind::Term => {
-                    self.bb_arena.push(insn);
+                    self.bb_arena.push(BlockInsn::new(insn));
                     break;
                 }
                 BbOpKind::Branch => {
-                    self.bb_arena.push(insn);
+                    self.bb_arena.push(BlockInsn::new(insn));
                     let step_len = u64::from(insn.len);
                     cur_pc = cur_pc.wrapping_add(step_len);
                     cur_pa = cur_pa.wrapping_add(step_len);
                 }
                 BbOpKind::Seq => {
-                    self.bb_arena.push(block_insn(insn));
+                    self.bb_arena.push(BlockInsn::new(block_insn(insn)));
                     let step_len = u64::from(insn.len);
                     cur_pc = cur_pc.wrapping_add(step_len);
                     cur_pa = cur_pa.wrapping_add(step_len);
@@ -4235,7 +4375,7 @@ mod tests {
         // B's blocks land in the slots that A's blocks used.
         let filler = BB_ARENA_SIZE - BB_MAX_INSNS + 1 - h.bb_arena.len();
         h.bb_arena
-            .extend(std::iter::repeat_n(Insn::ILLEGAL, filler));
+            .extend(std::iter::repeat_n(BlockInsn::new(Insn::ILLEGAL), filler));
         assert_eq!(run_blocks(&mut h, &bus, B), 400);
         assert!(
             h.bb_arena.len() < BB_ARENA_SIZE / 2,
