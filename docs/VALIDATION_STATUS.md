@@ -84,7 +84,7 @@ built-in-SBI Linux test both pass with the fix.
 | P19 NVMe, vsock, Snapshot v2 exits | Verified 2026-11-02, except disk state | `linux_devices`: Linux reads and writes NVMe, connects `AF_VSOCK` to CID 2, and NVMe and virtio-pci keep working after save/restore into a fresh machine. Snapshots do not contain disk contents, so no QCOW2 restore is claimed. |
 | Poweroff and reboot | Verified 2026-11-02 | `linux_devices`: `reboot -f` reaches `PowerEvent::Reset`, twice. |
 | SMP4 stability | Partial | The functional SMP4 boots pass and the isolated P17 campaign completed 20/20 SMP4 shell boots, but there is no repeated full device-smoke campaign. |
-| P17 `< 8 s` single-hart / `< 10 s` SMP4 | Failed (25–29% faster since 2026-11-02) | The P17 fixture (`tests/linux_perf.rs`: Debian inputs, `Machine::new()` to the first `~ # `) now runs in CI for the PR head and its base on the same runner (job `p17-bench`). On a GitHub ubuntu-latest runner, 9 samples each: base `0946319` median 30.52 s (SMP1) / 36.23 s (SMP4); head with the PMP page cache and interpreter changes 22.92 s / 25.69 s (`evidence/2026-11-02/p17-ci-same-runner.txt`). The earlier M-series campaign measured 18.905/21.103 s on the base. The targets are still missed on this runner; a from-source boot to poweroff on a 4-vCPU container takes 7.50/9.57 s (`evidence/2026-11-02/boot-bench-interpreter.txt`). |
+| P17 `< 8 s` single-hart / `< 10 s` SMP4 | Failed (27–33% faster since 2026-11-02) | The P17 fixture (`tests/linux_perf.rs`: Debian inputs, `Machine::new()` to the first `~ # `) runs in CI for the PR head and its base on the same runner (job `p17-bench`). Latest (`b14129f`, `evidence/2026-11-02/p17-ci-same-runner-2.txt`): head 26.33 s (SMP1) / 29.70 s (SMP4) vs base 36.15 / 44.40 s on the same runner. The first comparison (`p17-ci-same-runner.txt`, faster runner) gave 22.92 / 25.69 s vs 30.52 / 36.23 s. The earlier M-series campaign measured 18.905/21.103 s on the base. The targets are still missed on GitHub runners. A from-source boot to poweroff on a 4-vCPU container takes 6.72 s (SMP1) (`evidence/2026-11-02/boot-bench-interpreter-2.txt`). |
 | `riscv-arch-test` privileged subset | Verified 2026-11-02 | 418/418 (`tests/arch-test/README.md`). |
 | Guest PMU/perf | Verified 2026-11-02 (counting) | `linux_devices`: `riscv-pmu-sbi` probes 16 firmware and 31 hardware counters, and `perf_event_open` counts instructions. PMU overflow interrupts are not asserted. |
 | Boot lockstep P16/P26 | Partial (first 10M instructions), 2026-11-02 | 10,000,000 instructions of OpenSBI + early Linux with 0 divergences against QEMU 11.1.3. A boot to the shell is about 10⁹ instructions and needs checkpointed windows. |
@@ -158,9 +158,9 @@ kernel bug was fixed.
 
 Ranked; details in [`REVIEW-20261102.md`](REVIEW-20261102.md) §6.
 
-1. P17: keep optimizing. The same-runner CI benchmark is 22.92/25.69 s
-   (SMP1/SMP4), against 8/10 s targets; base was 30.52/36.23 s. Next
-   candidates are in REVIEW §7.
+1. P17: keep optimizing. The same-runner CI benchmark is 27–33% faster
+   than base, but still about 3× above the 8 s / 10 s targets on GitHub
+   runners. Next candidates (threaded/JIT-style dispatch) are in REVIEW §7.
 2. Extend boot lockstep past the first 10M instructions (checkpointed
    windows) and add a 3M-step run to CI as a scheduled job.
 3. H extension (RVA23S64). Zama16b is implemented, and the README claims RVA23U64 only.

@@ -1,0 +1,11 @@
+# P17 benchmark, CI job p17-bench, run 41570452502, job 125701849894 (GitHub ubuntu-latest runner),
+# head = b14129f (inline simple ops + pointer-masking fast path + everything before), base = 0946319.
+# scripts/p17-compare.sh 3 head=. base=base; 9 recorded samples per build and hart count.
+# This runner was slower than the one in p17-ci-same-runner.txt (base 36.15 s vs 30.52 s SMP1);
+# compare head with base within one file.
+label smp n median p95 (seconds, recorded samples only)
+head 1 9 26.331 27.117
+head 4 9 29.699 30.527
+base 1 9 36.145 36.617
+base 4 9 44.401 45.289
+# head/base: SMP1 -27.2%, SMP4 -33.1% (first comparison, 74ac533: -24.9%, -29.1%).
