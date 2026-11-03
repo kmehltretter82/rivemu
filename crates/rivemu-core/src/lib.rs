@@ -95,6 +95,12 @@ pub trait IrqLine: Send + Sync {
 pub trait Timebase: Send + Sync {
     /// Current timebase value.
     fn now(&self) -> u64;
+
+    /// Makes [`Self::now`] return `ticks` from this instant on, for guest
+    /// writes to `mtime`. Returns `false` if this timebase cannot be set.
+    fn try_set_now(&self, _ticks: u64) -> bool {
+        false
+    }
 }
 
 /// A timebase that never advances (useful for tests).
@@ -151,6 +157,11 @@ impl Timebase for HostTimebase {
     fn now(&self) -> u64 {
         let raw = self.clock.now_ns() / (1_000_000_000 / self.freq_hz);
         raw.wrapping_add(self.offset_ticks.load(Ordering::Relaxed))
+    }
+
+    fn try_set_now(&self, ticks: u64) -> bool {
+        self.set_now(ticks);
+        true
     }
 }
 
@@ -210,6 +221,11 @@ impl Timebase for IcountTimebase {
     #[inline]
     fn now(&self) -> u64 {
         self.ns.load(Ordering::Relaxed) / (1_000_000_000 / self.freq_hz)
+    }
+
+    fn try_set_now(&self, ticks: u64) -> bool {
+        self.set_now(ticks);
+        true
     }
 }
 

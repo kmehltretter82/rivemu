@@ -90,6 +90,55 @@ pub const MCYCLE: u16 = 0xb00;
 pub const MINSTRET: u16 = 0xb02;
 pub const MHPMCOUNTER3: u16 = 0xb03;
 pub const MHPMCOUNTER31: u16 = 0xb1f;
+pub const MTINST: u16 = 0x34a;
+pub const MTVAL2: u16 = 0x34b;
+
+// Hypervisor (H extension).
+pub const HSTATUS: u16 = 0x600;
+pub const HEDELEG: u16 = 0x602;
+pub const HIDELEG: u16 = 0x603;
+pub const HIE: u16 = 0x604;
+pub const HTIMEDELTA: u16 = 0x605;
+pub const HCOUNTEREN: u16 = 0x606;
+pub const HGEIE: u16 = 0x607;
+pub const HENVCFG: u16 = 0x60a;
+pub const HSTATEEN0: u16 = 0x60c;
+pub const HSTATEEN3: u16 = 0x60f;
+pub const HTVAL: u16 = 0x643;
+pub const HIP: u16 = 0x644;
+pub const HVIP: u16 = 0x645;
+pub const HTINST: u16 = 0x64a;
+pub const HGATP: u16 = 0x680;
+pub const HGEIP: u16 = 0xe12;
+pub const VSSTATUS: u16 = 0x200;
+pub const VSIE: u16 = 0x204;
+pub const VSTVEC: u16 = 0x205;
+pub const VSSCRATCH: u16 = 0x240;
+pub const VSEPC: u16 = 0x241;
+pub const VSCAUSE: u16 = 0x242;
+pub const VSTVAL: u16 = 0x243;
+pub const VSIP: u16 = 0x244;
+pub const VSTIMECMP: u16 = 0x24d;
+pub const VSATP: u16 = 0x280;
+
+/// `hstatus` bits.
+pub mod hstatus {
+    pub const GVA: u64 = 1 << 6;
+    pub const SPV: u64 = 1 << 7;
+    pub const SPVP: u64 = 1 << 8;
+    pub const HU: u64 = 1 << 9;
+    pub const VTVM: u64 = 1 << 20;
+    pub const VTW: u64 = 1 << 21;
+    pub const VTSR: u64 = 1 << 22;
+    /// Svukte for HLV/HSV executed in U-mode.
+    pub const HUKTE: u64 = 1 << 24;
+    /// Ssnpm pointer masking for HLV/HSV executed in U-mode (WARL: 0, 2, 3).
+    pub const HUPMM_SHIFT: u32 = 48;
+    pub const HUPMM_MASK: u64 = 3 << HUPMM_SHIFT;
+    /// `VSXL` (read-only 2: VS-mode is RV64).
+    pub const VSXL_64: u64 = 2 << 32;
+    pub const WRITABLE: u64 = GVA | SPV | SPVP | HU | VTVM | VTW | VTSR | HUKTE | HUPMM_MASK;
+}
 
 /// `mstatus` / `sstatus` bits.
 pub mod status {
@@ -114,6 +163,10 @@ pub mod status {
     pub const SDT: u64 = 1 << 24;
     pub const UXL: u64 = 3 << 32;
     pub const SXL: u64 = 3 << 34;
+    /// H: guest virtual address in `mtval` (`GVA`) and previous
+    /// virtualization mode (`MPV`).
+    pub const GVA: u64 = 1 << 38;
+    pub const MPV: u64 = 1 << 39;
     pub const MPELP: u64 = 1 << 41;
     pub const MDT: u64 = 1 << 42;
     pub const SD: u64 = 1 << 63;
@@ -141,6 +194,9 @@ pub mod status {
     pub const S_READABLE: u64 = SIE | SPIE | SPP | VS | FS | SUM | MXR | SPELP | SDT | UXL | SD;
     /// Bits writable through `sstatus`.
     pub const S_WRITABLE: u64 = SIE | SPIE | SPP | VS | FS | SUM | MXR | SPELP | SDT;
+    /// Fields that `vsstatus` replaces while V = 1 (the H extension swaps
+    /// them, as QEMU does).
+    pub const VS_SWAPPED: u64 = SIE | SPIE | SPP | VS | FS | SUM | MXR | SPELP | SDT | UXL;
 }
 
 /// Interrupt bits in `mip` / `mie` (and interrupt cause numbers).
@@ -161,6 +217,24 @@ pub mod irq {
     pub const MEIP: u64 = 1 << MEI;
     pub const LCOFIP: u64 = 1 << LCOFI;
 
+    /// H extension: VS-level software, timer and external interrupts, and
+    /// the supervisor guest external interrupt.
+    pub const VSSI: u64 = 2;
+    pub const VSTI: u64 = 6;
+    pub const VSEI: u64 = 10;
+    pub const SGEI: u64 = 12;
+    pub const VSSIP: u64 = 1 << VSSI;
+    pub const VSTIP: u64 = 1 << VSTI;
+    pub const VSEIP: u64 = 1 << VSEI;
+    pub const SGEIP: u64 = 1 << SGEI;
+    pub const VS_MASK: u64 = VSSIP | VSTIP | VSEIP;
+    /// Interrupts that are always delegated to HS-mode with H (`mideleg`
+    /// read-only ones).
+    pub const HS_FORCED: u64 = VS_MASK | SGEIP;
+    /// Priority order with H (highest first), after the default order of
+    /// the privileged spec (and QEMU).
+    pub const PRIORITY_H: [u64; 11] = [MEI, MSI, MTI, SEI, SSI, STI, SGEI, VSEI, VSSI, VSTI, LCOFI];
+
     /// Interrupts that can be delegated to S-mode.
     pub const S_MASK: u64 = SSIP | STIP | SEIP | LCOFIP;
     /// All implemented interrupts.
@@ -175,7 +249,11 @@ pub mod hpmevent {
     pub const MINH: u64 = 1 << 62;
     pub const SINH: u64 = 1 << 61;
     pub const UINH: u64 = 1 << 60;
+    /// VS-mode and VU-mode filters (with H).
+    pub const VSINH: u64 = 1 << 59;
+    pub const VUINH: u64 = 1 << 58;
     pub const FILTER_MASK: u64 = MINH | SINH | UINH;
+    pub const FILTER_MASK_H: u64 = FILTER_MASK | VSINH | VUINH;
     pub const EVENT_MASK: u64 = 0x000f_ffff;
     pub const EVENT_CYCLES: u64 = 1;
     pub const EVENT_INSTRUCTIONS: u64 = 2;
@@ -203,6 +281,8 @@ pub mod envcfg {
 
     pub const S_MASK: u64 = FIOM | LPE | SSE | CBIE_MASK | CBCFE | CBZE | UKTE | PMM_MASK;
     pub const M_MASK: u64 = (S_MASK & !UKTE) | DTE | ADUE | PBMTE | STCE;
+    /// `henvcfg` bits that read as zero while the same `menvcfg` bit is 0.
+    pub const H_GATED: u64 = SSE | DTE | ADUE | PBMTE | STCE;
 
     /// Masks `v` to `mask`, clears the reserved `CBIE = 0b10` encoding (WARL),
     /// and preserves the previous `PMM` field if `v` specifies reserved `PMM = 0b01`.
@@ -229,6 +309,8 @@ pub mod mseccfg {
     pub const MLPE: u64 = 1 << 10;
     pub const PMM_SHIFT: u32 = 32;
     pub const PMM_MASK: u64 = 3 << PMM_SHIFT;
+    // `Hart::mask_data_addr` tests all three PMM fields with one mask.
+    const _: () = assert!(PMM_MASK == super::envcfg::PMM_MASK);
 }
 
 /// `mstateen0..3` / `sstateen0..3` bits (`Smstateen` / `Ssstateen`).
@@ -255,6 +337,14 @@ pub const MISA_VALUE: u64 = (2 << 62)
 
 /// Exceptions that may be delegated to S-mode (all but ecall-from-M and reserved, plus `SW_CHECK` = 18).
 pub const MEDELEG_MASK: u64 = 0x4b3ff;
+/// With H, also ecall-from-VS (10), the guest-page faults (20, 21, 23) and
+/// virtual instruction (22).
+pub const MEDELEG_MASK_H: u64 = MEDELEG_MASK | (1 << 10) | (0xf << 20);
+/// Exceptions that `hedeleg` may delegate to VS-mode: as `medeleg`, but not
+/// the ecalls from HS/VS/M, the guest-page faults or virtual instruction.
+pub const HEDELEG_MASK: u64 = MEDELEG_MASK & !((1 << 9) | (1 << 10) | (1 << 11));
+/// Interrupts that `hideleg` may delegate to VS-mode.
+pub const HIDELEG_MASK: u64 = irq::VS_MASK;
 
 /// Number of implemented PMP entries.
 pub const PMP_ENTRIES: usize = 16;
@@ -284,6 +374,9 @@ pub mod trig {
     pub const SIZE_SHIFT: u32 = 16;
     pub const SIZE_MASK: u64 = 0xf << 16;
     pub const HIT0: u64 = 1 << 22;
+    /// `mcontrol6` VU-mode / VS-mode match enables (with H).
+    pub const VU6: u64 = 1 << 23;
+    pub const VS6: u64 = 1 << 24;
     pub const DMODE: u64 = 1 << 59;
 
     pub const ICOUNT_ACTION_MASK: u64 = 0x3f;
@@ -294,6 +387,9 @@ pub mod trig {
     pub const ICOUNT_COUNT_SHIFT: u32 = 10;
     pub const ICOUNT_COUNT_MASK: u64 = 0x3fff << 10;
     pub const ICOUNT_HIT: u64 = 1 << 24;
+    /// `icount` VU-mode / VS-mode enables (with H).
+    pub const ICOUNT_VU: u64 = 1 << 25;
+    pub const ICOUNT_VS: u64 = 1 << 26;
 
     /// `tinfo`: version = 1 (`[31:24]`), supported types = 2 (`mcontrol`), 3 (`icount`), 6 (`mcontrol6`).
     pub const TINFO_VAL: u64 = 0x0100_004c;
@@ -355,37 +451,131 @@ pub struct Csrs {
     pub mcontext: u64,
     pub active_trigger_mask: u8,
     pub minstret: u64,
+    /// `mcycle`. One cycle per retired instruction, but inhibited, filtered
+    /// and written independently of `minstret`.
+    pub mcycle: u64,
+    /// H extension state.
+    pub h: HCsrs,
+}
+
+/// The S-level state that the H extension keeps in two copies: while
+/// V = 0 the active fields hold HS-mode's values and this bank holds the
+/// VS-mode ones (`vsstatus`, `vstvec`, ...); while V = 1 they are swapped
+/// (see `Hart::set_virt`).
+#[derive(Clone, Debug, Default)]
+pub struct SBank {
+    /// The [`status::VS_SWAPPED`] fields of `mstatus`.
+    pub status: u64,
+    pub stvec: u64,
+    pub sscratch: u64,
+    pub sepc: u64,
+    pub scause: u64,
+    pub stval: u64,
+    pub satp: u64,
+}
+
+/// Hypervisor CSRs (H extension).
+#[derive(Clone, Debug)]
+pub struct HCsrs {
+    pub hstatus: u64,
+    pub hedeleg: u64,
+    pub hideleg: u64,
+    pub hcounteren: u64,
+    pub htimedelta: u64,
+    pub htval: u64,
+    pub htinst: u64,
+    pub hgatp: u64,
+    pub henvcfg: u64,
+    pub hstateen: [u64; 4],
+    pub vstimecmp: u64,
+    pub mtval2: u64,
+    pub mtinst: u64,
+    /// The inactive S-level bank (see [`SBank`]).
+    pub bank: SBank,
+    /// The virtualization mode V, mirrored from `Hart::virt` (which
+    /// `Hart::set_virt` keeps in step) for the `envcfg`-dependent helpers
+    /// below, which pick `henvcfg` in VS-mode.
+    pub virt: bool,
+}
+
+impl Default for HCsrs {
+    fn default() -> Self {
+        Self {
+            hstatus: hstatus::VSXL_64,
+            hedeleg: 0,
+            hideleg: 0,
+            hcounteren: 0,
+            htimedelta: 0,
+            htval: 0,
+            htinst: 0,
+            hgatp: 0,
+            henvcfg: 0,
+            hstateen: [0; 4],
+            vstimecmp: u64::MAX,
+            mtval2: 0,
+            mtinst: 0,
+            virt: false,
+            bank: SBank {
+                // vsstatus.UXL = 64-bit.
+                status: 2 << 32,
+                ..SBank::default()
+            },
+        }
+    }
 }
 
 impl Csrs {
-    /// Returns whether `Zicfiss` shadow-stack operations are enabled for `prv`.
+    /// `henvcfg` as it takes effect: the [`envcfg::H_GATED`] bits read as
+    /// zero while `menvcfg` has them clear.
+    #[inline]
+    pub fn henvcfg_eff(&self) -> u64 {
+        self.h.henvcfg & (!envcfg::H_GATED | self.menvcfg)
+    }
+
+    /// Returns whether `Zicfiss` shadow-stack operations are enabled for `prv`
+    /// (in VS-mode by `henvcfg.SSE`, in VU-mode by `henvcfg` and `senvcfg`).
     #[inline]
     pub fn shadow_stack_enabled(&self, prv: crate::hart::Priv) -> bool {
+        let s_level = if self.h.virt {
+            self.henvcfg_eff()
+        } else {
+            self.menvcfg
+        };
         match prv {
             crate::hart::Priv::Machine => false,
-            crate::hart::Priv::Supervisor => (self.menvcfg & envcfg::SSE) != 0,
-            crate::hart::Priv::User => (self.menvcfg & self.senvcfg & envcfg::SSE) != 0,
+            crate::hart::Priv::Supervisor => (s_level & envcfg::SSE) != 0,
+            crate::hart::Priv::User => (self.menvcfg & s_level & self.senvcfg & envcfg::SSE) != 0,
         }
     }
 
-    /// Returns whether `Zicfilp` forward-edge landing-pad enforcement is enabled for `prv`.
+    /// Returns whether `Zicfilp` forward-edge landing-pad enforcement is enabled for `prv`
+    /// (in VS-mode by `henvcfg.LPE`).
     #[inline]
     pub fn landing_pad_enabled(&self, prv: crate::hart::Priv) -> bool {
         match prv {
             crate::hart::Priv::Machine => (self.mseccfg & mseccfg::MLPE) != 0,
+            crate::hart::Priv::Supervisor if self.h.virt => (self.h.henvcfg & envcfg::LPE) != 0,
             crate::hart::Priv::Supervisor => (self.menvcfg & envcfg::LPE) != 0,
             crate::hart::Priv::User => (self.senvcfg & envcfg::LPE) != 0,
         }
     }
 
-    /// Returns the effective `Ssnpm`/`Smnpm` pointer-masking width (`0`, `7`, or `16`) for `prv`.
+    /// Returns the effective `Ssnpm`/`Smnpm` pointer-masking width (`0`, `7`, or `16`) for
+    /// data accesses at `prv`, in VS/VU-mode when `virt` (VS-mode uses `henvcfg.PMM`; `MXR` of
+    /// either HS-mode or VS-mode turns masking off, as in QEMU).
     #[inline]
-    pub fn effective_pmlen(&self, prv: crate::hart::Priv) -> u32 {
-        if prv != crate::hart::Priv::Machine && (self.mstatus & status::MXR) != 0 {
+    pub fn effective_pmlen(&self, prv: crate::hart::Priv, virt: bool) -> u32 {
+        if prv != crate::hart::Priv::Machine
+            && ((self.mstatus & status::MXR) != 0
+                || (virt && (self.h.bank.status & status::MXR) != 0))
+        {
             return 0;
         }
         let pmm = match prv {
             crate::hart::Priv::Machine => (self.mseccfg & mseccfg::PMM_MASK) >> mseccfg::PMM_SHIFT,
+            crate::hart::Priv::Supervisor if virt => {
+                (self.h.henvcfg & envcfg::PMM_MASK) >> envcfg::PMM_SHIFT
+            }
             crate::hart::Priv::Supervisor => (self.menvcfg & envcfg::PMM_MASK) >> envcfg::PMM_SHIFT,
             crate::hart::Priv::User => (self.senvcfg & envcfg::PMM_MASK) >> envcfg::PMM_SHIFT,
         };
@@ -419,11 +609,16 @@ impl Csrs {
             let ty = t1 >> trig::TYPE_SHIFT;
             let active = match ty {
                 trig::TYPE_MCONTROL | trig::TYPE_MCONTROL6 => {
-                    (t1 & (trig::M | trig::S | trig::U)) != 0
+                    (t1 & (trig::M | trig::S | trig::U | trig::VS6 | trig::VU6)) != 0
                         && (t1 & (trig::LOAD | trig::STORE | trig::EXECUTE)) != 0
                 }
                 trig::TYPE_ICOUNT => {
-                    (t1 & (trig::ICOUNT_M | trig::ICOUNT_S | trig::ICOUNT_U)) != 0
+                    (t1 & (trig::ICOUNT_M
+                        | trig::ICOUNT_S
+                        | trig::ICOUNT_U
+                        | trig::ICOUNT_VS
+                        | trig::ICOUNT_VU))
+                        != 0
                         && (t1 & (trig::ICOUNT_COUNT_MASK | trig::ICOUNT_PENDING)) != 0
                 }
                 _ => false,
@@ -447,7 +642,13 @@ impl Default for Csrs {
             mip: 0,
             mtvec: 0,
             mcounteren: 0,
-            menvcfg: envcfg::CBIE_MASK | envcfg::CBCFE | envcfg::CBZE | envcfg::PBMTE,
+            // ADUE = 1: hardware A/D updating (Svadu) is enabled at reset,
+            // matching what the MMU does unless Svade is selected.
+            menvcfg: envcfg::CBIE_MASK
+                | envcfg::CBCFE
+                | envcfg::CBZE
+                | envcfg::PBMTE
+                | envcfg::ADUE,
             mcountinhibit: 0,
             mcyclecfg: 0,
             minstretcfg: 0,
@@ -477,12 +678,10 @@ impl Default for Csrs {
             vtype: 1 << 63,
             ssp: 0,
             mseccfg: 0,
-            mstateen: [
-                stateen::M0_MASK,
-                stateen::M1_3_MASK,
-                stateen::M1_3_MASK,
-                stateen::M1_3_MASK,
-            ],
+            // Smstateen: "On reset, all writable mstateen bits are
+            // initialized by the hardware to zeros." Firmware (or
+            // Hart::init_smode_boot, which stands in for it) enables them.
+            mstateen: [0; 4],
             sstateen: [0; 4],
             pmpcfg: [0; PMP_ENTRIES],
             pmpaddr: [0; PMP_ENTRIES],
@@ -494,6 +693,8 @@ impl Default for Csrs {
             mcontext: 0,
             active_trigger_mask: 0,
             minstret: 0,
+            mcycle: 0,
+            h: HCsrs::default(),
         }
     }
 }

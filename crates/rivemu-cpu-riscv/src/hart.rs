@@ -4,12 +4,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rivemu_core::{AccessSize, Timebase};
-use rivemu_mem::AddressSpace;
+use rivemu_mem::{AddressSpace, RamView, RegionKind};
 
-use crate::csr::{self, Csrs, envcfg, irq, status};
+use crate::csr::{self, Csrs, envcfg, hstatus, irq, status};
 use crate::decode::{Insn, Op, amo, decode, decode_compressed};
 use crate::log::{LogFlags, Logger};
-use crate::mmu::{Access, Tlb};
+use crate::mmu::{Access, FAST_TLB_SLOTS, FastTlbSlot, PmpCache, Tlb};
 
 /// Exception cause codes.
 #[allow(missing_docs)]
@@ -30,6 +30,12 @@ pub mod cause {
     pub const STORE_PAGE_FAULT: u64 = 15;
     pub const DOUBLE_TRAP: u64 = 16;
     pub const SW_CHECK: u64 = 18;
+    /// H extension.
+    pub const ECALL_VS: u64 = 10;
+    pub const INSN_GUEST_PAGE_FAULT: u64 = 20;
+    pub const LOAD_GUEST_PAGE_FAULT: u64 = 21;
+    pub const VIRTUAL_INSN: u64 = 22;
+    pub const STORE_GUEST_PAGE_FAULT: u64 = 23;
 }
 
 /// A synchronous exception raised by an instruction.
@@ -39,13 +45,30 @@ pub struct Exception {
     pub cause: u64,
     /// Value for `xtval`.
     pub tval: u64,
+    /// H extension: the guest physical address shifted right by 2, for
+    /// `htval`/`mtval2` (guest-page faults; 0 otherwise).
+    pub tval2: u64,
+    /// H extension: `tval` is a guest virtual address (`hstatus.GVA`,
+    /// `mstatus.GVA`).
+    pub gva: bool,
 }
 
 impl Exception {
     /// Creates an exception.
     #[inline]
     pub const fn new(cause: u64, tval: u64) -> Self {
-        Self { cause, tval }
+        Self {
+            cause,
+            tval,
+            tval2: 0,
+            gva: false,
+        }
+    }
+
+    /// The same exception with another `tval`.
+    #[inline]
+    pub const fn with_tval(self, tval: u64) -> Self {
+        Self { tval, ..self }
     }
 }
 
@@ -102,12 +125,33 @@ impl HartIrqs {
 }
 
 const ICACHE_SIZE: usize = 8192;
-const BBCACHE_SIZE: usize = 1024;
-const BB_MAX_INSNS: usize = 8;
+/// Slots in the block index. A Linux boot runs about 64 K distinct blocks;
+/// the old 4096-entry cache refilled each one about 30 times.
+const BBCACHE_SIZE: usize = 32768;
+/// Decoded instructions the block arena holds before it is cleared. Each
+/// block takes its length in slots; slots of replaced blocks are reclaimed
+/// only when the arena is cleared. The memory is reserved, not touched, up
+/// front.
+const BB_ARENA_SIZE: usize = 1 << 19;
+
+/// Direct-mapped index into a decode cache of `size` entries: the physical
+/// address above the 2-byte instruction alignment, folded with the bits above
+/// it. Without the fold, blocks at the same offset in every `2 * size`-byte
+/// window collide. A Linux 6.12 boot took 7.8 M conflict misses (96% of all
+/// misses) in the old 1024-entry, unfolded block cache. Tags hold the full
+/// address, so the index function does not affect correctness.
+#[inline]
+fn decode_cache_index(pa: u64, size: usize) -> usize {
+    (((pa >> 1) ^ (pa >> 13)) as usize) & (size - 1)
+}
+const BB_MAX_INSNS: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BbOpKind {
     Seq,
+    /// A conditional branch: the block goes on after it, and a taken branch
+    /// leaves the block early.
+    Branch,
     Term,
     Abort,
 }
@@ -116,7 +160,6 @@ enum BbOpKind {
 const fn bb_op_kind(op: Op) -> BbOpKind {
     match op {
         Op::Illegal
-        | Op::Fence
         | Op::FenceI
         | Op::Ecall
         | Op::Ebreak
@@ -133,34 +176,369 @@ const fn bb_op_kind(op: Op) -> BbOpKind {
         | Op::WrsSto
         | Op::SfenceVma
         | Op::SinvalVma
+        | Op::HfenceVvma
+        | Op::HfenceGvma
         | Op::SfenceWInval
         | Op::SfenceInvalIr
         | Op::CboInval => BbOpKind::Abort,
-        Op::Jal | Op::Jalr | Op::Beq | Op::Bne | Op::Blt | Op::Bge | Op::Bltu | Op::Bgeu => {
-            BbOpKind::Term
-        }
+        Op::Beq | Op::Bne | Op::Blt | Op::Bge | Op::Bltu | Op::Bgeu => BbOpKind::Branch,
+        Op::Jal | Op::Jalr => BbOpKind::Term,
         _ => BbOpKind::Seq,
     }
 }
 
-/// Decoded basic-block cache entry indexed by `(pa >> 1) & (BBCACHE_SIZE - 1)`.
+/// The result of a Zba, Zbb, Zbs or Zicond operation (the same as in
+/// `execute`), or `None` for any other operation. Kept out of
+/// [`Hart::exec_inline`]'s `match` (which slows the common path when it
+/// grows) but still far cheaper than `execute`; kernels use these in their
+/// string functions (strcmp_zbb and others).
+#[inline(never)]
+fn bitmanip_value(op: Op, rs1: u64, rs2: u64, imm: u64) -> Option<u64> {
+    Some(match op {
+        Op::AddUw => rs2.wrapping_add(u64::from(rs1 as u32)),
+        Op::Sh1add => rs2.wrapping_add(rs1 << 1),
+        Op::Sh2add => rs2.wrapping_add(rs1 << 2),
+        Op::Sh3add => rs2.wrapping_add(rs1 << 3),
+        Op::Sh1addUw => rs2.wrapping_add(u64::from(rs1 as u32) << 1),
+        Op::Sh2addUw => rs2.wrapping_add(u64::from(rs1 as u32) << 2),
+        Op::Sh3addUw => rs2.wrapping_add(u64::from(rs1 as u32) << 3),
+        Op::SlliUw => u64::from(rs1 as u32) << (imm & 63),
+        Op::Andn => rs1 & !rs2,
+        Op::Orn => rs1 | !rs2,
+        Op::Xnor => !(rs1 ^ rs2),
+        Op::Clz => u64::from(rs1.leading_zeros()),
+        Op::Ctz => u64::from(rs1.trailing_zeros()),
+        Op::Cpop => u64::from(rs1.count_ones()),
+        Op::Clzw => u64::from((rs1 as u32).leading_zeros()),
+        Op::Ctzw => u64::from((rs1 as u32).trailing_zeros()),
+        Op::Cpopw => u64::from((rs1 as u32).count_ones()),
+        Op::SextB => rs1 as i8 as i64 as u64,
+        Op::SextH => rs1 as i16 as i64 as u64,
+        Op::ZextH => u64::from(rs1 as u16),
+        Op::Min => (rs1 as i64).min(rs2 as i64) as u64,
+        Op::Minu => rs1.min(rs2),
+        Op::Max => (rs1 as i64).max(rs2 as i64) as u64,
+        Op::Maxu => rs1.max(rs2),
+        Op::Rol => rs1.rotate_left((rs2 & 63) as u32),
+        Op::Ror => rs1.rotate_right((rs2 & 63) as u32),
+        Op::Rolw => sext32(u64::from((rs1 as u32).rotate_left((rs2 & 31) as u32))),
+        Op::Rorw => sext32(u64::from((rs1 as u32).rotate_right((rs2 & 31) as u32))),
+        Op::Rori => rs1.rotate_right((imm & 63) as u32),
+        Op::Roriw => sext32(u64::from((rs1 as u32).rotate_right((imm & 31) as u32))),
+        Op::OrcB => {
+            let mut out = 0u64;
+            for i in 0..8 {
+                if (rs1 >> (i * 8)) & 0xff != 0 {
+                    out |= 0xff << (i * 8);
+                }
+            }
+            out
+        }
+        Op::Rev8 => rs1.swap_bytes(),
+        Op::Bclr => rs1 & !(1u64 << (rs2 & 63)),
+        Op::Bext => (rs1 >> (rs2 & 63)) & 1,
+        Op::Binv => rs1 ^ (1u64 << (rs2 & 63)),
+        Op::Bset => rs1 | (1u64 << (rs2 & 63)),
+        Op::Bclri => rs1 & !(1u64 << (imm & 63)),
+        Op::Bexti => (rs1 >> (imm & 63)) & 1,
+        Op::Binvi => rs1 ^ (1u64 << (imm & 63)),
+        Op::Bseti => rs1 | (1u64 << (imm & 63)),
+        Op::CzeroEqz => {
+            if rs2 == 0 {
+                0
+            } else {
+                rs1
+            }
+        }
+        Op::CzeroNez => {
+            if rs2 != 0 {
+                0
+            } else {
+                rs1
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// What [`Hart::exec_inline`] did with an instruction.
+enum Inline {
+    /// Ran it; execution goes on at this PC, the next instruction.
+    Next(u64),
+    /// Ran a taken branch or a jump to this PC, which leaves the block.
+    Jump(u64),
+    /// Did nothing: the instruction needs `execute`.
+    Slow,
+}
+
+/// What a block's inline loads and stores use: the fast-TLB slot of the
+/// block's translation context with its epoch, and a view of guest RAM. All
+/// of it stays valid for the whole block (see [`Hart::try_step_bb`]).
+#[derive(Clone, Copy)]
+struct FastMem<'a> {
+    slot: usize,
+    epoch_hi: u64,
+    ram: RamView<'a>,
+}
+
+/// Whether `op` is an integer operation whose only effect is writing `rd`
+/// (the value-producing arms of [`Hart::exec_inline`]).
+const fn writes_only_rd(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Lui
+            | Op::Auipc
+            | Op::Addi
+            | Op::Slti
+            | Op::Sltiu
+            | Op::Xori
+            | Op::Ori
+            | Op::Andi
+            | Op::Slli
+            | Op::Srli
+            | Op::Srai
+            | Op::Add
+            | Op::Sub
+            | Op::Sll
+            | Op::Slt
+            | Op::Sltu
+            | Op::Xor
+            | Op::Srl
+            | Op::Sra
+            | Op::Or
+            | Op::And
+            | Op::Addiw
+            | Op::Slliw
+            | Op::Srliw
+            | Op::Sraiw
+            | Op::Addw
+            | Op::Subw
+            | Op::Sllw
+            | Op::Srlw
+            | Op::Sraw
+            | Op::Mul
+            | Op::Mulh
+            | Op::Mulhsu
+            | Op::Mulhu
+            | Op::Mulw
+            | Op::Div
+            | Op::Divu
+            | Op::Rem
+            | Op::Remu
+            | Op::Divw
+            | Op::Divuw
+            | Op::Remw
+            | Op::Remuw
+            | Op::AddUw
+            | Op::Sh1add
+            | Op::Sh2add
+            | Op::Sh3add
+            | Op::Sh1addUw
+            | Op::Sh2addUw
+            | Op::Sh3addUw
+            | Op::SlliUw
+            | Op::Andn
+            | Op::Orn
+            | Op::Xnor
+            | Op::Clz
+            | Op::Ctz
+            | Op::Cpop
+            | Op::Clzw
+            | Op::Ctzw
+            | Op::Cpopw
+            | Op::SextB
+            | Op::SextH
+            | Op::ZextH
+            | Op::Min
+            | Op::Minu
+            | Op::Max
+            | Op::Maxu
+            | Op::Rol
+            | Op::Ror
+            | Op::Rolw
+            | Op::Rorw
+            | Op::Rori
+            | Op::Roriw
+            | Op::OrcB
+            | Op::Rev8
+            | Op::Bclr
+            | Op::Bext
+            | Op::Binv
+            | Op::Bset
+            | Op::Bclri
+            | Op::Bexti
+            | Op::Binvi
+            | Op::Bseti
+            | Op::CzeroEqz
+            | Op::CzeroNez
+    )
+}
+
+/// An instruction as the block cache stores it: an integer operation that
+/// writes x0 has no effect and becomes [`Op::Nop`], so that
+/// [`Hart::exec_inline`] can write `rd` without testing for x0. The raw
+/// encoding stays (fence.i re-validation compares it).
+#[inline]
+fn block_insn(insn: Insn) -> Insn {
+    if insn.rd == 0 && writes_only_rd(insn.op) {
+        Insn {
+            op: Op::Nop,
+            ..insn
+        }
+    } else {
+        insn
+    }
+}
+
+/// A general-purpose register number that the compiler knows is below 32:
+/// indexing `Hart::x` with it needs neither a mask nor a bounds check (the
+/// block loop indexes it two or three times per instruction).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum Reg {
+    R0,
+    R1,
+    R2,
+    R3,
+    R4,
+    R5,
+    R6,
+    R7,
+    R8,
+    R9,
+    R10,
+    R11,
+    R12,
+    R13,
+    R14,
+    R15,
+    R16,
+    R17,
+    R18,
+    R19,
+    R20,
+    R21,
+    R22,
+    R23,
+    R24,
+    R25,
+    R26,
+    R27,
+    R28,
+    R29,
+    R30,
+    R31,
+}
+
+impl Reg {
+    const ALL: [Reg; 32] = [
+        Reg::R0,
+        Reg::R1,
+        Reg::R2,
+        Reg::R3,
+        Reg::R4,
+        Reg::R5,
+        Reg::R6,
+        Reg::R7,
+        Reg::R8,
+        Reg::R9,
+        Reg::R10,
+        Reg::R11,
+        Reg::R12,
+        Reg::R13,
+        Reg::R14,
+        Reg::R15,
+        Reg::R16,
+        Reg::R17,
+        Reg::R18,
+        Reg::R19,
+        Reg::R20,
+        Reg::R21,
+        Reg::R22,
+        Reg::R23,
+        Reg::R24,
+        Reg::R25,
+        Reg::R26,
+        Reg::R27,
+        Reg::R28,
+        Reg::R29,
+        Reg::R30,
+        Reg::R31,
+    ];
+
+    /// The register `v & 31`.
+    #[inline]
+    const fn of(v: u8) -> Self {
+        Self::ALL[(v & 31) as usize]
+    }
+
+    #[inline(always)]
+    const fn i(self) -> usize {
+        self as usize
+    }
+}
+
+/// A decoded instruction as the block arena holds it: [`Insn`] with the
+/// integer register fields typed as [`Reg`] (same size, 16 bytes).
 #[derive(Clone, Copy, Debug)]
+struct BlockInsn {
+    imm: i32,
+    raw: u32,
+    op: Op,
+    rd: Reg,
+    rs1: Reg,
+    rs2: Reg,
+    rs3: u8,
+    funct: u8,
+    dbl: bool,
+    len: u8,
+}
+
+impl BlockInsn {
+    fn new(i: Insn) -> Self {
+        Self {
+            imm: i.imm,
+            raw: i.raw,
+            op: i.op,
+            rd: Reg::of(i.rd),
+            rs1: Reg::of(i.rs1),
+            rs2: Reg::of(i.rs2),
+            rs3: i.rs3,
+            funct: i.funct,
+            dbl: i.dbl,
+            len: i.len,
+        }
+    }
+
+    /// The [`Insn`] for `execute` (instructions that do not run inline).
+    #[inline]
+    fn insn(&self) -> Insn {
+        Insn {
+            op: self.op,
+            rd: self.rd as u8,
+            rs1: self.rs1 as u8,
+            rs2: self.rs2 as u8,
+            rs3: self.rs3,
+            funct: self.funct,
+            dbl: self.dbl,
+            len: self.len,
+            imm: self.imm,
+            raw: self.raw,
+        }
+    }
+}
+
+/// Decoded basic-block index entry, indexed by
+/// `decode_cache_index(pa, BBCACHE_SIZE)`. The instructions are
+/// `bb_arena[start..start + len]`.
+#[derive(Clone, Copy, Debug, Default)]
 struct BbCacheEntry {
     /// `(pa << 16) | icache_gen` (0 means invalid).
     tag: u64,
-    /// Number of valid decoded instructions in `insns` (`0..=BB_MAX_INSNS`).
+    /// First instruction in `bb_arena`.
+    start: u32,
+    /// Number of decoded instructions (`0..=BB_MAX_INSNS`).
     len: u8,
-    insns: [Insn; BB_MAX_INSNS],
-}
-
-impl Default for BbCacheEntry {
-    fn default() -> Self {
-        Self {
-            tag: 0,
-            len: 0,
-            insns: [Insn::ILLEGAL; BB_MAX_INSNS],
-        }
-    }
 }
 
 /// Macro-op fusion descriptor cached alongside the first instruction in [`IcacheEntry`].
@@ -274,12 +652,14 @@ pub struct Hart {
     pub irqs: Arc<HartIrqs>,
     /// Waiting for an interrupt (`wfi`).
     pub wfi: bool,
-    timebase: Arc<dyn Timebase>,
+    pub(crate) timebase: Arc<dyn Timebase>,
     /// Active 64-byte cache-line `LR` reservation.
     reservation: Option<Reservation>,
     pub(crate) tlb: Tlb,
+    pub(crate) pmp_cache: PmpCache,
     icache: Box<[IcacheEntry; ICACHE_SIZE]>,
     bbcache: Box<[BbCacheEntry; BBCACHE_SIZE]>,
+    bb_arena: Vec<BlockInsn>,
     icache_gen: u16,
     /// Cached instruction-fetch page: `(pc >> 12) + 1` (0 = invalid).
     fetch_vpn: u64,
@@ -291,6 +671,8 @@ pub struct Hart {
     yield_slice: bool,
     /// The current instruction wrote `minstret` (suppresses its increment).
     instret_written: bool,
+    /// The current instruction wrote `mcycle` (suppresses its increment).
+    cycle_written: bool,
     /// The current instruction wrote an `icount` trigger in `tdata1`.
     icount_written: bool,
     /// Bitmask of `mhpmcounter3..31` written by the current instruction.
@@ -310,15 +692,45 @@ pub struct Hart {
     pub pending_sbi: bool,
     /// Set when an `ebreak` matches the RISC-V Semihosting magic sequence.
     pub pending_semihost: bool,
+    /// Service RISC-V Semihosting calls (`-semihosting`). When `false`, the
+    /// magic sequence's `ebreak` raises a breakpoint exception like any other
+    /// `ebreak`, as on QEMU without `-semihosting` or on hardware without a
+    /// debugger. OpenSBI probes for semihosting this way and, when the probe
+    /// succeeds, uses the semihosting console instead of the UART.
+    pub semihosting: bool,
     /// Whether the hart is parked in the SBI HSM `STOPPED` state.
     pub hsm_stopped: bool,
+    /// Implement Smdbltrp (`-cpu rv64,smdbltrp=on`). Off by default, as in
+    /// Sail and QEMU's `rv64` model: software that predates Smdbltrp, such
+    /// as riscv-tests, takes M-mode traps before clearing the MDT bit that
+    /// Smdbltrp sets at reset. When off, `mstatus.MDT` is read-only zero.
+    pub smdbltrp: bool,
+    /// Implement the H extension (`-cpu rv64,h=on`). Off by default.
+    pub h_ext: bool,
+    /// Virtualization mode V (H extension): `true` in VS- and VU-mode.
+    /// While it is set, the S-level CSRs hold the VS copies (see
+    /// [`csr::SBank`] and [`Hart::set_virt`]).
+    pub virt: bool,
+    /// Smdbltrp critical-error state: a trap to M-mode arrived while
+    /// `mstatus.MDT` was 1. The hart stops without updating any architectural
+    /// state (there is no Smrnmi to take the trap instead).
+    pub critical_error: bool,
+    /// Set when an instruction read a value that depends on device timing or
+    /// on the implementation rather than on architectural state: a load
+    /// below DRAM (MMIO), or a read of a counter, `time`, `seed`, `tinfo`,
+    /// `mip`/`sip` or `scountovf`. Co-simulation clears it before a step and,
+    /// when it is set afterwards, takes the reference model's result instead
+    /// of comparing it. The hart itself never clears it.
+    pub nondeterministic_read: bool,
     /// Per-hart SBI FWFT locks: bit 0 for landing pads, bit 1 for shadow stacks.
     pub fwft_locks: u8,
     /// Trap on any unaligned scalar load or store (`LOAD_MISALIGNED` / `STORE_MISALIGNED`).
     pub strict_align: bool,
     /// Enforce `Svade` page-table rules (page fault when `pte.A == 0` or `pte.D == 0` on store).
     pub svade: bool,
-    /// Enforce strict PMP rules (deny S/U-mode access even when all PMP entries are `OFF`).
+    /// Spec PMP rule: an S/U-mode access that matches no active entry fails.
+    /// `MachineConfig` turns this on by default; a bare `Hart::new` leaves it
+    /// off so directed CPU tests can run S/U code without programming PMP.
     pub strict_pmp: bool,
     /// `Zicfilp` expected landing pad state (`true` = `LP_EXPECTED`).
     pub elp: bool,
@@ -365,14 +777,22 @@ impl Hart {
             timebase,
             reservation: None,
             tlb: Tlb::default(),
+            pmp_cache: PmpCache::default(),
             icache: Box::new([IcacheEntry::default(); ICACHE_SIZE]),
-            bbcache: Box::new([BbCacheEntry::default(); BBCACHE_SIZE]),
+            // Built on the heap: the index is 512 KiB, more than fits on a
+            // test thread's stack.
+            bbcache: vec![BbCacheEntry::default(); BBCACHE_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .expect("BBCACHE_SIZE entries"),
+            bb_arena: Vec::with_capacity(BB_ARENA_SIZE),
             icache_gen: 1,
             fetch_vpn: 0,
             fetch_pa_page: 0,
             check_irq: true,
             yield_slice: false,
             instret_written: false,
+            cycle_written: false,
             icount_written: false,
             hpm_written_mask: 0,
             log_flags: LogFlags::default(),
@@ -383,7 +803,13 @@ impl Hart {
             handle_sbi: false,
             pending_sbi: false,
             pending_semihost: false,
+            semihosting: false,
             hsm_stopped: false,
+            smdbltrp: false,
+            h_ext: false,
+            virt: false,
+            critical_error: false,
+            nondeterministic_read: false,
             fwft_locks: 0,
             strict_align: false,
             svade: false,
@@ -397,6 +823,19 @@ impl Hart {
         }
     }
 
+    /// Selects Svade (`true`: missing A/D bits raise page faults) or Svadu
+    /// (`false`: hardware updates them) as the reset scheme by setting the
+    /// reset value of `menvcfg.ADUE`. Software can still change `ADUE`;
+    /// the MMU follows the current `ADUE` value.
+    pub fn set_svade(&mut self, svade: bool) {
+        self.svade = svade;
+        if svade {
+            self.csr.menvcfg &= !csr::envcfg::ADUE;
+        } else {
+            self.csr.menvcfg |= csr::envcfg::ADUE;
+        }
+    }
+
     /// Resets architectural state and starts execution at `pc`.
     pub fn reset(&mut self, pc: u64) {
         self.pc = pc;
@@ -405,6 +844,15 @@ impl Hart {
         self.v = [[0; 32]; 32];
         self.prv = Priv::Machine;
         self.csr = Csrs::default();
+        self.virt = false;
+        // Smdbltrp: "Upon reset, the MDT field is set to 1."
+        if self.smdbltrp {
+            self.csr.mstatus |= status::MDT;
+        }
+        self.critical_error = false;
+        if self.svade {
+            self.csr.menvcfg &= !csr::envcfg::ADUE;
+        }
         self.wfi = false;
         self.reservation = None;
         self.flush_tlb();
@@ -427,7 +875,10 @@ impl Hart {
         self.prv = Priv::Supervisor;
         self.x[10] = self.id;
         self.x[11] = opaque;
+        // Entering S-mode directly stands in for firmware that ended with
+        // MRET, which clears MDT.
         self.csr.mstatus = (2 << 32) | (2 << 34);
+        self.critical_error = false;
         self.csr.medeleg = 0xb1ff | (1 << cause::SW_CHECK);
         self.csr.mideleg = irq::S_MASK;
         self.csr.mcounteren = 0xffff_ffff;
@@ -436,6 +887,13 @@ impl Hart {
             envcfg::STCE | envcfg::PBMTE | envcfg::CBIE_MASK | envcfg::CBCFE | envcfg::CBZE;
         self.csr.senvcfg = envcfg::CBIE_MASK | envcfg::CBCFE | envcfg::CBZE;
         self.csr.mseccfg = csr::mseccfg::SSEED;
+        // Like OpenSBI's mstatus_init: give S-mode its stateen-gated state.
+        self.csr.mstateen = [
+            csr::stateen::M0_MASK,
+            csr::stateen::M1_3_MASK,
+            csr::stateen::M1_3_MASK,
+            csr::stateen::M1_3_MASK,
+        ];
         self.csr.pmpaddr[0] = (1 << 54) - 1;
         self.csr.pmpcfg[0] = 0x1f;
         self.update_pmp_state();
@@ -478,7 +936,7 @@ impl Hart {
     }
 
     #[inline]
-    fn flush_tlb(&mut self) {
+    pub(crate) fn flush_tlb(&mut self) {
         self.tlb.flush();
         self.fetch_vpn = 0;
     }
@@ -495,6 +953,7 @@ impl Hart {
         if self.icache_gen == 0 {
             self.icache.fill(IcacheEntry::default());
             self.bbcache.fill(BbCacheEntry::default());
+            self.bb_arena.clear();
             self.icache_gen = 1;
         }
     }
@@ -510,10 +969,13 @@ impl Hart {
         self.reservation = None;
     }
 
+    /// Register indices are masked with `& 31` here and in the hot paths:
+    /// decoded fields are always below 32, and the mask lets the compiler
+    /// drop the bounds check.
     #[inline]
     pub(crate) fn set_x(&mut self, rd: u8, v: u64) {
         if rd != 0 {
-            self.x[rd as usize] = v;
+            self.x[usize::from(rd & 31)] = v;
         }
     }
 
@@ -528,7 +990,7 @@ impl Hart {
     pub fn run(&mut self, bus: &AddressSpace, budget: u64) -> u64 {
         self.hit_breakpoint = false;
         self.yield_slice = false;
-        if self.hsm_stopped {
+        if self.hsm_stopped || self.critical_error {
             return 0;
         }
         self.take_pending_interrupt();
@@ -536,32 +998,37 @@ impl Hart {
             return 0;
         }
         let has_bp = !self.breakpoints.is_empty();
+        // Whether blocks and fused pairs may run. Its inputs change only
+        // through instructions that `step` executes (CSR writes, xRET) or
+        // through a change of privilege mode (traps), so it is recomputed
+        // after every `step` and whenever a block returns in another mode.
+        let mut fast_ok = !has_bp && self.blocks_allowed();
+        let mut fast_prv = self.prv;
         let mut n = 0;
         while n < budget {
             if has_bp && self.breakpoints.contains(&self.pc) {
                 self.hit_breakpoint = true;
                 break;
             }
-            if n + 1 < budget
-                && !has_bp
-                && !self.elp
-                && !self.csr.landing_pad_enabled(self.prv)
-                && !self.pmp_subpage
-                && self.log_flags.is_empty()
-                && self.csr.active_hpm_mask == 0
-                && self.csr.active_trigger_mask == 0
-                && self.watchpoints.is_empty()
-            {
-                if self.try_step_fused(bus) {
-                    n += 2;
-                    continue;
-                }
+            if fast_ok && n + 1 < budget {
+                // Blocks first: they run up to BB_MAX_INSNS instructions per
+                // dispatch, and a fusible pair inside a block just runs as two
+                // ordinary instructions with the same result. Fused pairs
+                // still help where no block of 2+ instructions starts.
                 let bb_steps = self.try_step_bb(bus, budget - n);
                 if bb_steps > 0 {
                     n += bb_steps;
                     if self.wfi || self.yield_slice {
                         break;
                     }
+                    if self.prv != fast_prv {
+                        fast_prv = self.prv;
+                        fast_ok = self.blocks_allowed();
+                    }
+                    continue;
+                }
+                if self.try_step_fused(bus) {
+                    n += 2;
                     continue;
                 }
             }
@@ -573,15 +1040,44 @@ impl Hart {
             if self.wfi || self.yield_slice || self.hit_breakpoint {
                 break;
             }
+            fast_ok = !has_bp && self.blocks_allowed();
+            fast_prv = self.prv;
         }
         self.reservation = None;
         n
     }
 
+    /// Whether `run` may use blocks and fused pairs: they skip the landing
+    /// pad, sub-page PMP, logging, HPM event and trigger checks.
     #[inline]
-    fn bump_minstret(&mut self, delta: u64) {
+    fn blocks_allowed(&self) -> bool {
+        !self.elp
+            && !self.csr.landing_pad_enabled(self.prv)
+            && !self.pmp_subpage
+            && self.log_flags.is_empty()
+            && self.csr.active_hpm_mask == 0
+            && self.csr.active_trigger_mask == 0
+            && self.watchpoints.is_empty()
+    }
+
+    /// Advances `minstret` and `mcycle` by `delta` retired instructions,
+    /// honouring `mcountinhibit.IR`/`.CY` and the Smcntrpmf mode filters.
+    #[inline]
+    fn bump_counters(&mut self, delta: u64) {
+        // Common case: neither counter inhibited or filtered by mode.
+        const MODE_INH: u64 = csr::hpmevent::FILTER_MASK_H;
+        if self.csr.mcountinhibit & 5 == 0
+            && (self.csr.minstretcfg | self.csr.mcyclecfg) & MODE_INH == 0
+        {
+            self.csr.minstret = self.csr.minstret.wrapping_add(delta);
+            self.csr.mcycle = self.csr.mcycle.wrapping_add(delta);
+            return;
+        }
         if self.csr.mcountinhibit & 4 == 0 && !self.mode_inhibited(self.csr.minstretcfg) {
             self.csr.minstret = self.csr.minstret.wrapping_add(delta);
+        }
+        if self.csr.mcountinhibit & 1 == 0 && !self.mode_inhibited(self.csr.mcyclecfg) {
+            self.csr.mcycle = self.csr.mcycle.wrapping_add(delta);
         }
     }
 
@@ -591,6 +1087,8 @@ impl Hart {
         if pc & 0xfff > 0xffc {
             return 0;
         }
+        // The fetch page cache holds only addresses the decode caches can tag
+        // (below 2^48), so a hit needs no check.
         let vpn_tag = (pc >> 12) + 1;
         let pa = if self.fetch_vpn == vpn_tag {
             self.fetch_pa_page | (pc & 0xfff)
@@ -598,52 +1096,488 @@ impl Hart {
             let Ok(pa) = self.translate(bus, pc, Access::Fetch) else {
                 return 0;
             };
+            if pa >> 48 != 0 {
+                return 0;
+            }
             self.fetch_vpn = vpn_tag;
             self.fetch_pa_page = pa & !0xfff;
             pa
         };
-        if pa >> 48 != 0 {
-            return 0;
-        }
-        let bb_idx = ((pa >> 1) as usize) & (BBCACHE_SIZE - 1);
+        let bb_idx = decode_cache_index(pa, BBCACHE_SIZE);
         let tag = (pa << 16) | u64::from(self.icache_gen);
-        let entry = if self.bbcache[bb_idx].tag == tag {
-            self.bbcache[bb_idx]
+        let old_tag = self.bbcache[bb_idx].tag;
+        let avail = if old_tag == tag {
+            usize::from(self.bbcache[bb_idx].len)
+        } else if old_tag != 0 && old_tag >> 16 == pa && self.bb_matches_memory(bus, pc, pa, bb_idx)
+        {
+            // Same block, decoded before the last fence.i, and memory still
+            // holds the same instructions: keep the decode.
+            self.bbcache[bb_idx].tag = tag;
+            usize::from(self.bbcache[bb_idx].len)
         } else {
             self.populate_bbcache_same_page(bus, pc, pa, bb_idx, tag)
         };
-        let avail = usize::from(entry.len);
-        if avail < 2 {
+        if avail == 0 {
             return 0;
         }
-        let limit = avail.min(max_insns as usize);
-        for (i, insn) in entry.insns[..limit].iter().enumerate() {
-            match self.execute(bus, insn) {
+        // Everything the inline load/store path depends on besides the fast
+        // TLB itself is constant within a block: the privilege mode,
+        // mstatus, senvcfg and the pointer-masking CSRs change only through
+        // CSR writes, traps and xRET, and those end a block. `run` already
+        // excluded triggers, watchpoints, logging and sub-page PMP.
+        let mem = if !self.strict_align
+            && (self.csr.menvcfg | self.csr.senvcfg | self.csr.mseccfg | self.csr.h.henvcfg)
+                & envcfg::PMM_MASK
+                == 0
+        {
+            bus.fast_ram_view().map(|ram| {
+                let ctx = self.fast_tlb_ctx();
+                let slot = self.tlb.fast.slot_for(ctx);
+                FastMem {
+                    slot,
+                    epoch_hi: self.tlb.fast.slots[slot].epoch_hi,
+                    ram,
+                }
+            })
+        } else {
+            None
+        };
+        // The arena moves out of `self` while the block runs, so that the
+        // loop walks a plain slice. Nothing a block can contain touches the
+        // decode caches: fence.i, CSR accesses and the other flushing
+        // instructions end a block (`BbOpKind::Abort`).
+        let arena = std::mem::take(&mut self.bb_arena);
+        let gen_before = self.icache_gen;
+        let mut total = 0u64;
+        // Instructions of completed blocks, counted into minstret/mcycle once
+        // when the chain ends (nothing in a chain reads them: CSR accesses
+        // end blocks, and a block that stops early counts its own).
+        let mut completed_insns = 0u64;
+        let (mut idx, mut avail) = (bb_idx, avail);
+        loop {
+            let block_pc = self.pc;
+            let start = self.bbcache[idx].start as usize;
+            let limit = avail.min((max_insns - total) as usize);
+            let (done, completed) = self.run_block(bus, &arena[start..start + limit], mem);
+            total += done;
+            if !completed || total >= max_insns {
+                if completed {
+                    completed_insns += done;
+                }
+                break;
+            }
+            completed_insns += done;
+            // A loop that branches back to its own start runs the same
+            // block again (the decode caches do not change within a chain).
+            if self.pc == block_pc {
+                continue;
+            }
+            // Chain into the next block while it is already decoded: the
+            // block-invariant state above (privilege, mstatus, the envcfg
+            // CSRs) only changes through something that ends the chain.
+            let fetch_slot = mem.as_ref().map(|m| (m.slot, m.epoch_hi));
+            match self.cached_block_at_pc(bus, fetch_slot) {
+                Some(next) => (idx, avail) = next,
+                None => break,
+            }
+        }
+        if completed_insns != 0 {
+            self.bump_counters(completed_insns);
+        }
+        debug_assert_eq!(
+            self.icache_gen, gen_before,
+            "a block flushed the decode caches"
+        );
+        self.bb_arena = arena;
+        total
+    }
+
+    /// The decoded block at `self.pc` if the cache holds it for the current
+    /// decode generation (no re-validation or decoding: the arena may be
+    /// moved out of the hart while this runs), as `(index, length)`.
+    /// `fetch_slot` is the chain's fast-TLB slot and its epoch: a fetch from
+    /// another page looks there before it takes the full translation.
+    #[inline(always)]
+    fn cached_block_at_pc(
+        &mut self,
+        bus: &AddressSpace,
+        fetch_slot: Option<(usize, u64)>,
+    ) -> Option<(usize, usize)> {
+        // No block starts within the last 3 bytes of a page (`try_step_bb`
+        // decodes none there), so such a PC simply finds no block.
+        let pc = self.pc;
+        let vpn_tag = (pc >> 12) + 1;
+        let pa = if self.fetch_vpn == vpn_tag {
+            self.fetch_pa_page | (pc & 0xfff)
+        } else {
+            let fast = fetch_slot.and_then(|(slot, epoch_hi)| {
+                let table = &self.tlb.fast.slots[slot % FAST_TLB_SLOTS].fetch;
+                FastTlbSlot::hit(table, epoch_hi, pc).map(|e| e.pa_page | (pc & 0xfff))
+            });
+            let pa = match fast {
+                Some(pa) => pa,
+                None => {
+                    let (pa, ram_off) = self.translate_with_ram_off(bus, pc, Access::Fetch).ok()?;
+                    if pa >> 48 != 0 {
+                        return None;
+                    }
+                    if fetch_slot.is_some() {
+                        self.fast_tlb_fill_fetch(pc, pa, ram_off);
+                    }
+                    pa
+                }
+            };
+            self.fetch_vpn = vpn_tag;
+            self.fetch_pa_page = pa & !0xfff;
+            pa
+        };
+        let idx = decode_cache_index(pa, BBCACHE_SIZE);
+        let entry = &self.bbcache[idx];
+        (entry.tag == (pa << 16) | u64::from(self.icache_gen) && entry.len != 0)
+            .then_some((idx, usize::from(entry.len)))
+    }
+
+    /// Runs the decoded instructions of one block (see [`Self::try_step_bb`])
+    /// and returns the number attempted, including one that trapped, and
+    /// whether all of `insns` ran without a trap, interrupt check, `wfi` or
+    /// yield.
+    #[inline(always)]
+    fn run_block(
+        &mut self,
+        bus: &AddressSpace,
+        insns: &[BlockInsn],
+        mem: Option<FastMem<'_>>,
+    ) -> (u64, bool) {
+        // The PC stays in a local while inline instructions run and is
+        // written back before anything that reads it. This removes a
+        // store-to-load dependency through `self.pc` between consecutive
+        // instructions.
+        let mut pc = self.pc;
+        let mut i = 0;
+        while i < insns.len() {
+            let insn = &insns[i];
+            i += 1;
+            // Integer ALU, Lui/Auipc, Jal/Jalr and branches cannot trap,
+            // touch memory or set check_irq/wfi/yield_slice, so they skip the
+            // `execute` call and the per-instruction flag check. Neither can
+            // a RAM load or store that hits the fast TLB. Blocks run only
+            // with landing pads disabled and `elp` clear (see `run`), and
+            // nothing in a block sets `elp`.
+            debug_assert!(!self.elp);
+            match self.exec_inline(bus, insn, mem, pc) {
+                Inline::Next(next) => {
+                    pc = next;
+                    continue;
+                }
+                Inline::Jump(target) => {
+                    // Blocks go on past conditional branches: a taken one
+                    // ends the block here (`try_step_bb` counts it).
+                    self.pc = target;
+                    return (i as u64, true);
+                }
+                Inline::Slow => {}
+            }
+            self.pc = pc;
+            match self.execute(bus, &insn.insn()) {
                 Ok(()) => {
+                    pc = self.pc;
                     if self.check_irq || self.wfi || self.yield_slice {
-                        let done = (i + 1) as u64;
-                        self.bump_minstret(done);
+                        let done = i as u64;
+                        self.bump_counters(done);
                         if self.check_irq {
                             self.take_pending_interrupt();
                         }
-                        return done;
+                        return (done, false);
                     }
                 }
                 Err(e) => {
-                    let retired = i as u64;
+                    let retired = (i - 1) as u64;
                     if retired > 0 {
-                        self.bump_minstret(retired);
+                        self.bump_counters(retired);
                     }
                     self.instret_written = false;
+                    self.cycle_written = false;
                     self.hpm_written_mask = 0;
-                    self.trap(e.cause, false, e.tval);
-                    return retired + 1;
+                    self.trap_exception(e);
+                    return (retired + 1, false);
                 }
             }
         }
-        let done = limit as u64;
-        self.bump_minstret(done);
-        done
+        self.pc = pc;
+        // The caller counts completed blocks into minstret/mcycle.
+        (insns.len() as u64, true)
+    }
+
+    /// Executes `insn` if it is one of the simple integer instructions, or
+    /// (with `mem_ctx`, see [`Self::exec_load_inline`]) an integer load or
+    /// store that hits the fast TLB, with the same semantics as the matching
+    /// arm of [`Self::execute`]; returns `false` (and does nothing) for
+    /// every other instruction. One `match` dispatches both kinds.
+    #[inline(always)]
+    fn exec_inline(
+        &mut self,
+        bus: &AddressSpace,
+        insn: &BlockInsn,
+        mem: Option<FastMem<'_>>,
+        pc: u64,
+    ) -> Inline {
+        let next = pc.wrapping_add(u64::from(insn.len));
+        let rs1 = self.x[insn.rs1.i()];
+        let rs2 = self.x[insn.rs2.i()];
+        let imm = insn.imm as u64;
+        let rd = insn.rd;
+        let v = match insn.op {
+            Op::Addi => rs1.wrapping_add(imm),
+            Op::Add => rs1.wrapping_add(rs2),
+            Op::Sub => rs1.wrapping_sub(rs2),
+            Op::Lui => imm,
+            Op::Auipc => pc.wrapping_add(imm),
+            Op::Andi => rs1 & imm,
+            Op::Ori => rs1 | imm,
+            Op::Xori => rs1 ^ imm,
+            Op::Slli => rs1 << (imm & 63),
+            Op::Srli => rs1 >> (imm & 63),
+            Op::Srai => ((rs1 as i64) >> (imm & 63)) as u64,
+            Op::Slti => u64::from((rs1 as i64) < i64::from(insn.imm)),
+            Op::Sltiu => u64::from(rs1 < imm),
+            Op::And => rs1 & rs2,
+            Op::Or => rs1 | rs2,
+            Op::Xor => rs1 ^ rs2,
+            Op::Sll => rs1 << (rs2 & 63),
+            Op::Srl => rs1 >> (rs2 & 63),
+            Op::Sra => ((rs1 as i64) >> (rs2 & 63)) as u64,
+            Op::Slt => u64::from((rs1 as i64) < (rs2 as i64)),
+            Op::Sltu => u64::from(rs1 < rs2),
+            Op::Addiw => sext32(rs1.wrapping_add(imm)),
+            Op::Slliw => sext32(rs1 << (imm & 31)),
+            Op::Srliw => sext32(u64::from((rs1 as u32) >> (imm & 31))),
+            Op::Sraiw => ((rs1 as i32) >> (imm & 31)) as i64 as u64,
+            Op::Addw => sext32(rs1.wrapping_add(rs2)),
+            Op::Subw => sext32(rs1.wrapping_sub(rs2)),
+            Op::Sllw => sext32(rs1 << (rs2 & 31)),
+            Op::Srlw => sext32(u64::from((rs1 as u32) >> (rs2 & 31))),
+            Op::Sraw => ((rs1 as i32) >> (rs2 & 31)) as i64 as u64,
+            // M: multiplication and division never trap (division by zero
+            // and overflow have defined results). Bignum code (RSA and ECC
+            // signature checks while Linux loads modules) is full of these.
+            Op::Mul => rs1.wrapping_mul(rs2),
+            Op::Mulh => ((i128::from(rs1 as i64) * i128::from(rs2 as i64)) >> 64) as u64,
+            Op::Mulhsu => ((i128::from(rs1 as i64) * i128::from(rs2)) >> 64) as u64,
+            Op::Mulhu => ((u128::from(rs1) * u128::from(rs2)) >> 64) as u64,
+            Op::Mulw => sext32(rs1.wrapping_mul(rs2)),
+            Op::Div => {
+                let (a, b) = (rs1 as i64, rs2 as i64);
+                (if b == 0 { -1 } else { a.wrapping_div(b) }) as u64
+            }
+            Op::Divu => rs1.checked_div(rs2).unwrap_or(u64::MAX),
+            Op::Rem => {
+                let (a, b) = (rs1 as i64, rs2 as i64);
+                (if b == 0 { a } else { a.wrapping_rem(b) }) as u64
+            }
+            Op::Remu => {
+                if rs2 == 0 {
+                    rs1
+                } else {
+                    rs1 % rs2
+                }
+            }
+            Op::Divw => {
+                let (a, b) = (rs1 as i32, rs2 as i32);
+                (if b == 0 { -1 } else { a.wrapping_div(b) }) as i64 as u64
+            }
+            Op::Divuw => {
+                let (a, b) = (rs1 as u32, rs2 as u32);
+                sext32(u64::from(a.checked_div(b).unwrap_or(u32::MAX)))
+            }
+            Op::Remw => {
+                let (a, b) = (rs1 as i32, rs2 as i32);
+                (if b == 0 { a } else { a.wrapping_rem(b) }) as i64 as u64
+            }
+            Op::Remuw => {
+                let (a, b) = (rs1 as u32, rs2 as u32);
+                sext32(u64::from(if b == 0 { a } else { a % b }))
+            }
+            Op::Beq | Op::Bne | Op::Blt | Op::Bge | Op::Bltu | Op::Bgeu => {
+                let taken = match insn.op {
+                    Op::Beq => rs1 == rs2,
+                    Op::Bne => rs1 != rs2,
+                    Op::Blt => (rs1 as i64) < (rs2 as i64),
+                    Op::Bge => (rs1 as i64) >= (rs2 as i64),
+                    Op::Bltu => rs1 < rs2,
+                    _ => rs1 >= rs2,
+                };
+                return if taken {
+                    Inline::Jump(pc.wrapping_add(imm))
+                } else {
+                    Inline::Next(next)
+                };
+            }
+            Op::Jal => {
+                self.set_x(rd as u8, next);
+                return Inline::Jump(pc.wrapping_add(imm));
+            }
+            // Blocks run only with landing pads disabled (see `run`), so
+            // Jalr never sets `elp` here.
+            Op::Jalr => {
+                self.set_x(rd as u8, next);
+                return Inline::Jump(rs1.wrapping_add(imm) & !1);
+            }
+            // One arm per opcode, so that each inlined access has a
+            // constant size.
+            Op::Ld => {
+                let ok = self.exec_load_inline(insn, mem, rs1, AccessSize::Double, |v| v);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
+            }
+            Op::Lw => {
+                let ok =
+                    self.exec_load_inline(insn, mem, rs1, AccessSize::Word, |v| v as i32 as u64);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
+            }
+            Op::Lwu => {
+                let ok = self.exec_load_inline(insn, mem, rs1, AccessSize::Word, |v| v);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
+            }
+            Op::Lbu => {
+                let ok = self.exec_load_inline(insn, mem, rs1, AccessSize::Byte, |v| v);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
+            }
+            Op::Lb => {
+                let ok =
+                    self.exec_load_inline(insn, mem, rs1, AccessSize::Byte, |v| v as i8 as u64);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
+            }
+            Op::Lhu => {
+                let ok = self.exec_load_inline(insn, mem, rs1, AccessSize::Half, |v| v);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
+            }
+            Op::Lh => {
+                let ok =
+                    self.exec_load_inline(insn, mem, rs1, AccessSize::Half, |v| v as i16 as u64);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
+            }
+            Op::Sd => {
+                let ok = self.exec_store_inline(bus, insn, mem, rs1, rs2, AccessSize::Double);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
+            }
+            Op::Sw => {
+                let ok = self.exec_store_inline(bus, insn, mem, rs1, rs2, AccessSize::Word);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
+            }
+            Op::Sb => {
+                let ok = self.exec_store_inline(bus, insn, mem, rs1, rs2, AccessSize::Byte);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
+            }
+            Op::Sh => {
+                let ok = self.exec_store_inline(bus, insn, mem, rs1, rs2, AccessSize::Half);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
+            }
+            Op::Nop => return Inline::Next(next),
+            _ => match bitmanip_value(insn.op, rs1, rs2, imm) {
+                Some(v) => v,
+                None => return Inline::Slow,
+            },
+        };
+        // Blocks store operations that write x0 as `Nop` (`block_insn`).
+        debug_assert!(rd != Reg::R0);
+        self.x[rd.i()] = v;
+        Inline::Next(next)
+    }
+
+    /// An integer load in a block that stays within one page and hits the
+    /// fast TLB: loads, extends with `ext` and writes `rd`. Returns `false`
+    /// (and does nothing) otherwise, or when `mem_ctx` is `None`.
+    /// `mem_ctx` is [`Self::fast_tlb_ctx`] when the block may access memory
+    /// inline: no pointer masking and no strict alignment. Blocks never run
+    /// with triggers, watchpoints or logging.
+    #[inline(always)]
+    fn exec_load_inline(
+        &mut self,
+        insn: &BlockInsn,
+        mem: Option<FastMem<'_>>,
+        rs1: u64,
+        size: AccessSize,
+        ext: impl Fn(u64) -> u64,
+    ) -> bool {
+        let Some(m) = mem else {
+            return false;
+        };
+        let va = rs1.wrapping_add(insn.imm as u64);
+        // A naturally aligned access stays within its page; `read_aligned`
+        // refuses the others, which take the full path.
+        let slot = &self.tlb.fast.slots[m.slot % FAST_TLB_SLOTS];
+        let Some(e) = FastTlbSlot::hit(&slot.load, m.epoch_hi, va) else {
+            return false;
+        };
+        let Some(v) = m.ram.read_aligned(e.ram_page_off | (va & 0xfff), size) else {
+            return false;
+        };
+        if insn.rd != Reg::R0 {
+            self.x[insn.rd.i()] = ext(v);
+        }
+        true
+    }
+
+    /// The store counterpart of [`Self::exec_load_inline`].
+    #[inline(always)]
+    fn exec_store_inline(
+        &mut self,
+        bus: &AddressSpace,
+        insn: &BlockInsn,
+        mem: Option<FastMem<'_>>,
+        rs1: u64,
+        rs2: u64,
+        size: AccessSize,
+    ) -> bool {
+        let Some(m) = mem else {
+            return false;
+        };
+        let va = rs1.wrapping_add(insn.imm as u64);
+        let slot = &self.tlb.fast.slots[m.slot % FAST_TLB_SLOTS];
+        let Some(e) = FastTlbSlot::hit(&slot.store, m.epoch_hi, va) else {
+            return false;
+        };
+        let (pa, off) = (e.pa_page | (va & 0xfff), e.ram_page_off | (va & 0xfff));
+        // The page's dirty bit is set (see `FastTlb`); `write_aligned`
+        // refuses misaligned accesses, which take the full path.
+        if m.ram.write_aligned(off, size, rs2).is_none() {
+            return false;
+        }
+        self.invalidate_reservation(pa);
+        bus.invalidate_cache_line(pa, size);
+        true
+    }
+
+    /// Whether the block cached at `bb_idx` for `pa` still describes memory:
+    /// every instruction's encoding is unchanged and its fetch still passes
+    /// PMP, as when [`Self::populate_bbcache_same_page`] decoded it. A
+    /// fence.i (Linux runs thousands while booting, for example whenever it
+    /// maps an executable page) invalidates every decoded block, and this
+    /// check is much cheaper than decoding the block again.
+    #[cold]
+    fn bb_matches_memory(&self, bus: &AddressSpace, pc: u64, pa: u64, bb_idx: usize) -> bool {
+        let entry = &self.bbcache[bb_idx];
+        let start = entry.start as usize;
+        let mut off = 0u64;
+        for insn in &self.bb_arena[start..start + usize::from(entry.len)] {
+            let (cur_pc, cur_pa) = (pc.wrapping_add(off), pa + off);
+            let size = if insn.len == 2 {
+                AccessSize::Half
+            } else {
+                AccessSize::Word
+            };
+            let fetch_ok = self
+                .check_pmp_access(cur_pc, cur_pa, 2, Access::Fetch)
+                .is_ok()
+                && (insn.len == 2
+                    || self
+                        .check_pmp_access(cur_pc + 2, cur_pa + 2, 2, Access::Fetch)
+                        .is_ok());
+            if !fetch_ok || bus.read(cur_pa, size).ok() != Some(u64::from(insn.raw)) {
+                return false;
+            }
+            off += u64::from(insn.len);
+        }
+        true
     }
 
     #[cold]
@@ -654,38 +1588,50 @@ impl Hart {
         pa: u64,
         bb_idx: usize,
         tag: u64,
-    ) -> BbCacheEntry {
-        let mut insns = [Insn::ILLEGAL; BB_MAX_INSNS];
-        let mut len = 0usize;
+    ) -> usize {
+        // Decode straight into the arena. When it is full, clear it with
+        // every index entry that points into it.
+        if self.bb_arena.len() + BB_MAX_INSNS > BB_ARENA_SIZE {
+            self.bb_arena.clear();
+            self.bbcache.fill(BbCacheEntry::default());
+        }
+        let start = self.bb_arena.len();
         let mut cur_pc = pc;
         let mut cur_pa = pa;
-        while len < BB_MAX_INSNS && cur_pc >> 12 == pc >> 12 && (cur_pc & 0xfff) <= 0xffc {
+        while self.bb_arena.len() - start < BB_MAX_INSNS
+            && cur_pc >> 12 == pc >> 12
+            && (cur_pc & 0xfff) <= 0xffc
+        {
             let Ok(insn) = self.fetch_decode_same_page(bus, cur_pc, cur_pa) else {
                 break;
             };
             match bb_op_kind(insn.op) {
                 BbOpKind::Abort => break,
                 BbOpKind::Term => {
-                    insns[len] = insn;
-                    len += 1;
+                    self.bb_arena.push(BlockInsn::new(insn));
                     break;
                 }
+                BbOpKind::Branch => {
+                    self.bb_arena.push(BlockInsn::new(insn));
+                    let step_len = u64::from(insn.len);
+                    cur_pc = cur_pc.wrapping_add(step_len);
+                    cur_pa = cur_pa.wrapping_add(step_len);
+                }
                 BbOpKind::Seq => {
-                    insns[len] = insn;
-                    len += 1;
+                    self.bb_arena.push(BlockInsn::new(block_insn(insn)));
                     let step_len = u64::from(insn.len);
                     cur_pc = cur_pc.wrapping_add(step_len);
                     cur_pa = cur_pa.wrapping_add(step_len);
                 }
             }
         }
-        let entry = BbCacheEntry {
+        let len = self.bb_arena.len() - start;
+        self.bbcache[bb_idx] = BbCacheEntry {
             tag,
+            start: start as u32,
             len: len as u8,
-            insns,
         };
-        self.bbcache[bb_idx] = entry;
-        entry
+        len
     }
 
     #[inline]
@@ -701,14 +1647,14 @@ impl Hart {
             let Ok(pa) = self.translate(bus, pc, Access::Fetch) else {
                 return false;
             };
+            if pa >> 48 != 0 {
+                return false;
+            }
             self.fetch_vpn = vpn_tag;
             self.fetch_pa_page = pa & !0xfff;
             pa
         };
-        if pa >> 48 != 0 {
-            return false;
-        }
-        let idx = ((pa >> 1) as usize) & (ICACHE_SIZE - 1);
+        let idx = decode_cache_index(pa, ICACHE_SIZE);
         let tag = (pa << 16) | u64::from(self.icache_gen);
         let fused = if self.icache[idx].tag == tag {
             self.icache[idx].fused
@@ -727,20 +1673,20 @@ impl Hart {
             } => {
                 self.x[rd as usize] = pc.wrapping_add(offset as u64);
                 self.pc = pc.wrapping_add(u64::from(total_len));
-                self.bump_minstret(2);
+                self.bump_counters(2);
                 true
             }
             FusedOp::LuiAddi { rd, total_len, imm } | FusedOp::LuiAddiw { rd, total_len, imm } => {
                 self.x[rd as usize] = imm;
                 self.pc = pc.wrapping_add(u64::from(total_len));
-                self.bump_minstret(2);
+                self.bump_counters(2);
                 true
             }
             FusedOp::ZextW { rd, rs1, total_len } => {
                 let v = u64::from(self.x[rs1 as usize] as u32);
                 self.x[rd as usize] = v;
                 self.pc = pc.wrapping_add(u64::from(total_len));
-                self.bump_minstret(2);
+                self.bump_counters(2);
                 true
             }
             FusedOp::AuipcJalr {
@@ -753,7 +1699,7 @@ impl Hart {
                 self.x[t_reg as usize] = pc.wrapping_add(auipc_imm as i64 as u64);
                 self.set_x(link_rd, pc.wrapping_add(u64::from(total_len)));
                 self.pc = pc.wrapping_add(jalr_offset as u64) & !1;
-                self.bump_minstret(2);
+                self.bump_counters(2);
                 true
             }
         }
@@ -765,6 +1711,7 @@ impl Hart {
             self.log_exec_cpu();
         }
         self.instret_written = false;
+        self.cycle_written = false;
         self.icount_written = false;
         self.hpm_written_mask = 0;
         let step_prv = self.prv;
@@ -777,12 +1724,19 @@ impl Hart {
         };
         match result {
             Ok(()) => {
-                // An explicit write to minstret suppresses that instruction's increment.
+                // An explicit write to minstret or mcycle suppresses that
+                // instruction's increment of the written counter.
                 if self.csr.mcountinhibit & 4 == 0
                     && !self.mode_inhibited(self.csr.minstretcfg)
                     && !std::mem::take(&mut self.instret_written)
                 {
                     self.csr.minstret = self.csr.minstret.wrapping_add(1);
+                }
+                if self.csr.mcountinhibit & 1 == 0
+                    && !self.mode_inhibited(self.csr.mcyclecfg)
+                    && !std::mem::take(&mut self.cycle_written)
+                {
+                    self.csr.mcycle = self.csr.mcycle.wrapping_add(1);
                 }
                 if self.csr.active_hpm_mask != 0 {
                     self.step_hpm_counters();
@@ -795,9 +1749,10 @@ impl Hart {
             }
             Err(e) => {
                 self.instret_written = false;
+                self.cycle_written = false;
                 self.icount_written = false;
                 self.hpm_written_mask = 0;
-                self.trap(e.cause, false, e.tval);
+                self.trap_exception(e);
             }
         }
     }
@@ -844,10 +1799,12 @@ impl Hart {
 
     #[cold]
     fn step_icount_triggers(&mut self, prv: Priv) {
-        let mode_bit = match prv {
-            Priv::Machine => csr::trig::ICOUNT_M,
-            Priv::Supervisor => csr::trig::ICOUNT_S,
-            Priv::User => csr::trig::ICOUNT_U,
+        let mode_bit = match (prv, self.virt) {
+            (Priv::Machine, _) => csr::trig::ICOUNT_M,
+            (Priv::Supervisor, false) => csr::trig::ICOUNT_S,
+            (Priv::User, false) => csr::trig::ICOUNT_U,
+            (Priv::Supervisor, true) => csr::trig::ICOUNT_VS,
+            (Priv::User, true) => csr::trig::ICOUNT_VU,
         };
         for i in 0..csr::TRIGGER_COUNT {
             let t1 = self.csr.tdata1[i];
@@ -897,10 +1854,14 @@ impl Hart {
 
     #[inline]
     fn trigger_mode_and_context_match(&self, t1: u64, t3: u64, prv: Priv) -> bool {
-        let mode_bit = match prv {
-            Priv::Machine => csr::trig::M,
-            Priv::Supervisor => csr::trig::S,
-            Priv::User => csr::trig::U,
+        // With V = 1 only mcontrol6 matches, by its vs/vu bits (as QEMU).
+        let mode_bit = match (prv, self.virt) {
+            (Priv::Machine, _) => csr::trig::M,
+            (Priv::Supervisor, false) => csr::trig::S,
+            (Priv::User, false) => csr::trig::U,
+            _ if t1 >> csr::trig::TYPE_SHIFT != csr::trig::TYPE_MCONTROL6 => return false,
+            (Priv::Supervisor, true) => csr::trig::VS6,
+            (Priv::User, true) => csr::trig::VU6,
         };
         (t1 & mode_bit) != 0 && self.trigger_context_match(t3)
     }
@@ -1001,14 +1962,45 @@ impl Hart {
         Ok(())
     }
 
+    /// PMA check for the cache block at `pa`, after the PMP check (Sail
+    /// `phys_access_check`): cbo.clean/flush/inval need a readable or
+    /// writable region and cbo.zero needs RAM; otherwise the instruction
+    /// raises a store/AMO access fault (Zicbom/Zicboz).
+    fn cbo_pma_check(bus: &AddressSpace, pa: u64, va: u64, zero: bool) -> Result<(), Exception> {
+        let ok = match bus.find(pa).map(|r| &r.kind) {
+            None => false,
+            Some(RegionKind::Ram(_)) => true,
+            Some(RegionKind::Rom(_) | RegionKind::Mmio(_)) => !zero,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(Exception::new(cause::STORE_ACCESS, va))
+        }
+    }
+
+    /// Whether the Sscofpmf/Smcntrpmf filter `cfg` stops counting in the
+    /// current mode (VS/VU-mode use VSINH/VUINH).
     #[inline]
     fn mode_inhibited(&self, cfg: u64) -> bool {
-        let bit = match self.prv {
-            Priv::Machine => csr::hpmevent::MINH,
-            Priv::Supervisor => csr::hpmevent::SINH,
-            Priv::User => csr::hpmevent::UINH,
+        let bit = match (self.prv, self.virt) {
+            (Priv::Machine, _) => csr::hpmevent::MINH,
+            (Priv::Supervisor, false) => csr::hpmevent::SINH,
+            (Priv::User, false) => csr::hpmevent::UINH,
+            (Priv::Supervisor, true) => csr::hpmevent::VSINH,
+            (Priv::User, true) => csr::hpmevent::VUINH,
         };
         cfg & bit != 0
+    }
+
+    /// The writable mode filters of `mhpmevent`, `mcyclecfg` and
+    /// `minstretcfg`.
+    fn hpm_filter_mask(&self) -> u64 {
+        if self.h_ext {
+            csr::hpmevent::FILTER_MASK_H
+        } else {
+            csr::hpmevent::FILTER_MASK
+        }
     }
 
     #[cold]
@@ -1048,6 +2040,9 @@ impl Hart {
     }
 
     fn select_interrupt(&self, pending: u64) -> Option<u64> {
+        if self.h_ext {
+            return self.h_select_interrupt(pending);
+        }
         let mstatus = self.csr.mstatus;
         let m_enabled = self.prv < Priv::Machine || mstatus & status::MIE != 0;
         let s_enabled = self.prv < Priv::Supervisor
@@ -1072,23 +2067,56 @@ impl Hart {
                 v |= irq::STIP;
             }
         }
+        if self.vstimer_pending() {
+            v |= irq::VSTIP;
+        }
         v
     }
 
     /// Enters a trap handler.
     pub fn trap(&mut self, code: u64, interrupt: bool, tval: u64) {
+        self.trap_full(code, interrupt, tval, 0, false);
+    }
+
+    /// Takes the trap for exception `e`, with its H-extension values.
+    #[inline]
+    pub(crate) fn trap_exception(&mut self, e: Exception) {
+        self.trap_full(e.cause, false, e.tval, e.tval2, e.gva);
+    }
+
+    /// Enters a trap handler. `tval2` (`htval`/`mtval2`) and `gva`
+    /// (`hstatus.GVA`/`mstatus.GVA`) matter only with the H extension.
+    fn trap_full(&mut self, code: u64, interrupt: bool, tval: u64, tval2: u64, gva: bool) {
         let old_pc = self.pc;
         let old_prv = self.prv;
+        let old_virt = self.virt;
         self.reservation = None;
         self.wfi = false;
         let deleg = if interrupt {
-            self.csr.mideleg
+            self.mideleg_eff()
         } else {
             self.csr.medeleg
         };
         let delegated_to_s = self.prv <= Priv::Supervisor && (deleg >> code) & 1 != 0;
-        let dte = self.csr.menvcfg & envcfg::DTE != 0;
-        let s_double_trap = delegated_to_s && dte && (self.csr.mstatus & status::SDT) != 0;
+        let hdeleg = if interrupt {
+            self.csr.h.hideleg
+        } else {
+            self.csr.h.hedeleg
+        };
+        let to_vs = delegated_to_s && old_virt && (hdeleg >> code) & 1 != 0;
+        // Ssdbltrp: VS-mode uses henvcfg.DTE and vsstatus.SDT; a trap from
+        // V = 1 into HS-mode uses HS-mode's SDT, which is in the bank.
+        let dte = if to_vs {
+            self.csr.h.henvcfg & envcfg::DTE != 0
+        } else {
+            self.csr.menvcfg & envcfg::DTE != 0
+        };
+        let sdt = if old_virt && !to_vs {
+            self.csr.h.bank.status & status::SDT != 0
+        } else {
+            self.csr.mstatus & status::SDT != 0
+        };
+        let s_double_trap = delegated_to_s && dte && sdt;
         let (code, interrupt, tval, to_s) = if s_double_trap {
             (
                 cause::DOUBLE_TRAP,
@@ -1099,6 +2127,49 @@ impl Hart {
         } else {
             (code, interrupt, tval, delegated_to_s)
         };
+        let to_vs = to_vs && to_s;
+        // Smdbltrp: a trap into M-mode while MDT = 1 is an unexpected trap.
+        // Without Smrnmi "the hart enters a critical-error state without
+        // updating any architectural state, including the pc".
+        if self.smdbltrp && !to_s && self.csr.mstatus & status::MDT != 0 {
+            self.critical_error = true;
+            return;
+        }
+        // VS-mode sees its interrupts as the S-level ones (VSSI -> SSI, ...).
+        let code = if to_vs && interrupt && matches!(code, irq::VSSI | irq::VSTI | irq::VSEI) {
+            code - 1
+        } else {
+            code
+        };
+        if self.h_ext && !to_vs {
+            // Leaving V = 1 restores HS-mode's S-level CSRs first.
+            self.set_virt(false);
+            let h = &mut self.csr.h;
+            if to_s {
+                h.hstatus &= !(hstatus::SPV | hstatus::SPVP | hstatus::GVA);
+                if old_virt {
+                    h.hstatus |= hstatus::SPV;
+                    if old_prv == Priv::Supervisor {
+                        h.hstatus |= hstatus::SPVP;
+                    }
+                }
+                if gva {
+                    h.hstatus |= hstatus::GVA;
+                }
+                h.htval = tval2;
+                h.htinst = 0;
+            } else {
+                self.csr.mstatus &= !(status::MPV | status::GVA);
+                if old_virt {
+                    self.csr.mstatus |= status::MPV;
+                }
+                if gva {
+                    self.csr.mstatus |= status::GVA;
+                }
+                h.mtval2 = tval2;
+                h.mtinst = 0;
+            }
+        }
         let cause = code | (u64::from(interrupt) << 63);
         let save_elp = self.elp && self.csr.landing_pad_enabled(old_prv);
         self.elp = false;
@@ -1136,6 +2207,10 @@ impl Hart {
             if save_elp {
                 *s |= status::MPELP;
             }
+            // Smdbltrp: taking a trap into M-mode sets MDT.
+            if self.smdbltrp {
+                *s |= status::MDT;
+            }
             self.prv = Priv::Machine;
             self.pc = trap_vector(self.csr.mtvec, code, interrupt);
         }
@@ -1159,12 +2234,14 @@ impl Hart {
                 self.fetch_pa_page | (pc & 0xfff)
             } else {
                 let pa = self.translate(bus, pc, Access::Fetch)?;
-                self.fetch_vpn = vpn_tag;
-                self.fetch_pa_page = pa & !0xfff;
+                if pa >> 48 == 0 {
+                    self.fetch_vpn = vpn_tag;
+                    self.fetch_pa_page = pa & !0xfff;
+                }
                 pa
             };
             if pa >> 48 == 0 {
-                let idx = ((pa >> 1) as usize) & (ICACHE_SIZE - 1);
+                let idx = decode_cache_index(pa, ICACHE_SIZE);
                 let tag = (pa << 16) | u64::from(self.icache_gen);
                 let entry = &self.icache[idx];
                 if entry.tag == tag {
@@ -1275,12 +2352,21 @@ impl Hart {
         if (va & 0xfff) + n > 0x1000 {
             return self.load_page_cross(bus, va, n);
         }
+        if let Some(off) = self.fast_load_ram_off(va) {
+            if let Some(v) = bus.read_fast_ram(off, size) {
+                return Ok(v);
+            }
+        }
         let (pa, ram_page_off) = self.translate_with_ram_off(bus, va, Access::Load)?;
         self.check_pmp_access(va, pa, n, Access::Load)?;
         if ram_page_off != u64::MAX {
             if let Some(v) = bus.read_fast_ram(ram_page_off | (pa & 0xfff), size) {
+                self.fast_tlb_fill(va, pa, ram_page_off, false);
                 return Ok(v);
             }
+        }
+        if pa < 0x8000_0000 {
+            self.nondeterministic_read = true;
         }
         bus.read(pa, size).map_err(|e| {
             if self.log_flags.has(LogFlags::GUEST_ERRORS) {
@@ -1317,6 +2403,12 @@ impl Hart {
         if (va & 0xfff) + n > 0x1000 {
             return self.store_page_cross(bus, va, n, value);
         }
+        if let Some((pa, off)) = self.fast_store_ram_off(va) {
+            self.invalidate_reservation(pa);
+            if bus.write_fast_ram(pa, off, size, value).is_some() {
+                return Ok(());
+            }
+        }
         let (pa, ram_page_off) = self.translate_with_ram_off(bus, va, Access::Store)?;
         self.check_pmp_access(va, pa, n, Access::Store)?;
         self.invalidate_reservation(pa);
@@ -1325,6 +2417,7 @@ impl Hart {
                 .write_fast_ram(pa, ram_page_off | (pa & 0xfff), size, value)
                 .is_some()
         {
+            self.fast_tlb_fill(va, pa, ram_page_off, true);
             return Ok(());
         }
         if pa < 0x8000_0000 {
@@ -1374,6 +2467,29 @@ impl Hart {
         Exception::new(cause::ILLEGAL_INSN, u64::from(insn.raw))
     }
 
+    /// Whether a Zicbom/Zicboz instruction is enabled by the `envcfg` field
+    /// `bits` (`CBIE`, `CBCFE` or `CBZE`), in QEMU's order: `menvcfg`
+    /// (illegal instruction), then with V = 1 `henvcfg` and, in VU-mode,
+    /// `senvcfg` (virtual instruction), then `senvcfg` in U-mode (illegal).
+    fn cbo_enabled(&self, bits: u64, insn: &Insn) -> Result<(), Exception> {
+        if self.prv == Priv::Machine {
+            return Ok(());
+        }
+        let c = &self.csr;
+        if c.menvcfg & bits == 0 {
+            return Err(Self::illegal(insn));
+        }
+        if self.virt
+            && (c.h.henvcfg & bits == 0 || (self.prv == Priv::User && c.senvcfg & bits == 0))
+        {
+            return Err(Exception::new(cause::VIRTUAL_INSN, u64::from(insn.raw)));
+        }
+        if self.prv == Priv::User && c.senvcfg & bits == 0 {
+            return Err(Self::illegal(insn));
+        }
+        Ok(())
+    }
+
     fn execute(&mut self, bus: &AddressSpace, insn: &Insn) -> Result<(), Exception> {
         let pc = self.pc;
         if self.elp {
@@ -1392,8 +2508,8 @@ impl Hart {
             self.elp = false;
         }
         let next = pc.wrapping_add(u64::from(insn.len));
-        let rs1 = self.x[insn.rs1 as usize];
-        let rs2 = self.x[insn.rs2 as usize];
+        let rs1 = self.x[usize::from(insn.rs1 & 31)];
+        let rs2 = self.x[usize::from(insn.rs2 & 31)];
         let imm = insn.imm as u64;
         let rd = insn.rd;
         let mut new_pc = next;
@@ -1408,6 +2524,7 @@ impl Hart {
 
         match insn.op {
             Op::Illegal => return Err(Self::illegal(insn)),
+            Op::Nop => {}
             Op::Lui => self.set_x(rd, imm),
             Op::Auipc => self.set_x(rd, pc.wrapping_add(imm)),
             Op::Jal => {
@@ -1489,6 +2606,7 @@ impl Hart {
                 } else {
                     let c = match self.prv {
                         Priv::User => cause::ECALL_U,
+                        Priv::Supervisor if self.virt => cause::ECALL_VS,
                         Priv::Supervisor => cause::ECALL_S,
                         Priv::Machine => cause::ECALL_M,
                     };
@@ -1496,7 +2614,7 @@ impl Hart {
                 }
             }
             Op::Ebreak => {
-                if insn.len == 4 && self.is_semihost_sequence(bus, pc) {
+                if self.semihosting && insn.len == 4 && self.is_semihost_sequence(bus, pc) {
                     self.pending_semihost = true;
                     self.yield_slice = true;
                 } else {
@@ -1794,7 +2912,9 @@ impl Hart {
                 let s = self.csr.mstatus;
                 let mpp = Priv::from_bits(s >> status::MPP_SHIFT);
                 let mpelp = s & status::MPELP != 0;
-                let mut n = s & !(status::MIE | status::MPP | status::MPELP | status::MDT);
+                let to_virt = self.h_ext && s & status::MPV != 0 && mpp != Priv::Machine;
+                let mut n =
+                    s & !(status::MIE | status::MPP | status::MPELP | status::MDT | status::MPV);
                 if s & status::MPIE != 0 {
                     n |= status::MIE;
                 }
@@ -1806,6 +2926,9 @@ impl Hart {
                     }
                 }
                 self.csr.mstatus = n;
+                if to_virt {
+                    self.set_virt(true);
+                }
                 self.prv = mpp;
                 self.elp = mpelp && self.csr.landing_pad_enabled(mpp);
                 self.reservation = None;
@@ -1815,6 +2938,11 @@ impl Hart {
             }
             Op::Sret => {
                 let s = self.csr.mstatus;
+                if self.virt
+                    && (self.prv < Priv::Supervisor || self.csr.h.hstatus & hstatus::VTSR != 0)
+                {
+                    return Err(Exception::new(cause::VIRTUAL_INSN, u64::from(insn.raw)));
+                }
                 if self.prv < Priv::Supervisor
                     || (self.prv == Priv::Supervisor && s & status::TSR != 0)
                 {
@@ -1833,17 +2961,33 @@ impl Hart {
                 }
                 n |= status::SPIE;
                 self.csr.mstatus = n;
+                // The return address is the current mode's sepc: read it
+                // before a switch to V = 1 swaps in the VS copy.
+                new_pc = self.csr.sepc;
+                // From HS-mode, sret returns to hstatus.SPV's mode and clears
+                // SPV (as QEMU does); from VS-mode it stays in V = 1.
+                if self.h_ext && !self.virt {
+                    let spv = self.csr.h.hstatus & hstatus::SPV != 0;
+                    self.csr.h.hstatus &= !hstatus::SPV;
+                    if spv {
+                        self.set_virt(true);
+                    }
+                }
                 self.prv = spp;
                 self.elp = spelp && self.csr.landing_pad_enabled(spp);
                 self.reservation = None;
                 self.fetch_vpn = 0;
                 self.check_irq = true;
-                new_pc = self.csr.sepc;
             }
             Op::Wfi => {
                 let s = self.csr.mstatus;
-                if self.prv == Priv::User || (self.prv == Priv::Supervisor && s & status::TW != 0) {
+                if (self.prv == Priv::User && !self.virt)
+                    || (self.prv == Priv::Supervisor && s & status::TW != 0)
+                {
                     return Err(Self::illegal(insn));
+                }
+                if self.virt && (self.prv == Priv::User || self.csr.h.hstatus & hstatus::VTW != 0) {
+                    return Err(Exception::new(cause::VIRTUAL_INSN, u64::from(insn.raw)));
                 }
                 if self.mip() & self.csr.mie == 0 {
                     self.wfi = true;
@@ -1853,6 +2997,14 @@ impl Hart {
                 }
             }
             Op::WrsNto => {
+                // Zawrs: with V = 1, hstatus.VTW (and TW = 0) makes it a
+                // virtual instruction (QEMU raises it at once).
+                if self.virt
+                    && self.csr.h.hstatus & hstatus::VTW != 0
+                    && self.csr.mstatus & status::TW == 0
+                {
+                    return Err(Exception::new(cause::VIRTUAL_INSN, u64::from(insn.raw)));
+                }
                 if self.prv != Priv::Machine && self.csr.mstatus & status::TW != 0 {
                     return Err(Self::illegal(insn));
                 }
@@ -1864,75 +3016,88 @@ impl Hart {
                 self.yield_slice = true;
             }
             Op::SfenceVma | Op::SinvalVma => {
-                if self.prv == Priv::User
+                // mstatus.TVM governs HS-mode, hstatus.VTVM VS-mode; from
+                // VU-mode it is a virtual instruction.
+                if self.virt {
+                    if self.prv == Priv::User || self.csr.h.hstatus & hstatus::VTVM != 0 {
+                        return Err(Exception::new(cause::VIRTUAL_INSN, u64::from(insn.raw)));
+                    }
+                } else if self.prv == Priv::User
                     || (self.prv == Priv::Supervisor && self.csr.mstatus & status::TVM != 0)
                 {
                     return Err(Self::illegal(insn));
                 }
-                self.sfence_vma(insn.rs1, insn.rs2, rs1, rs2);
+                if self.virt {
+                    // VS-stage entries are not tagged by VMID or VS-ASID.
+                    self.flush_tlb();
+                } else {
+                    self.sfence_vma(insn.rs1, insn.rs2, rs1, rs2);
+                }
             }
             Op::SfenceWInval | Op::SfenceInvalIr => {
                 if self.prv == Priv::User {
-                    return Err(Self::illegal(insn));
+                    return Err(if self.virt {
+                        Exception::new(cause::VIRTUAL_INSN, u64::from(insn.raw))
+                    } else {
+                        Self::illegal(insn)
+                    });
                 }
                 self.fetch_vpn = 0;
+            }
+            Op::HfenceVvma | Op::HfenceGvma => {
+                self.h_insn_check(insn.raw, true)?;
+                if insn.op == Op::HfenceGvma
+                    && self.prv == Priv::Supervisor
+                    && self.csr.mstatus & status::TVM != 0
+                {
+                    return Err(Self::illegal(insn));
+                }
+                self.flush_tlb();
+            }
+            Op::Hlv => {
+                self.h_insn_check(insn.raw, false)?;
+                let v = self.hyp_load(bus, rs1, insn.funct)?;
+                self.set_x(rd, v);
+            }
+            Op::Hsv => {
+                self.h_insn_check(insn.raw, false)?;
+                self.hyp_store(bus, rs1, insn.funct, rs2)?;
             }
 
             // Zicbom / Zicboz (64-byte cache-block operations).
             Op::CboInval => {
-                let ok = match self.prv {
-                    Priv::Machine => true,
-                    Priv::Supervisor => self.csr.menvcfg & envcfg::CBIE_MASK != 0,
-                    Priv::User => {
-                        (self.csr.menvcfg & envcfg::CBIE_MASK) != 0
-                            && (self.csr.senvcfg & envcfg::CBIE_MASK) != 0
-                    }
-                };
-                if !ok {
-                    return Err(Self::illegal(insn));
-                }
+                self.cbo_enabled(envcfg::CBIE_MASK, insn)?;
                 let va = self.mask_data_addr(rs1);
                 let base_va = va & !63;
                 let pa = self
                     .translate(bus, base_va, Access::CacheBom)
-                    .map_err(|e| Exception::new(e.cause, va))?;
+                    .map_err(|e| Exception { tval: va, ..e })?;
                 self.check_pmp_access(va, pa, 64, Access::CacheBom)?;
+                Self::cbo_pma_check(bus, pa, va, false)?;
                 self.invalidate_reservation(pa);
                 bus.invalidate_cache_line(pa, AccessSize::Double);
             }
             Op::CboClean | Op::CboFlush => {
-                let ok = match self.prv {
-                    Priv::Machine => true,
-                    Priv::Supervisor => self.csr.menvcfg & envcfg::CBCFE != 0,
-                    Priv::User => (self.csr.menvcfg & self.csr.senvcfg & envcfg::CBCFE) != 0,
-                };
-                if !ok {
-                    return Err(Self::illegal(insn));
-                }
+                self.cbo_enabled(envcfg::CBCFE, insn)?;
                 let va = self.mask_data_addr(rs1);
                 let base_va = va & !63;
                 let pa = self
                     .translate(bus, base_va, Access::CacheBom)
-                    .map_err(|e| Exception::new(e.cause, va))?;
+                    .map_err(|e| Exception { tval: va, ..e })?;
                 self.check_pmp_access(va, pa, 64, Access::CacheBom)?;
+                Self::cbo_pma_check(bus, pa, va, false)?;
                 self.invalidate_reservation(pa);
                 bus.invalidate_cache_line(pa, AccessSize::Double);
             }
             Op::CboZero => {
-                let ok = match self.prv {
-                    Priv::Machine => true,
-                    Priv::Supervisor => self.csr.menvcfg & envcfg::CBZE != 0,
-                    Priv::User => (self.csr.menvcfg & self.csr.senvcfg & envcfg::CBZE) != 0,
-                };
-                if !ok {
-                    return Err(Self::illegal(insn));
-                }
+                self.cbo_enabled(envcfg::CBZE, insn)?;
                 let va = self.mask_data_addr(rs1);
                 let base_va = va & !63;
                 let pa = self
                     .translate(bus, base_va, Access::Store)
-                    .map_err(|e| Exception::new(e.cause, va))?;
+                    .map_err(|e| Exception { tval: va, ..e })?;
                 self.check_pmp_access(va, pa, 64, Access::Store)?;
+                Self::cbo_pma_check(bus, pa, va, true)?;
                 self.invalidate_reservation(pa);
                 bus.invalidate_cache_line(pa, AccessSize::Double);
                 for off in (0..64u64).step_by(8) {
@@ -2094,7 +3259,15 @@ impl Hart {
             _ => (true, true),
         };
         self.check_data_triggers(addr, size.bytes(), is_load, is_store)?;
-        if addr & (size.bytes() - 1) != 0 {
+        // Zama16b: a misaligned AMO (Zaamo, Zabha, Zacas up to doubleword)
+        // that stays inside a naturally aligned 16-byte granule executes
+        // atomically. Other misaligned AMOs, and misaligned LR/SC and
+        // Zalasr accesses, raise address-misaligned.
+        let misaligned = addr & (size.bytes() - 1) != 0;
+        if misaligned
+            && (matches!(insn.op, Op::Lr | Op::Sc | Op::LoadAq | Op::StoreRl)
+                || (addr & 15) + size.bytes() > 16)
+        {
             let c = if matches!(insn.op, Op::Lr | Op::LoadAq) {
                 cause::LOAD_MISALIGNED
             } else {
@@ -2102,6 +3275,13 @@ impl Hart {
             };
             return Err(Exception::new(c, addr));
         }
+        let amo_rmw = |pa: u64, f: &mut dyn FnMut(u64) -> u64| {
+            if misaligned {
+                bus.atomic_rmw_granule(pa, size, f)
+            } else {
+                bus.atomic_rmw(pa, size, f)
+            }
+        };
         match insn.op {
             Op::Lr => {
                 let pa = self.translate(bus, addr, Access::Load)?;
@@ -2152,15 +3332,14 @@ impl Hart {
                 self.check_pmp_access(addr, pa, size.bytes(), Access::Store)?;
                 let cmp = zext(self.x[usize::from(insn.rd)]);
                 let new_val = zext(src);
-                let old = bus
-                    .atomic_rmw(pa, size, |old_raw| {
-                        if zext(old_raw) == cmp {
-                            new_val
-                        } else {
-                            old_raw
-                        }
-                    })
-                    .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
+                let old = amo_rmw(pa, &mut |old_raw| {
+                    if zext(old_raw) == cmp {
+                        new_val
+                    } else {
+                        old_raw
+                    }
+                })
+                .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
                 self.invalidate_reservation(pa);
                 self.set_x(insn.rd, sext(old));
             }
@@ -2170,23 +3349,22 @@ impl Hart {
                 let b_s = sext(src) as i64;
                 let b_u = zext(src);
                 let funct = insn.funct;
-                let old = bus
-                    .atomic_rmw(pa, size, |old_raw| {
-                        let a_s = sext(old_raw) as i64;
-                        let a_u = zext(old_raw);
-                        match funct {
-                            amo::SWAP => b_u,
-                            amo::ADD => a_u.wrapping_add(b_u),
-                            amo::XOR => a_u ^ b_u,
-                            amo::AND => a_u & b_u,
-                            amo::OR => a_u | b_u,
-                            amo::MIN => a_s.min(b_s) as u64,
-                            amo::MAX => a_s.max(b_s) as u64,
-                            amo::MINU => a_u.min(b_u),
-                            _ => a_u.max(b_u),
-                        }
-                    })
-                    .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
+                let old = amo_rmw(pa, &mut |old_raw| {
+                    let a_s = sext(old_raw) as i64;
+                    let a_u = zext(old_raw);
+                    match funct {
+                        amo::SWAP => b_u,
+                        amo::ADD => a_u.wrapping_add(b_u),
+                        amo::XOR => a_u ^ b_u,
+                        amo::AND => a_u & b_u,
+                        amo::OR => a_u | b_u,
+                        amo::MIN => a_s.min(b_s) as u64,
+                        amo::MAX => a_s.max(b_s) as u64,
+                        amo::MINU => a_u.min(b_u),
+                        _ => a_u.max(b_u),
+                    }
+                })
+                .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
                 self.invalidate_reservation(pa);
                 self.set_x(insn.rd, sext(old));
             }
@@ -2208,11 +3386,15 @@ impl Hart {
             _ => (u64::from(insn.rs1), insn.rs1 != 0),
         };
         // Privilege and read-only checks.
-        if (self.prv as u16) < (num >> 8) & 3 {
-            return Err(illegal());
-        }
-        if writes && num >> 10 == 3 {
-            return Err(illegal());
+        if self.h_ext {
+            self.h_csr_check(num, writes, insn.raw)?;
+        } else {
+            if (self.prv as u16) < (num >> 8) & 3 {
+                return Err(illegal());
+            }
+            if writes && num >> 10 == 3 {
+                return Err(illegal());
+            }
         }
         if num == csr::SEED && !writes {
             return Err(illegal());
@@ -2223,6 +3405,20 @@ impl Hart {
         } else {
             0
         };
+        if reads
+            && matches!(
+                num,
+                csr::SEED
+                    | csr::TINFO
+                    | csr::MIP
+                    | csr::SIP
+                    | 0xb00..=0xb1f
+                    | 0xc00..=0xc1f
+                    | 0xda0
+            )
+        {
+            self.nondeterministic_read = true;
+        }
         if writes {
             // Per RISC-V Privileged Spec 3.1.9, RMW operations on `mip` use only
             // the software-writable bits as their input, not external IRQ lines.
@@ -2239,12 +3435,36 @@ impl Hart {
         Ok(())
     }
 
-    fn fs_enabled(&self) -> bool {
+    /// Floating-point state is on: `mstatus.FS`, and with V = 1 also the
+    /// HS-level `sstatus.FS` (kept in the bank while V = 1).
+    pub(crate) fn fs_enabled(&self) -> bool {
         self.csr.mstatus & status::FS != 0
+            && (!self.virt || self.csr.h.bank.status & status::FS != 0)
     }
 
-    fn vs_enabled(&self) -> bool {
+    /// Vector state is on (as [`Self::fs_enabled`], for `VS`).
+    pub(crate) fn vs_enabled(&self) -> bool {
         self.csr.mstatus & status::VS != 0
+            && (!self.virt || self.csr.h.bank.status & status::VS != 0)
+    }
+
+    /// Marks the floating-point state dirty, in both `vsstatus` and the
+    /// HS-level `sstatus` while V = 1.
+    #[inline]
+    pub(crate) fn mark_fs_dirty(&mut self) {
+        self.csr.mstatus |= status::FS;
+        if self.virt {
+            self.csr.h.bank.status |= status::FS;
+        }
+    }
+
+    /// Marks the vector state dirty (as [`Self::mark_fs_dirty`]).
+    #[inline]
+    pub(crate) fn mark_vs_dirty(&mut self) {
+        self.csr.mstatus |= status::VS;
+        if self.virt {
+            self.csr.h.bank.status |= status::VS;
+        }
     }
 
     /// Whether counter `idx` (0 = cycle, 1 = time, 2 = instret, ...) is
@@ -2260,6 +3480,11 @@ impl Hart {
 
     /// Reads a CSR; `None` if it does not exist or is inaccessible.
     pub fn csr_read(&self, num: u16) -> Option<u64> {
+        if self.h_ext {
+            if let Some(v) = self.h_csr_read(num) {
+                return v;
+            }
+        }
         let c = &self.csr;
         Some(match num {
             csr::FFLAGS | csr::FRM | csr::FCSR if !self.fs_enabled() => return None,
@@ -2308,15 +3533,20 @@ impl Hart {
                     return None;
                 }
                 match num {
-                    csr::CYCLE | csr::INSTRET => c.minstret,
+                    csr::CYCLE => c.mcycle,
+                    csr::INSTRET => c.minstret,
+                    csr::TIME if self.virt => self.timebase.now().wrapping_add(c.h.htimedelta),
                     csr::TIME => self.timebase.now(),
                     _ => c.mhpmcounter[(num - csr::HPMCOUNTER3) as usize],
                 }
             }
             csr::SCOUNTOVF => {
                 let mut ovf = 0u64;
+                // In VS-mode hcounteren masks the bits too (as QEMU).
                 let en = if self.prv == Priv::Machine {
                     u64::MAX
+                } else if self.virt {
+                    c.mcounteren & c.h.hcounteren
                 } else {
                     c.mcounteren
                 };
@@ -2361,7 +3591,8 @@ impl Hart {
                 c.stimecmp
             }
             csr::SATP => {
-                if self.prv == Priv::Supervisor && c.mstatus & status::TVM != 0 {
+                // mstatus.TVM traps HS-mode only (VS-mode has hstatus.VTVM).
+                if self.prv == Priv::Supervisor && !self.virt && c.mstatus & status::TVM != 0 {
                     return None;
                 }
                 c.satp
@@ -2381,7 +3612,7 @@ impl Hart {
             csr::MVENDORID | csr::MARCHID | csr::MIMPID | csr::MCONFIGPTR => 0,
             csr::MHARTID => self.id,
             csr::MSTATUS => self.read_mstatus(),
-            csr::MISA => csr::MISA_VALUE,
+            csr::MISA => csr::MISA_VALUE | if self.h_ext { 1 << 7 } else { 0 },
             csr::MEDELEG => c.medeleg,
             csr::MIDELEG => c.mideleg,
             csr::MIE => c.mie,
@@ -2423,7 +3654,8 @@ impl Hart {
             csr::TDATA3 => c.tdata3[c.tselect as usize],
             csr::TINFO => csr::trig::TINFO_VAL,
             csr::MCONTEXT => c.mcontext,
-            csr::MCYCLE | csr::MINSTRET => c.minstret,
+            csr::MCYCLE => c.mcycle,
+            csr::MINSTRET => c.minstret,
             csr::MHPMCOUNTER3..=csr::MHPMCOUNTER31 => {
                 c.mhpmcounter[(num - csr::MHPMCOUNTER3) as usize]
             }
@@ -2452,38 +3684,43 @@ impl Hart {
 
     /// Writes a CSR; `None` if it does not exist or is inaccessible.
     pub fn csr_write(&mut self, num: u16, v: u64) -> Option<()> {
+        if self.h_ext {
+            if let Some(r) = self.h_csr_write(num, v) {
+                return r;
+            }
+        }
         match num {
             csr::FFLAGS | csr::FRM | csr::FCSR if !self.fs_enabled() => return None,
             csr::FFLAGS => {
                 self.csr.fflags = v & 0x1f;
-                self.csr.mstatus |= status::FS;
+                self.mark_fs_dirty();
             }
             csr::FRM => {
                 self.csr.frm = v & 7;
-                self.csr.mstatus |= status::FS;
+                self.mark_fs_dirty();
             }
             csr::FCSR => {
                 self.csr.fflags = v & 0x1f;
                 self.csr.frm = (v >> 5) & 7;
-                self.csr.mstatus |= status::FS;
+                self.mark_fs_dirty();
             }
             csr::VSTART | csr::VXSAT | csr::VXRM | csr::VCSR if !self.vs_enabled() => return None,
             csr::VSTART => {
                 self.csr.vstart = v & ((csr::VLEN as u64) - 1);
-                self.csr.mstatus |= status::VS;
+                self.mark_vs_dirty();
             }
             csr::VXSAT => {
                 self.csr.vxsat = v & 1;
-                self.csr.mstatus |= status::VS;
+                self.mark_vs_dirty();
             }
             csr::VXRM => {
                 self.csr.vxrm = v & 3;
-                self.csr.mstatus |= status::VS;
+                self.mark_vs_dirty();
             }
             csr::VCSR => {
                 self.csr.vxsat = v & 1;
                 self.csr.vxrm = (v >> 1) & 3;
-                self.csr.mstatus |= status::VS;
+                self.mark_vs_dirty();
             }
             csr::SSP => {
                 if self.prv != Priv::Machine && !self.csr.shadow_stack_enabled(self.prv) {
@@ -2503,7 +3740,13 @@ impl Hart {
             }
             csr::SSTATUS => {
                 let mut m = status::S_WRITABLE;
-                if self.csr.menvcfg & envcfg::DTE == 0 {
+                // VS-mode's sstatus is vsstatus: its SDT needs henvcfg.DTE.
+                let dte = if self.virt {
+                    self.csr.henvcfg_eff()
+                } else {
+                    self.csr.menvcfg
+                };
+                if dte & envcfg::DTE == 0 {
                     m &= !status::SDT;
                 }
                 let mut n = (self.csr.mstatus & !m) | (v & m);
@@ -2527,7 +3770,11 @@ impl Hart {
                     return None;
                 }
                 let mut mask = envcfg::S_MASK;
-                if self.csr.menvcfg & envcfg::SSE == 0 {
+                // senvcfg.SSE needs menvcfg.SSE, and from VS-mode also
+                // henvcfg.SSE (as QEMU).
+                if self.csr.menvcfg & envcfg::SSE == 0
+                    || (self.virt && self.csr.h.henvcfg & envcfg::SSE == 0)
+                {
                     mask &= !envcfg::SSE;
                 }
                 self.csr.senvcfg = envcfg::sanitize(v, self.csr.senvcfg, mask);
@@ -2555,7 +3802,8 @@ impl Hart {
                 self.csr.stimecmp = v;
             }
             csr::SATP => {
-                if self.prv == Priv::Supervisor && self.csr.mstatus & status::TVM != 0 {
+                if self.prv == Priv::Supervisor && !self.virt && self.csr.mstatus & status::TVM != 0
+                {
                     return None;
                 }
                 let mode = v >> 60;
@@ -2567,6 +3815,8 @@ impl Hart {
                         self.flush_tlb();
                     } else {
                         self.fetch_vpn = 0;
+                        // The main TLB is ASID-tagged; the fast path is not.
+                        self.tlb.fast.invalidate();
                     }
                 }
             }
@@ -2588,8 +3838,14 @@ impl Hart {
             }
             csr::MSTATUS => {
                 let mut m = status::M_WRITABLE;
+                if self.h_ext {
+                    m |= status::MPV | status::GVA;
+                }
                 if self.csr.menvcfg & envcfg::DTE == 0 {
                     m &= !status::SDT;
+                }
+                if !self.smdbltrp {
+                    m &= !status::MDT;
                 }
                 let mut n = (self.csr.mstatus & !m) | (v & m);
                 if v & m & status::SDT != 0 {
@@ -2605,9 +3861,23 @@ impl Hart {
                 self.csr.mstatus = n;
             }
             csr::MISA => {}
-            csr::MEDELEG => self.csr.medeleg = v & csr::MEDELEG_MASK,
+            csr::MEDELEG => {
+                let mask = if self.h_ext {
+                    csr::MEDELEG_MASK_H
+                } else {
+                    csr::MEDELEG_MASK
+                };
+                self.csr.medeleg = v & mask;
+            }
             csr::MIDELEG => self.csr.mideleg = v & irq::S_MASK,
-            csr::MIE => self.csr.mie = v & irq::ALL,
+            csr::MIE => {
+                let mask = if self.h_ext {
+                    irq::ALL | irq::HS_FORCED
+                } else {
+                    irq::ALL
+                };
+                self.csr.mie = v & mask;
+            }
             csr::MTVEC => {
                 if v & 2 == 0 {
                     self.csr.mtvec = v;
@@ -2640,11 +3910,12 @@ impl Hart {
                 self.csr.mcountinhibit = v & 0xffff_fffd;
                 self.csr.update_active_hpm_mask();
             }
-            csr::MCYCLECFG => self.csr.mcyclecfg = v & csr::hpmevent::FILTER_MASK,
-            csr::MINSTRETCFG => self.csr.minstretcfg = v & csr::hpmevent::FILTER_MASK,
+            csr::MCYCLECFG => self.csr.mcyclecfg = v & self.hpm_filter_mask(),
+            csr::MINSTRETCFG => self.csr.minstretcfg = v & self.hpm_filter_mask(),
             csr::MHPMEVENT3..=csr::MHPMEVENT31 => {
                 let i = (num - csr::MHPMEVENT3) as usize;
-                self.csr.mhpmevent[i] = v & csr::hpmevent::MHPMEVENT_MASK;
+                self.csr.mhpmevent[i] =
+                    v & (csr::hpmevent::MHPMEVENT_MASK | self.hpm_filter_mask());
                 self.csr.update_active_hpm_mask();
             }
             csr::MSCRATCH => self.csr.mscratch = v,
@@ -2655,6 +3926,12 @@ impl Hart {
                 let mut m = irq::SSIP | irq::SEIP | irq::LCOFIP;
                 if self.csr.menvcfg & envcfg::STCE == 0 {
                     m |= irq::STIP;
+                }
+                if self.h_ext {
+                    m |= irq::VSSIP | irq::VSEIP;
+                    if self.csr.menvcfg & self.csr.h.henvcfg & envcfg::STCE == 0 {
+                        m |= irq::VSTIP;
+                    }
                 }
                 self.csr.mip = (self.csr.mip & !m) | (v & m);
             }
@@ -2734,7 +4011,7 @@ impl Hart {
                         self.csr.tdata1[idx] = prev_ty << csr::trig::TYPE_SHIFT;
                     }
                     csr::trig::TYPE_MCONTROL | csr::trig::TYPE_MCONTROL6 => {
-                        let rw_mask = csr::trig::LOAD
+                        let mut rw_mask = csr::trig::LOAD
                             | csr::trig::STORE
                             | csr::trig::EXECUTE
                             | csr::trig::U
@@ -2743,15 +4020,21 @@ impl Hart {
                             | csr::trig::MATCH_MASK
                             | csr::trig::CHAIN
                             | csr::trig::SIZE_MASK;
+                        if self.h_ext && ty == csr::trig::TYPE_MCONTROL6 {
+                            rw_mask |= csr::trig::VS6 | csr::trig::VU6;
+                        }
                         self.csr.tdata1[idx] = (ty << csr::trig::TYPE_SHIFT) | (v & rw_mask);
                     }
                     csr::trig::TYPE_ICOUNT => {
-                        let rw_mask = csr::trig::ICOUNT_U
+                        let mut rw_mask = csr::trig::ICOUNT_U
                             | csr::trig::ICOUNT_S
                             | csr::trig::ICOUNT_PENDING
                             | csr::trig::ICOUNT_M
                             | csr::trig::ICOUNT_COUNT_MASK
                             | csr::trig::ICOUNT_HIT;
+                        if self.h_ext {
+                            rw_mask |= csr::trig::ICOUNT_VS | csr::trig::ICOUNT_VU;
+                        }
                         self.csr.tdata1[idx] = (ty << csr::trig::TYPE_SHIFT) | (v & rw_mask);
                         self.icount_written = true;
                     }
@@ -2772,7 +4055,11 @@ impl Hart {
             csr::MCONTEXT => {
                 self.csr.mcontext = v & 0x1fff;
             }
-            csr::MCYCLE | csr::MINSTRET => {
+            csr::MCYCLE => {
+                self.csr.mcycle = v;
+                self.cycle_written = true;
+            }
+            csr::MINSTRET => {
                 self.csr.minstret = v;
                 self.instret_written = true;
             }
@@ -3032,3 +4319,68 @@ const SM4_SBOX: [u8; 256] = [
     0x89, 0x69, 0x97, 0x4a, 0x0c, 0x96, 0x77, 0x7e, 0x65, 0xb9, 0xf1, 0x09, 0xc5, 0x6e, 0xc6, 0x84,
     0x18, 0xf0, 0x7d, 0xec, 0x3a, 0xdc, 0x4d, 0x20, 0x79, 0xee, 0x5f, 0x3e, 0xd7, 0xcb, 0x39, 0x48,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rivemu_core::FrozenTimebase;
+    use rivemu_core::size::MIB;
+    use rivemu_mem::Ram;
+
+    /// Runs `addi a0, a0, imm; j .+4` blocks from `at` until the `wfi` after
+    /// them and returns `a0`.
+    fn run_blocks(h: &mut Hart, bus: &AddressSpace, at: u64) -> u64 {
+        h.wfi = false;
+        h.pc = at;
+        h.x[10] = 0;
+        let mut attempted = 0;
+        while !h.wfi && attempted < 1000 {
+            attempted += h.run(bus, 100);
+        }
+        assert!(h.wfi);
+        h.x[10]
+    }
+
+    /// Clearing the full block arena must also drop every index entry that
+    /// points into it; otherwise a block decoded before the clear runs the
+    /// instructions of whatever block reused its arena slots.
+    #[test]
+    fn clearing_the_block_arena_drops_index_entries() {
+        // A and B use different index slots, so only a stale A entry can
+        // point at B's instructions.
+        const A: u64 = 0x8000_0000;
+        const B: u64 = 0x8000_0100;
+        let mut bus = AddressSpace::new();
+        bus.add_ram("ram", A, Arc::new(Ram::new(MIB).unwrap()))
+            .unwrap();
+        for (base, imm) in [(A, 1u64), (B, 100)] {
+            for i in 0..4 {
+                let at = base + 8 * i;
+                bus.write(at, AccessSize::Word, (imm << 20) | 0x0005_0513)
+                    .unwrap(); // addi a0, a0, imm
+                bus.write(at + 4, AccessSize::Word, 0x0040_006f).unwrap(); // j .+4
+            }
+            bus.write(base + 32, AccessSize::Word, 0x1050_0073).unwrap(); // wfi
+        }
+        let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+        h.reset(A);
+        assert_eq!(run_blocks(&mut h, &bus, A), 4);
+        for i in 0..4 {
+            assert_ne!(
+                decode_cache_index(A + 8 * i, BBCACHE_SIZE),
+                decode_cache_index(B + 8 * i, BBCACHE_SIZE)
+            );
+        }
+        // Fill the arena up to the point where B's first block clears it, so
+        // B's blocks land in the slots that A's blocks used.
+        let filler = BB_ARENA_SIZE - BB_MAX_INSNS + 1 - h.bb_arena.len();
+        h.bb_arena
+            .extend(std::iter::repeat_n(BlockInsn::new(Insn::ILLEGAL), filler));
+        assert_eq!(run_blocks(&mut h, &bus, B), 400);
+        assert!(
+            h.bb_arena.len() < BB_ARENA_SIZE / 2,
+            "the arena was cleared"
+        );
+        assert_eq!(run_blocks(&mut h, &bus, A), 4);
+    }
+}

@@ -1,0 +1,12 @@
+
+RVCP-SUMMARY: TEST FAILED - Test File "Sm_mcsr_cntr-00.S"
+
+RVCP: DEBUG INFORMATION FOLLOWS
+RVCP: Test Info: "test: 544; cg: Sm_mcsr_cg; cp: cp_inhibit_mcycle; bin: "
+RVCP: Instruction: 0xb0002373
+RVCP: Approximate address (failure may be slightly after this): 0x0000000080002bc0
+RVCP: Register: x6
+RVCP: Bad Value:      0x0000000000000007
+RVCP: Expected Value: 0x0000000000000000
+RVCP: END OF DEBUG INFORMATION
+

@@ -404,15 +404,19 @@ fn main() {
 
     let Ok(st) = status else {
         let _ = std::fs::remove_dir_all(&tmp_dir);
-        assert!(!require_9p, "rustc is required by RIVEMU_REQUIRE_9P");
+        assert!(
+            !required,
+            "rustc is required by RIVEMU_REQUIRE_LINUX_TEST / RIVEMU_REQUIRE_9P"
+        );
         eprintln!("skipping: rustc not available");
         return;
     };
     if !st.success() {
         let _ = std::fs::remove_dir_all(&tmp_dir);
         assert!(
-            !require_9p,
-            "riscv64gc-unknown-linux-musl is required by RIVEMU_REQUIRE_9P"
+            !required,
+            "riscv64gc-unknown-linux-musl (rustup target add riscv64gc-unknown-linux-musl) is \
+             required by RIVEMU_REQUIRE_LINUX_TEST / RIVEMU_REQUIRE_9P"
         );
         eprintln!("skipping: riscv64gc-unknown-linux-musl target not installed");
         return;
@@ -449,6 +453,9 @@ fn main() {
         strict_align: true,
         svade: true,
         strict_pmp: true,
+        semihosting: false,
+        smdbltrp: false,
+        hypervisor: false,
     })
     .expect("machine init");
 

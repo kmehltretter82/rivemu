@@ -1,0 +1,14 @@
+   Compiling rivemu-machine v0.1.0 (/home/user/rivemu/crates/rivemu-machine)
+    Finished `release` profile [optimized + debuginfo] target(s) in 11.19s
+     Running tests/linux_devices.rs (target/release/deps/linux_devices-cbcebac7f23127ee)
+
+running 6 tests
+test nvme_namespace_reads_and_writes_from_linux ... ok
+test guest_reboot_resets_the_machine_and_boots_again ... ok
+test sbi_pmu_counts_guest_instructions ... ok
+test snapshot_v2_restores_pci_nvme_into_a_fresh_machine ... ok
+test virtio_gpu_scanout_and_input_devices_work_from_linux ... ok
+test virtio_vsock_guest_connects_to_host_cid ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.59s
+

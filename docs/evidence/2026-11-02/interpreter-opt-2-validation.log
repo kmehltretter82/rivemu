@@ -1,0 +1,23 @@
+== binary a701ce0247042361311c665a1fc8ae0da976d9eb1f7c440bed35c911d33d26f7  target/release/rivemu-system-riscv64
+== workspace
+workspace done
+== clippy
+clippy done
+== ACT (1251)
+total: 1251
+PASS: 1251
+FAIL: 0
+TIMEOUT: 0
+== linux devices
+test guest_reboot_resets_the_machine_and_boots_again ... ok
+test nvme_namespace_reads_and_writes_from_linux ... ok
+test sbi_pmu_counts_guest_instructions ... ok
+test snapshot_v2_restores_pci_nvme_into_a_fresh_machine ... ok
+test virtio_gpu_scanout_and_input_devices_work_from_linux ... ok
+test virtio_vsock_guest_connects_to_host_cid ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 57.74s
+== lockstep 36
+    Finished `release` profile [optimized] target(s) in 8.03s
+failed=0
+0
+done

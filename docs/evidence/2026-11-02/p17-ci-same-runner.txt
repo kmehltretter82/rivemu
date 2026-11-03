@@ -1,0 +1,60 @@
+# P17 benchmark (tests/linux_perf.rs: Debian kernel + initramfs from scripts/fetch-linux-test.sh,
+# 256 MiB, external OpenSBI v1.7, no VirtIO; Machine::new() to the first "~ # ").
+# CI job p17-bench, run 41561662363, job 125673450249, GitHub ubuntu-latest runner, 2026-11-03.
+# scripts/p17-compare.sh 3 head=. base=base: alternating rounds on the same runner,
+# 1 warmup + 3 recorded boots per round and hart count.
+# head = 74ac533 (207c7dc interpreter changes + 02d1f3c PMP page cache + all fixes), base = 0946319.
+head,round=1,P17_SAMPLE,smp=1,phase=warmup,index=0,seconds=23.014630
+head,round=1,P17_SAMPLE,smp=1,phase=recorded,index=0,seconds=22.947700
+head,round=1,P17_SAMPLE,smp=1,phase=recorded,index=1,seconds=22.933057
+head,round=1,P17_SAMPLE,smp=1,phase=recorded,index=2,seconds=22.932326
+head,round=1,P17_SAMPLE,smp=4,phase=warmup,index=0,seconds=26.121218
+head,round=1,P17_SAMPLE,smp=4,phase=recorded,index=0,seconds=25.613322
+head,round=1,P17_SAMPLE,smp=4,phase=recorded,index=1,seconds=25.912808
+head,round=1,P17_SAMPLE,smp=4,phase=recorded,index=2,seconds=25.854293
+base,round=1,P17_SAMPLE,smp=1,phase=warmup,index=0,seconds=30.384191
+base,round=1,P17_SAMPLE,smp=1,phase=recorded,index=0,seconds=30.437106
+base,round=1,P17_SAMPLE,smp=1,phase=recorded,index=1,seconds=30.433051
+base,round=1,P17_SAMPLE,smp=1,phase=recorded,index=2,seconds=30.378332
+base,round=1,P17_SAMPLE,smp=4,phase=warmup,index=0,seconds=36.418323
+base,round=1,P17_SAMPLE,smp=4,phase=recorded,index=0,seconds=36.122154
+base,round=1,P17_SAMPLE,smp=4,phase=recorded,index=1,seconds=37.310907
+base,round=1,P17_SAMPLE,smp=4,phase=recorded,index=2,seconds=36.871710
+head,round=2,P17_SAMPLE,smp=1,phase=warmup,index=0,seconds=22.993418
+head,round=2,P17_SAMPLE,smp=1,phase=recorded,index=0,seconds=22.904460
+head,round=2,P17_SAMPLE,smp=1,phase=recorded,index=1,seconds=22.928753
+head,round=2,P17_SAMPLE,smp=1,phase=recorded,index=2,seconds=22.816102
+head,round=2,P17_SAMPLE,smp=4,phase=warmup,index=0,seconds=25.701307
+head,round=2,P17_SAMPLE,smp=4,phase=recorded,index=0,seconds=25.668376
+head,round=2,P17_SAMPLE,smp=4,phase=recorded,index=1,seconds=25.694151
+head,round=2,P17_SAMPLE,smp=4,phase=recorded,index=2,seconds=25.865416
+base,round=2,P17_SAMPLE,smp=1,phase=warmup,index=0,seconds=30.603779
+base,round=2,P17_SAMPLE,smp=1,phase=recorded,index=0,seconds=30.442325
+base,round=2,P17_SAMPLE,smp=1,phase=recorded,index=1,seconds=30.519808
+base,round=2,P17_SAMPLE,smp=1,phase=recorded,index=2,seconds=30.571049
+base,round=2,P17_SAMPLE,smp=4,phase=warmup,index=0,seconds=36.626114
+base,round=2,P17_SAMPLE,smp=4,phase=recorded,index=0,seconds=36.940562
+base,round=2,P17_SAMPLE,smp=4,phase=recorded,index=1,seconds=36.108458
+base,round=2,P17_SAMPLE,smp=4,phase=recorded,index=2,seconds=35.887838
+head,round=3,P17_SAMPLE,smp=1,phase=warmup,index=0,seconds=22.890906
+head,round=3,P17_SAMPLE,smp=1,phase=recorded,index=0,seconds=22.924309
+head,round=3,P17_SAMPLE,smp=1,phase=recorded,index=1,seconds=22.812026
+head,round=3,P17_SAMPLE,smp=1,phase=recorded,index=2,seconds=22.851877
+head,round=3,P17_SAMPLE,smp=4,phase=warmup,index=0,seconds=25.496444
+head,round=3,P17_SAMPLE,smp=4,phase=recorded,index=0,seconds=25.579911
+head,round=3,P17_SAMPLE,smp=4,phase=recorded,index=1,seconds=25.847765
+head,round=3,P17_SAMPLE,smp=4,phase=recorded,index=2,seconds=25.414781
+base,round=3,P17_SAMPLE,smp=1,phase=warmup,index=0,seconds=30.437779
+base,round=3,P17_SAMPLE,smp=1,phase=recorded,index=0,seconds=30.516125
+base,round=3,P17_SAMPLE,smp=1,phase=recorded,index=1,seconds=30.658035
+base,round=3,P17_SAMPLE,smp=1,phase=recorded,index=2,seconds=30.547228
+base,round=3,P17_SAMPLE,smp=4,phase=warmup,index=0,seconds=37.071642
+base,round=3,P17_SAMPLE,smp=4,phase=recorded,index=0,seconds=36.225664
+base,round=3,P17_SAMPLE,smp=4,phase=recorded,index=1,seconds=36.359969
+base,round=3,P17_SAMPLE,smp=4,phase=recorded,index=2,seconds=35.901080
+
+label smp n median p95 (seconds, recorded samples only)
+head 1 9 22.924 22.948
+head 4 9 25.694 25.913
+base 1 9 30.516 30.658
+base 4 9 36.226 37.311

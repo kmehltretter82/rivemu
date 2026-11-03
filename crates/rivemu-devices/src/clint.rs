@@ -130,8 +130,16 @@ impl MmioDevice for Clint {
             }
             o if (MTIME..MTIME + 8).contains(&o) => {
                 let base = self.timebase.now();
-                let cur = base.wrapping_add(s.offset);
-                s.offset = reg_write(cur, o, size, value).wrapping_sub(base);
+                let new = reg_write(base.wrapping_add(s.offset), o, size, value);
+                // The `time` CSR is a read-only shadow of `mtime`, and Sstc
+                // compares against it, so move the timebase the harts share.
+                // Keep a CLINT-local offset only for a timebase that cannot
+                // be set.
+                if self.timebase.try_set_now(new) {
+                    s.offset = 0;
+                } else {
+                    s.offset = new.wrapping_sub(base);
+                }
             }
             _ => {}
         }
@@ -191,5 +199,22 @@ mod tests {
         assert_eq!(c.mtime(), 1000);
         t.0.store(60, Ordering::Relaxed);
         assert_eq!(c.read(MTIME, AccessSize::Word), 1010);
+    }
+
+    /// The `time` CSR is a read-only shadow of `mtime`: a guest write to
+    /// `mtime` must move the timebase the harts read, not only the CLINT's
+    /// view of it. Found by riscv-arch-test Sm_mcsr_cntr (cp_mtime_write).
+    #[test]
+    fn mtime_write_moves_the_shared_timebase() {
+        let tb = Arc::new(rivemu_core::IcountTimebase::new(10_000_000, 0));
+        tb.advance(1_000_000);
+        let c = Clint::new(tb.clone(), vec![HartIrqs::new()]);
+        c.write(MTIME, AccessSize::Double, 42);
+        assert_eq!(tb.now(), 42);
+        assert_eq!(c.mtime(), 42);
+        // A 32-bit write to the upper half keeps the lower half.
+        c.write(MTIME + 4, AccessSize::Word, 1);
+        assert_eq!(tb.now(), (1 << 32) | 42);
+        assert_eq!(c.read(MTIME, AccessSize::Double), (1 << 32) | 42);
     }
 }

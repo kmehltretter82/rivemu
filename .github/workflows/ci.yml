@@ -49,6 +49,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Guest Rust PID 1 in tests/linux_boot.rs (required, not skipped).
+          targets: riscv64gc-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - uses: actions/cache@v4
         with:
@@ -58,6 +61,152 @@ jobs:
       - run: cargo test --release -p rivemu-machine --test linux_boot -- --nocapture --test-threads=1
         env:
           RIVEMU_REQUIRE_LINUX_TEST: 1
+
+  linux-devices:
+    # Linux 6.12 + BusyBox built from pinned sources (about 25 min, then
+    # cached) and booted under OpenSBI v1.7 with NVMe, virtio-gpu/input,
+    # vsock, the SBI PMU, reboot and Snapshot v2 (tests/linux_devices.rs).
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64gc-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-linux-gnu flex bison bc cpio libssl-dev libelf-dev
+      - uses: actions/cache@v4
+        with:
+          path: images/linux-test
+          key: linux-test-${{ hashFiles('scripts/fetch-linux-test.sh') }}
+      - run: scripts/fetch-linux-test.sh
+      - uses: actions/cache@v4
+        with:
+          path: |
+            images/linux-src/Image
+            images/linux-src/busybox
+          key: linux-src-${{ hashFiles('scripts/build-linux-test-from-source.sh') }}
+      - run: scripts/build-linux-test-from-source.sh
+      - run: cargo test --release -p rivemu-machine --test linux_devices -- --nocapture --test-threads=1
+        env:
+          RIVEMU_REQUIRE_LINUX_DEVICES: 1
+
+  arch-test:
+    # riscv-arch-test (ACT4): the 15 privileged and all rv64i suites, Sail
+    # 0.16 as the reference (tests/arch-test/README.md). The ELFs are rebuilt
+    # only when the configuration or the build script changes.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - id: elfs
+        uses: actions/cache@v4
+        with:
+          path: arch-test-work/act-work/rivemu-rv64/elfs
+          key: arch-test-elfs-${{ hashFiles('tests/arch-test/rivemu-rv64/**', 'scripts/build-arch-test.sh') }}
+      - if: steps.elfs.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            arch-test-work/sail
+            arch-test-work/sail-riscv
+          key: arch-test-tools-${{ hashFiles('scripts/build-arch-test.sh') }}
+      - if: steps.elfs.outputs.cache-hit != 'true'
+        name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-20 lld-20 llvm-20 cmake libgmp-dev zlib1g-dev
+      - if: steps.elfs.outputs.cache-hit != 'true'
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - if: steps.elfs.outputs.cache-hit != 'true'
+        uses: astral-sh/setup-uv@v6
+      - if: steps.elfs.outputs.cache-hit != 'true'
+        run: scripts/build-arch-test.sh arch-test-work
+      - run: cargo build --release -p rivemu-cli
+      - run: scripts/run-arch-test.sh "$PWD/arch-test-work/act-work/rivemu-rv64/elfs" "$RUNNER_TEMP/act"
+      - name: Require every test to pass
+        run: |
+          cat "$RUNNER_TEMP/act/summary.txt" >> "$GITHUB_STEP_SUMMARY"
+          grep -qx 'FAIL: 0' "$RUNNER_TEMP/act/summary.txt"
+          grep -qx 'TIMEOUT: 0' "$RUNNER_TEMP/act/summary.txt"
+          test "$(sed -n 's/^total: //p' "$RUNNER_TEMP/act/summary.txt")" -ge 1251
+
+  p17-bench:
+    # P17 Linux-to-shell benchmark (tests/linux_perf.rs, Debian inputs) for the
+    # PR head and its base, alternating on the same runner so that both see
+    # the same machine. The P17 target (docs/PLAN.md) is defined on Apple
+    # Silicon, which macos-latest is. Informational: it reports medians and
+    # never fails on timing.
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: images/linux-test
+          key: linux-test-${{ runner.os }}-${{ hashFiles('scripts/fetch-linux-test.sh') }}
+      - run: scripts/fetch-linux-test.sh
+      - run: mkdir -p base/images && cp -r images/linux-test base/images/
+      - name: Boot profile (head, Debian inputs, to /init + poweroff)
+        run: P17_PROFILE_SUMMARY=p17-profile.txt scripts/p17-profile.sh
+      - run: scripts/p17-compare.sh 3 head=. base=base | tee p17-compare.txt
+      - name: P17 threshold check on Apple Silicon (tests/linux_perf.rs as defined, 2 warmups and 20 samples, median and p95)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        env:
+          RIVEMU_REQUIRE_LINUX_PERF: 1
+          RIVEMU_LINUX_PERF_ASSERT_THRESHOLDS: 1
+        run: |
+          set -o pipefail
+          cargo test -q --release -p rivemu-machine --test linux_perf -- --nocapture 2>&1 \
+            | tee p17-threshold.txt | grep -E '^P17_(SAMPLE|CALIB|RESULT|THRESHOLD)|panicked|test result'
+      - name: Summary
+        run: |
+          cat p17-profile.txt
+          sed -n '/^label smp n median/,$p' p17-compare.txt
+          echo "### P17 on ${{ matrix.os }} ($(uname -m))" >> "$GITHUB_STEP_SUMMARY"
+          sed -n '/^label smp n median/,/^$/p' p17-compare.txt >> "$GITHUB_STEP_SUMMARY"
+          if [ -f p17-threshold.txt ]; then
+            grep -E '^P17_(RESULT|THRESHOLD)|panicked|test result' p17-threshold.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+  p17-callgrind:
+    # Host instructions of the P17 Debian boot under callgrind with
+    # -icount shift=3: the same guest work on every run, so the total and
+    # the hottest lines compare across commits without runner noise.
+    # Informational.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: images/linux-test
+          key: linux-test-${{ runner.os }}-${{ hashFiles('scripts/fetch-linux-test.sh') }}
+      - run: scripts/fetch-linux-test.sh
+      - run: sudo apt-get install -y -q valgrind > /dev/null
+      - run: scripts/p17-callgrind.sh cg.out
 
   msrv:
     name: msrv (1.85)

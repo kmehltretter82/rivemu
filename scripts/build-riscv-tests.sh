@@ -39,6 +39,19 @@ for p in riscv64-elf- riscv64-unknown-elf- riscv64-linux-gnu-; do
     if command -v "${p}as" >/dev/null 2>&1; then GNU_PREFIX=$p; break; fi
 done
 
+# Rebuild everything when the toolchain, flags, or pinned revision change, so a
+# stale build directory (for example a restored CI cache) is never reused.
+fingerprint=$(
+    {
+        cat "$0" "$ROOT"/scripts/riscv-tests-include/*
+        echo "$REV"
+        "$CLANG" --version | head -n 1
+        if [ -n "$GNU_PREFIX" ]; then "$GNU_PREFIX"as --version | head -n 1; fi
+    } | cksum | cut -d' ' -f1
+)
+if [ "$(cat "$OUT/.fingerprint" 2>/dev/null)" != "$fingerprint" ]; then
+    rm -rf "$OUT"
+fi
 mkdir -p "$OUT"
 count=0
 
@@ -65,6 +78,13 @@ build_p() { # suite
 }
 
 # Virtual-memory ("v") environment: test + small C runtime that enables Sv39.
+#
+# `-msmall-data-limit=0` keeps vm.c's small globals (`freelist_head`,
+# `freelist_tail`) out of `.sbss`. LLD would otherwise place `.sbss` right after
+# the test's `.data` in the same 4 KiB page. The kernel updates those globals
+# after copying the page into user space, and the final `evict()` then sees a
+# "modified" page without PTE.D and fails with `Assertion failed: ... & 0x080`.
+# Sail and real hardware fail such binaries in the same way.
 build_v() { # suite
     local suite=$1
     for src in "$SRC/isa/$suite"/*.S; do
@@ -72,9 +92,11 @@ build_v() { # suite
         name=$(basename "$src" .S)
         local out="$OUT/$suite-v-$name"
         [ "$out" -nt "$src" ] && continue
-        "$CLANG" "${CFLAGS[@]}" -O2 -DENTROPY=0x$(printf '%s' "$name" | cksum | cut -c1-6) \
+        "$CLANG" "${CFLAGS[@]}" -O2 -msmall-data-limit=0 \
+            -DENTROPY=0x$(printf '%s' "$name" | cksum | cut -c1-6) \
             -ffreestanding -I"$ROOT/scripts/riscv-tests-include" \
-            -I"$SRC/env/v" -I"$SRC/isa/macros/scalar" -T"$SRC/env/v/link.ld" \
+            -I"$SRC/env/v" -I"$SRC/isa/macros/scalar" \
+            -T"$ROOT/scripts/riscv-tests-include/link-v.ld" \
             "$src" "$SRC/env/v/entry.S" "$SRC/env/v/vm.c" "$SRC/env/v/string.c" -o "$out"
         count=$((count + 1))
     done
@@ -87,4 +109,5 @@ for s in rv64ui rv64um rv64ua rv64uf rv64ud rv64uc; do
     build_v "$s"
 done
 
+echo "$fingerprint" > "$OUT/.fingerprint"
 echo "riscv-tests: built $count new binaries in $OUT ($(ls "$OUT" | wc -l | tr -d ' ') total)"

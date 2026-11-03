@@ -1,0 +1,38 @@
+# P17 benchmark on Apple Silicon: CI job "p17-bench (macos-latest)" (GitHub's macOS arm64
+# runner, an M1-class virtual machine with 3 vCPUs). docs/PLAN.md defines the P17 exit
+# criterion on Apple Silicon: single-hart Linux-to-shell boot < 8 s, -smp 4 < 10 s.
+# Fixture: tests/linux_perf.rs (Debian kernel + BusyBox initramfs from
+# scripts/fetch-linux-test.sh, Machine::new() to the first "~ # "), run by
+# scripts/p17-compare.sh 3 head=. base=base: head and base (0946319, the branch base)
+# alternate on the same runner, 3 rounds x 3 recorded boots = 9 samples per build and
+# hart count (seconds; median and nearest-rank p95).
+#
+# head      run           SMP1 median (p95)   SMP4 median (p95)   base SMP1 / SMP4 (same runner)
+# eda5267   41584708801   12.867 (15.337)     15.740 (20.197)     21.064 / 26.349
+# aedb252   41590487482    9.014 (10.185)     10.363 (10.935)     24.320 / 29.177
+# eabd681   41593624316    7.148 ( 7.391)      7.564 ( 8.126)     18.750 / 20.673
+# 7860b3a   41594273005    7.943 ( 8.732)      7.610 ( 9.346)     21.235 / 25.211
+# 27ddcbf   41608020067    8.963 (14.82 )      9.96  (12.70 )     24.49  / 28.00
+# c2ffc78   41619541764    7.899 (11.269)      8.860 (10.828)     21.424 / 22.416
+# 8247296   41623958358    8.794 (10.729)      9.313 (11.680)     23.952 / 27.209
+# 21acfa8   41636562098    6.224 ( 7.670)      7.026 (11.401)     25.361 / 29.304
+# 4bbacc7   41640005441    6.940 (10.527)      6.593 ( 9.376)     22.045 / 25.250
+# 23d425f   41642509507    5.923 ( 6.456)      7.145 (10.545)     23.834 / 28.110
+#   (21acfa8: superblocks, fetch fast TLB; see p17-superblocks.txt. Its SMP4 p95
+#   is the round-1 samples, 10.0 to 11.4 s, in a slow period of the runner that
+#   shows in base too.)
+#
+# Runner speed varies between jobs: base SMP1 ranged from 18.75 to 24.32 s. Within a job,
+# head/base was 0.38 (eabd681) and 0.37 (7860b3a) for SMP1, 0.37 and 0.30 for SMP4.
+# Both medians are under the targets for eabd681 and 7860b3a; for 7860b3a, on the slower
+# runner, the SMP1 p95 (8.73 s) is above 8 s.
+#
+# The same jobs print a boot profile (scripts/p17-profile.sh, Debian inputs to /init +
+# poweroff). eabd681 on macOS: 1,969,133,524 guest instructions (SMP1) in 7.56 s
+# (260.4 MIPS); minstret reads only 478,812,141 because the kernel's SBI PMU driver inhibits
+# it. Guest profile: RSA bignum (mpihelp_*) ~30%, ECC (vli_*) ~25%, SHA-256 9.7%,
+# SHA-3 7.3% (module signature and X.509 checks, jitter-entropy).
+#
+# Ubuntu runner (p17-bench (ubuntu-latest)), for comparison:
+# eda5267   20.400 / 22.405 vs base 36.438 / 45.012
+# a84d83b   17.345 / 18.508 vs base 36.763 / 45.427

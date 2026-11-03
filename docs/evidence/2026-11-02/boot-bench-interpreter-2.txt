@@ -1,0 +1,26 @@
+# scripts/bench-boot.sh 5 {1,4} opt=207c7dc new=this commit; same inputs as boot-bench-interpreter.txt
+# host: 4 vCPU, 6.18.44-fc-v230; Tue Nov  3 03:05:49 UTC 2026; load: 0.69 1.54 2.06
+run 1 opt smp=1 7.341803332s
+run 1 new smp=1 6.735115598s
+run 2 opt smp=1 7.200233795s
+run 2 new smp=1 6.639350421s
+run 3 opt smp=1 7.259859815s
+run 3 new smp=1 6.920482445s
+run 4 opt smp=1 6.849907837s
+run 4 new smp=1 6.692620363s
+run 5 opt smp=1 7.081197665s
+run 5 new smp=1 6.722754071s
+opt smp=1 n=5 median=7.20s min=6.85s max=7.34s
+new smp=1 n=5 median=6.72s min=6.64s max=6.92s
+run 1 opt smp=4 9.304591933s
+run 1 new smp=4 8.591222514s
+run 2 opt smp=4 10.951251257s
+run 2 new smp=4 8.919344820s
+run 3 opt smp=4 10.920382762s
+run 3 new smp=4 10.492998021s
+run 4 opt smp=4 11.628382000s
+run 4 new smp=4 10.667877605s
+run 5 opt smp=4 10.971350556s
+run 5 new smp=4 10.585637276s
+opt smp=4 n=5 median=10.95s min=9.30s max=11.63s
+new smp=4 n=5 median=10.49s min=8.59s max=10.67s
