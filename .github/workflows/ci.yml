@@ -198,6 +198,11 @@ jobs:
       - run: cargo build --release -p rivemu-cli
       - run: python3 scripts/interp-microbench.py target/release/rivemu-system-riscv64 3 base= fwd=RIVEMU_BLOCK_FWD=1
       - run: scripts/p17-ab.sh 3 base= fwd=RIVEMU_BLOCK_FWD=1
+      - name: Host profile of the P17 boot (callgrind, deterministic -icount)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y -q valgrind > /dev/null
+          scripts/p17-callgrind.sh cg.out
 
   msrv:
     name: msrv (1.85)

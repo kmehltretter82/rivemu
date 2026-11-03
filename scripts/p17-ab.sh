@@ -34,7 +34,7 @@ echo
 echo "label smp n median p95 (seconds, recorded samples only)"
 for spec in "$@"; do
     label="${spec%%=*}"
-    for smp in 1 4; do
+    for smp in ${RIVEMU_LINUX_PERF_SMPS//,/ }; do
         grep "^$label,.*smp=$smp,phase=recorded" "$samples" | sed 's/.*seconds=//' | sort -n \
             | awk -v l="$label" -v s="$smp" '
                 { v[NR] = $1 }

@@ -295,9 +295,10 @@ pub struct Machine {
     /// The harts.
     pub harts: Vec<Hart>,
     /// Guest PC profile: when `Some`, every scheduling slice adds the number
-    /// of instructions a hart ran to the entry for the PC it stopped at, so
-    /// the totals approximate where guest instructions are spent.
-    pub pc_samples: Option<std::collections::HashMap<u64, u64>>,
+    /// of instructions a hart ran and the host time it took (nanoseconds) to
+    /// the entry for the PC it stopped at, so the totals approximate where
+    /// guest instructions and host time are spent.
+    pub pc_samples: Option<std::collections::HashMap<u64, (u64, u64)>>,
     /// Instructions the harts attempted since construction (including ones
     /// that trapped). Unlike `minstret`, the guest cannot inhibit or write it.
     pub executed: u64,
@@ -766,6 +767,7 @@ impl Machine {
         for i in 0..self.harts.len() {
             let mut rem = QUANTUM;
             while rem > 0 {
+                let started = self.pc_samples.is_some().then(std::time::Instant::now);
                 let ran = self.harts[i].run(&self.bus, rem);
                 if self.harts[i].critical_error {
                     eprintln!(
@@ -783,8 +785,10 @@ impl Machine {
                 }
                 self.executed += ran;
                 if ran > 0 {
-                    if let Some(samples) = &mut self.pc_samples {
-                        *samples.entry(self.harts[i].pc).or_insert(0) += ran;
+                    if let (Some(samples), Some(started)) = (&mut self.pc_samples, started) {
+                        let e = samples.entry(self.harts[i].pc).or_insert((0, 0));
+                        e.0 += ran;
+                        e.1 += started.elapsed().as_nanos() as u64;
                     }
                 }
                 rem = rem.saturating_sub(ran);
