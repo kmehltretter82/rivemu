@@ -232,7 +232,9 @@ pub struct Options {
     pub strict_align: bool,
     /// Enforce `Svade` page-table rules (page fault when `pte.A == 0` or `pte.D == 0` on store).
     pub svade: bool,
-    /// Enforce strict PMP rules (deny S/U-mode access even when all PMP entries are `OFF`).
+    /// Spec PMP rule: with PMP implemented, an S/U-mode access that matches no
+    /// active entry fails. On by default; `-cpu rv64,pmp=off` allows such
+    /// accesses for bare-metal images that never program PMP.
     pub strict_pmp: bool,
     /// `-semihosting` / `-semihosting-config enable=on`: service RISC-V Semihosting calls.
     pub semihosting: bool,
@@ -280,7 +282,7 @@ impl Default for Options {
             screendump: None,
             strict_align: false,
             svade: false,
-            strict_pmp: false,
+            strict_pmp: true,
             semihosting: false,
             smdbltrp: false,
         }
@@ -918,8 +920,9 @@ usage: {PROG} [options]
 
 Machine:
   -machine|-M virt[,prop=value...]  select machine (only 'virt'; '-M help' lists)
-  -cpu rv64[,strict-align=on][,svade=on][,pmp=on]  select CPU model ('-cpu help' lists)
-  -strict                           enable strict alignment, Svade page faults, and PMP
+  -cpu rv64[,strict-align=on][,svade=on][,pmp=off]  select CPU model ('-cpu help' lists);
+                                    pmp=off lets S/U accesses through when no PMP entry matches
+  -strict                           enable strict alignment and Svade page faults (PMP is strict by default)
   -m [size=]N[KMG]                  guest RAM size (default 128M; unit M if omitted)
   -smp [cpus=]N                     number of harts
 
@@ -979,6 +982,21 @@ mod tests {
         let o = parse(&[]).unwrap();
         assert_eq!(o, Options::default());
         assert_eq!(o.memory, 128 << 20);
+    }
+
+    /// PMP follows the spec by default (an S/U access matching no entry
+    /// fails); `-cpu rv64,pmp=off` opts out for images that never program PMP.
+    #[test]
+    fn pmp_is_strict_by_default_and_pmp_off_opts_out() {
+        assert!(parse(&[]).unwrap().strict_pmp);
+        assert!(parse(&["-cpu", "rv64"]).unwrap().strict_pmp);
+        assert!(!parse(&["-cpu", "rv64,pmp=off"]).unwrap().strict_pmp);
+        assert!(
+            parse(&["-cpu", "rv64,pmp=off", "-strict"])
+                .unwrap()
+                .strict_pmp
+        );
+        assert!(rivemu_machine::MachineConfig::default().strict_pmp);
     }
 
     #[test]

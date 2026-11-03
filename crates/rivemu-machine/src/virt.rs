@@ -167,7 +167,9 @@ pub struct MachineConfig {
     pub strict_align: bool,
     /// Enforce `Svade` page-table rules (page fault when `pte.A == 0` or `pte.D == 0` on store).
     pub svade: bool,
-    /// Enforce strict PMP rules (deny S/U-mode access even when all PMP entries are `OFF`).
+    /// Spec PMP rule (default): with PMP implemented, an S/U-mode access that
+    /// matches no active entry fails. `false` allows such accesses, for
+    /// bare-metal images that never program PMP (`-cpu rv64,pmp=off`).
     pub strict_pmp: bool,
     /// Service RISC-V Semihosting calls (`-semihosting`); off by default, as in QEMU.
     pub semihosting: bool,
@@ -192,7 +194,7 @@ impl Default for MachineConfig {
             icount: None,
             strict_align: false,
             svade: false,
-            strict_pmp: false,
+            strict_pmp: true,
             semihosting: false,
             smdbltrp: false,
         }

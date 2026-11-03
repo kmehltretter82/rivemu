@@ -347,7 +347,9 @@ pub struct Hart {
     pub strict_align: bool,
     /// Enforce `Svade` page-table rules (page fault when `pte.A == 0` or `pte.D == 0` on store).
     pub svade: bool,
-    /// Enforce strict PMP rules (deny S/U-mode access even when all PMP entries are `OFF`).
+    /// Spec PMP rule: an S/U-mode access that matches no active entry fails.
+    /// `MachineConfig` turns this on by default; a bare `Hart::new` leaves it
+    /// off so directed CPU tests can run S/U code without programming PMP.
     pub strict_pmp: bool,
     /// `Zicfilp` expected landing pad state (`true` = `LP_EXPECTED`).
     pub elp: bool,
