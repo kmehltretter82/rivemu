@@ -70,8 +70,27 @@ impl Ram {
         })
     }
 
-    #[inline]
+    #[inline(always)]
     fn mark_dirty_range(&self, offset: u64, len: u64) {
+        // Fast path: an access within one page whose bit is already set.
+        // Bits are only cleared while the machine is stopped (reset,
+        // snapshot restore), so a set bit stays set while guests and devices
+        // write, and testing first skips the locked read-modify-write.
+        if len != 0 && (offset & 0xfff) + len <= 0x1000 {
+            let p = (offset >> 12) as usize;
+            if let Some(w) = self.dirty.get(p >> 6) {
+                let bit = 1u64 << (p & 63);
+                if w.load(Ordering::Relaxed) & bit == 0 {
+                    w.fetch_or(bit, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
+        self.mark_dirty_pages(offset, len);
+    }
+
+    #[cold]
+    fn mark_dirty_pages(&self, offset: u64, len: u64) {
         if len == 0 {
             return;
         }
@@ -79,10 +98,6 @@ impl Ram {
         let last_page = (offset.saturating_add(len - 1) >> 12) as usize;
         for p in first_page..=last_page {
             if let Some(w) = self.dirty.get(p >> 6) {
-                // Bits are only cleared while the machine is stopped (reset,
-                // snapshot restore), so a set bit stays set while guests and
-                // devices write. Testing first skips the locked
-                // read-modify-write on every store to an already-dirty page.
                 let bit = 1u64 << (p & 63);
                 if w.load(Ordering::Relaxed) & bit == 0 {
                     w.fetch_or(bit, Ordering::Relaxed);
@@ -207,7 +222,7 @@ impl Ram {
     }
 
     /// Little-endian read of `size` bytes at `offset`; `None` if out of bounds.
-    #[inline]
+    #[inline(always)]
     pub fn read(&self, offset: u64, size: AccessSize) -> Option<u64> {
         if !self.in_bounds(offset, size.bytes()) {
             return None;
@@ -218,7 +233,7 @@ impl Ram {
 
     /// Little-endian write of the low `size` bytes of `value` at `offset`;
     /// `None` if out of bounds.
-    #[inline]
+    #[inline(always)]
     pub fn write(&self, offset: u64, size: AccessSize, value: u64) -> Option<()> {
         if !self.in_bounds(offset, size.bytes()) {
             return None;
@@ -574,7 +589,7 @@ impl Ram {
 
 /// # Safety
 /// `p` must be valid for reads of `size` bytes.
-#[inline]
+#[inline(always)]
 unsafe fn load(p: *mut u8, size: AccessSize) -> u64 {
     // SAFETY (all arms): caller guarantees validity; wider atomics are only
     // used when `p` is suitably aligned.
@@ -604,7 +619,7 @@ unsafe fn load(p: *mut u8, size: AccessSize) -> u64 {
 
 /// # Safety
 /// `p` must be valid for writes of `size` bytes.
-#[inline]
+#[inline(always)]
 unsafe fn store(p: *mut u8, size: AccessSize, value: u64) {
     // SAFETY (all arms): caller guarantees validity; wider atomics are only
     // used when `p` is suitably aligned.

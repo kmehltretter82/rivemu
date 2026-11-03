@@ -166,9 +166,12 @@ jobs:
       - run: scripts/fetch-linux-test.sh
       - run: mkdir -p base/images && cp -r images/linux-test base/images/
       - name: Boot profile (head, Debian inputs, to /init + poweroff)
-        run: scripts/p17-profile.sh
+        run: P17_PROFILE_SUMMARY=p17-profile.txt scripts/p17-profile.sh
       - run: scripts/p17-compare.sh 3 head=. base=base | tee p17-compare.txt
-      - run: |
+      - name: Summary
+        run: |
+          cat p17-profile.txt
+          tail -6 p17-compare.txt
           echo "### P17 on ${{ matrix.os }} ($(uname -m))" >> "$GITHUB_STEP_SUMMARY"
           tail -6 p17-compare.txt >> "$GITHUB_STEP_SUMMARY"
 

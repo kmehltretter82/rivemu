@@ -3763,3 +3763,39 @@ fn block_loads_and_stores_match_single_stepping() {
     assert_eq!(block.x[9] >> 32, 0, "lwu zero-extends");
     assert_eq!(block.x[6] & 0xffff_ffff, block.x[9]);
 }
+
+/// More distinct blocks than the block arena holds: the arena is cleared
+/// once it is full, and every block must still run (twice, so the second
+/// pass also runs blocks decoded after the clear).
+#[test]
+fn block_arena_overflow_keeps_executing_correctly() {
+    const CODE: u64 = 0x8000_0000;
+    const BLOCKS: u64 = 300_000; // 2 instructions each: more than 2^19 slots
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(4 * MIB).unwrap()))
+        .unwrap();
+    // Block i adds its own immediate, so a block that ran another block's
+    // stale decode would change the sum.
+    let imm = |i: u64| i % 1000 + 1;
+    for i in 0..BLOCKS {
+        let at = CODE + 8 * i;
+        let addi = (imm(i) << 20) | 0x0005_0513; // addi a0, a0, imm
+        bus.write(at, AccessSize::Word, addi).unwrap();
+        bus.write(at + 4, AccessSize::Word, 0x0040_006f).unwrap(); // j .+4
+    }
+    let sum: u64 = (0..BLOCKS).map(imm).sum();
+    bus.write(CODE + 8 * BLOCKS, AccessSize::Word, 0x1050_0073)
+        .unwrap(); // wfi
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    for pass in 1..=2u64 {
+        h.reset(CODE);
+        h.x[10] = 0;
+        let mut attempted = 0;
+        while !h.wfi && attempted < 4 * BLOCKS {
+            attempted += h.run(&bus, 10_000);
+        }
+        assert!(h.wfi, "pass {pass}: did not reach wfi");
+        assert_eq!(h.x[10], sum, "pass {pass}");
+        assert_eq!(h.pc, CODE + 8 * BLOCKS + 4, "pass {pass}");
+    }
+}

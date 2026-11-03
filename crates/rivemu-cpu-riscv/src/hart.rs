@@ -102,7 +102,14 @@ impl HartIrqs {
 }
 
 const ICACHE_SIZE: usize = 8192;
-const BBCACHE_SIZE: usize = 4096;
+/// Slots in the block index. A Linux boot runs about 64 K distinct blocks;
+/// the old 4096-entry cache refilled each one about 30 times.
+const BBCACHE_SIZE: usize = 32768;
+/// Decoded instructions the block arena holds before it is cleared. Each
+/// block takes its length in slots; slots of replaced blocks are reclaimed
+/// only when the arena is cleared. The memory is reserved, not touched, up
+/// front.
+const BB_ARENA_SIZE: usize = 1 << 19;
 
 /// Direct-mapped index into a decode cache of `size` entries: the physical
 /// address above the 2-byte instruction alignment, folded with the bits above
@@ -153,24 +160,17 @@ const fn bb_op_kind(op: Op) -> BbOpKind {
     }
 }
 
-/// Decoded basic-block cache entry, indexed by `decode_cache_index(pa, BBCACHE_SIZE)`.
-#[derive(Clone, Copy, Debug)]
+/// Decoded basic-block index entry, indexed by
+/// `decode_cache_index(pa, BBCACHE_SIZE)`. The instructions are
+/// `bb_arena[start..start + len]`.
+#[derive(Clone, Copy, Debug, Default)]
 struct BbCacheEntry {
     /// `(pa << 16) | icache_gen` (0 means invalid).
     tag: u64,
-    /// Number of valid decoded instructions in `insns` (`0..=BB_MAX_INSNS`).
+    /// First instruction in `bb_arena`.
+    start: u32,
+    /// Number of decoded instructions (`0..=BB_MAX_INSNS`).
     len: u8,
-    insns: [Insn; BB_MAX_INSNS],
-}
-
-impl Default for BbCacheEntry {
-    fn default() -> Self {
-        Self {
-            tag: 0,
-            len: 0,
-            insns: [Insn::ILLEGAL; BB_MAX_INSNS],
-        }
-    }
 }
 
 /// Macro-op fusion descriptor cached alongside the first instruction in [`IcacheEntry`].
@@ -291,6 +291,7 @@ pub struct Hart {
     pub(crate) pmp_cache: PmpCache,
     icache: Box<[IcacheEntry; ICACHE_SIZE]>,
     bbcache: Box<[BbCacheEntry; BBCACHE_SIZE]>,
+    bb_arena: Vec<Insn>,
     icache_gen: u16,
     /// Cached instruction-fetch page: `(pc >> 12) + 1` (0 = invalid).
     fetch_vpn: u64,
@@ -397,12 +398,13 @@ impl Hart {
             tlb: Tlb::default(),
             pmp_cache: PmpCache::default(),
             icache: Box::new([IcacheEntry::default(); ICACHE_SIZE]),
-            // Built on the heap: the cache is about 2 MiB, more than a test
-            // thread's stack.
+            // Built on the heap: the index is 512 KiB, more than fits on a
+            // test thread's stack.
             bbcache: vec![BbCacheEntry::default(); BBCACHE_SIZE]
                 .into_boxed_slice()
                 .try_into()
                 .expect("BBCACHE_SIZE entries"),
+            bb_arena: Vec::with_capacity(BB_ARENA_SIZE),
             icache_gen: 1,
             fetch_vpn: 0,
             fetch_pa_page: 0,
@@ -566,6 +568,7 @@ impl Hart {
         if self.icache_gen == 0 {
             self.icache.fill(IcacheEntry::default());
             self.bbcache.fill(BbCacheEntry::default());
+            self.bb_arena.clear();
             self.icache_gen = 1;
         }
     }
@@ -607,22 +610,19 @@ impl Hart {
             return 0;
         }
         let has_bp = !self.breakpoints.is_empty();
+        // Whether blocks and fused pairs may run. Its inputs change only
+        // through instructions that `step` executes (CSR writes, xRET) or
+        // through a change of privilege mode (traps), so it is recomputed
+        // after every `step` and whenever a block returns in another mode.
+        let mut fast_ok = !has_bp && self.blocks_allowed();
+        let mut fast_prv = self.prv;
         let mut n = 0;
         while n < budget {
             if has_bp && self.breakpoints.contains(&self.pc) {
                 self.hit_breakpoint = true;
                 break;
             }
-            if n + 1 < budget
-                && !has_bp
-                && !self.elp
-                && !self.csr.landing_pad_enabled(self.prv)
-                && !self.pmp_subpage
-                && self.log_flags.is_empty()
-                && self.csr.active_hpm_mask == 0
-                && self.csr.active_trigger_mask == 0
-                && self.watchpoints.is_empty()
-            {
+            if fast_ok && n + 1 < budget {
                 // Blocks first: they run up to BB_MAX_INSNS instructions per
                 // dispatch, and a fusible pair inside a block just runs as two
                 // ordinary instructions with the same result. Fused pairs
@@ -632,6 +632,10 @@ impl Hart {
                     n += bb_steps;
                     if self.wfi || self.yield_slice {
                         break;
+                    }
+                    if self.prv != fast_prv {
+                        fast_prv = self.prv;
+                        fast_ok = self.blocks_allowed();
                     }
                     continue;
                 }
@@ -648,9 +652,24 @@ impl Hart {
             if self.wfi || self.yield_slice || self.hit_breakpoint {
                 break;
             }
+            fast_ok = !has_bp && self.blocks_allowed();
+            fast_prv = self.prv;
         }
         self.reservation = None;
         n
+    }
+
+    /// Whether `run` may use blocks and fused pairs: they skip the landing
+    /// pad, sub-page PMP, logging, HPM event and trigger checks.
+    #[inline]
+    fn blocks_allowed(&self) -> bool {
+        !self.elp
+            && !self.csr.landing_pad_enabled(self.prv)
+            && !self.pmp_subpage
+            && self.log_flags.is_empty()
+            && self.csr.active_hpm_mask == 0
+            && self.csr.active_trigger_mask == 0
+            && self.watchpoints.is_empty()
     }
 
     /// Advances `minstret` and `mcycle` by `delta` retired instructions,
@@ -687,7 +706,14 @@ impl Hart {
         }
         let bb_idx = decode_cache_index(pa, BBCACHE_SIZE);
         let tag = (pa << 16) | u64::from(self.icache_gen);
-        let avail = if self.bbcache[bb_idx].tag == tag {
+        let old_tag = self.bbcache[bb_idx].tag;
+        let avail = if old_tag == tag {
+            usize::from(self.bbcache[bb_idx].len)
+        } else if old_tag != 0 && old_tag >> 16 == pa && self.bb_matches_memory(bus, pc, pa, bb_idx)
+        {
+            // Same block, decoded before the last fence.i, and memory still
+            // holds the same instructions: keep the decode.
+            self.bbcache[bb_idx].tag = tag;
             usize::from(self.bbcache[bb_idx].len)
         } else {
             self.populate_bbcache_same_page(bus, pc, pa, bb_idx, tag)
@@ -696,6 +722,7 @@ impl Hart {
             return 0;
         }
         let limit = avail.min(max_insns as usize);
+        let start = self.bbcache[bb_idx].start as usize;
         // Everything the inline load/store path depends on besides the fast
         // TLB itself is constant within a block: the privilege mode,
         // mstatus, senvcfg and the pointer-masking CSRs change only through
@@ -704,25 +731,24 @@ impl Hart {
         let mem_ctx = (!self.strict_align
             && (self.csr.menvcfg | self.csr.senvcfg | self.csr.mseccfg) & envcfg::PMM_MASK == 0)
             .then(|| self.fast_tlb_ctx());
-        // Read each instruction from the cache entry in place instead of
-        // copying the whole entry (about 176 bytes) per block. Nothing a
-        // block can contain invalidates the cache: fence.i, CSR accesses and
-        // the other flushing instructions end a block (`BbOpKind::Abort`).
+        // Read each instruction from the arena in place. Nothing a block can
+        // contain invalidates the cache: fence.i, CSR accesses and the other
+        // flushing instructions end a block (`BbOpKind::Abort`).
         for i in 0..limit {
-            let insn = self.bbcache[bb_idx].insns[i];
+            let insn = self.bb_arena[start + i];
             // Integer ALU, Lui/Auipc, Jal/Jalr and branches cannot trap,
             // touch memory or set check_irq/wfi/yield_slice, so they skip the
             // `execute` call and the per-instruction flag check. Neither can
-            // a RAM load or store that hits the fast TLB. A pending
-            // landing-pad check (`elp`) still goes through `execute`.
-            if !self.elp {
-                if self.exec_simple(&insn) {
+            // a RAM load or store that hits the fast TLB. Blocks run only
+            // with landing pads disabled and `elp` clear (see `run`), and
+            // nothing in a block sets `elp`.
+            debug_assert!(!self.elp);
+            if self.exec_simple(&insn) {
+                continue;
+            }
+            if let Some(ctx) = mem_ctx {
+                if self.exec_mem_fast(bus, &insn, ctx) {
                     continue;
-                }
-                if let Some(ctx) = mem_ctx {
-                    if self.exec_mem_fast(bus, &insn, ctx) {
-                        continue;
-                    }
                 }
             }
             match self.execute(bus, &insn) {
@@ -837,48 +863,103 @@ impl Hart {
     /// no strict alignment, and no triggers, watchpoints or logging.
     #[inline(always)]
     fn exec_mem_fast(&mut self, bus: &AddressSpace, insn: &Insn, ctx: u64) -> bool {
-        let (size, store) = match insn.op {
-            Op::Ld => (AccessSize::Double, false),
-            Op::Sd => (AccessSize::Double, true),
-            Op::Lw | Op::Lwu => (AccessSize::Word, false),
-            Op::Sw => (AccessSize::Word, true),
-            Op::Lbu | Op::Lb => (AccessSize::Byte, false),
-            Op::Sb => (AccessSize::Byte, true),
-            Op::Lh | Op::Lhu => (AccessSize::Half, false),
-            Op::Sh => (AccessSize::Half, true),
+        // One arm per opcode, so that each inlined access has a constant size.
+        let loaded = match insn.op {
+            Op::Ld => self.fast_load(bus, insn, ctx, AccessSize::Double),
+            Op::Lw => self
+                .fast_load(bus, insn, ctx, AccessSize::Word)
+                .map(|v| v as i32 as u64),
+            Op::Lwu => self.fast_load(bus, insn, ctx, AccessSize::Word),
+            Op::Lbu => self.fast_load(bus, insn, ctx, AccessSize::Byte),
+            Op::Lb => self
+                .fast_load(bus, insn, ctx, AccessSize::Byte)
+                .map(|v| v as i8 as u64),
+            Op::Lhu => self.fast_load(bus, insn, ctx, AccessSize::Half),
+            Op::Lh => self
+                .fast_load(bus, insn, ctx, AccessSize::Half)
+                .map(|v| v as i16 as u64),
+            Op::Sd => return self.fast_store(bus, insn, ctx, AccessSize::Double),
+            Op::Sw => return self.fast_store(bus, insn, ctx, AccessSize::Word),
+            Op::Sb => return self.fast_store(bus, insn, ctx, AccessSize::Byte),
+            Op::Sh => return self.fast_store(bus, insn, ctx, AccessSize::Half),
             _ => return false,
         };
+        let Some(v) = loaded else {
+            return false;
+        };
+        self.set_x(insn.rd, v);
+        self.pc = self.pc.wrapping_add(u64::from(insn.len));
+        true
+    }
+
+    /// The load half of [`Self::exec_mem_fast`]: the zero-extended value, or
+    /// `None` for anything but a single-page fast-TLB hit on RAM.
+    #[inline(always)]
+    fn fast_load(
+        &self,
+        bus: &AddressSpace,
+        insn: &Insn,
+        ctx: u64,
+        size: AccessSize,
+    ) -> Option<u64> {
+        let va = self.x[insn.rs1 as usize].wrapping_add(insn.imm as u64);
+        if (va & 0xfff) + size.bytes() > 0x1000 {
+            return None;
+        }
+        bus.read_fast_ram(self.fast_load_ram_off_ctx(va, ctx)?, size)
+    }
+
+    /// The store half of [`Self::exec_mem_fast`].
+    #[inline(always)]
+    fn fast_store(&mut self, bus: &AddressSpace, insn: &Insn, ctx: u64, size: AccessSize) -> bool {
         let va = self.x[insn.rs1 as usize].wrapping_add(insn.imm as u64);
         if (va & 0xfff) + size.bytes() > 0x1000 {
             return false;
         }
-        if store {
-            let Some((pa, off)) = self.fast_store_ram_off_ctx(va, ctx) else {
-                return false;
-            };
-            self.invalidate_reservation(pa);
-            if bus
-                .write_fast_ram(pa, off, size, self.x[insn.rs2 as usize])
-                .is_none()
-            {
-                return false;
-            }
-        } else {
-            let Some(v) = self
-                .fast_load_ram_off_ctx(va, ctx)
-                .and_then(|off| bus.read_fast_ram(off, size))
-            else {
-                return false;
-            };
-            let v = match insn.op {
-                Op::Lb => v as i8 as u64,
-                Op::Lh => v as i16 as u64,
-                Op::Lw => v as i32 as u64,
-                _ => v,
-            };
-            self.set_x(insn.rd, v);
+        let Some((pa, off)) = self.fast_store_ram_off_ctx(va, ctx) else {
+            return false;
+        };
+        self.invalidate_reservation(pa);
+        if bus
+            .write_fast_ram(pa, off, size, self.x[insn.rs2 as usize])
+            .is_none()
+        {
+            return false;
         }
         self.pc = self.pc.wrapping_add(u64::from(insn.len));
+        true
+    }
+
+    /// Whether the block cached at `bb_idx` for `pa` still describes memory:
+    /// every instruction's encoding is unchanged and its fetch still passes
+    /// PMP, as when [`Self::populate_bbcache_same_page`] decoded it. A
+    /// fence.i (Linux runs thousands while booting, for example whenever it
+    /// maps an executable page) invalidates every decoded block, and this
+    /// check is much cheaper than decoding the block again.
+    #[cold]
+    fn bb_matches_memory(&self, bus: &AddressSpace, pc: u64, pa: u64, bb_idx: usize) -> bool {
+        let entry = &self.bbcache[bb_idx];
+        let start = entry.start as usize;
+        let mut off = 0u64;
+        for insn in &self.bb_arena[start..start + usize::from(entry.len)] {
+            let (cur_pc, cur_pa) = (pc.wrapping_add(off), pa + off);
+            let size = if insn.len == 2 {
+                AccessSize::Half
+            } else {
+                AccessSize::Word
+            };
+            let fetch_ok = self
+                .check_pmp_access(cur_pc, cur_pa, 2, Access::Fetch)
+                .is_ok()
+                && (insn.len == 2
+                    || self
+                        .check_pmp_access(cur_pc + 2, cur_pa + 2, 2, Access::Fetch)
+                        .is_ok());
+            if !fetch_ok || bus.read(cur_pa, size).ok() != Some(u64::from(insn.raw)) {
+                return false;
+            }
+            off += u64::from(insn.len);
+        }
         true
     }
 
@@ -891,36 +972,42 @@ impl Hart {
         bb_idx: usize,
         tag: u64,
     ) -> usize {
-        let mut insns = [Insn::ILLEGAL; BB_MAX_INSNS];
-        let mut len = 0usize;
+        // Decode straight into the arena. When it is full, clear it with
+        // every index entry that points into it.
+        if self.bb_arena.len() + BB_MAX_INSNS > BB_ARENA_SIZE {
+            self.bb_arena.clear();
+            self.bbcache.fill(BbCacheEntry::default());
+        }
+        let start = self.bb_arena.len();
         let mut cur_pc = pc;
         let mut cur_pa = pa;
-        while len < BB_MAX_INSNS && cur_pc >> 12 == pc >> 12 && (cur_pc & 0xfff) <= 0xffc {
+        while self.bb_arena.len() - start < BB_MAX_INSNS
+            && cur_pc >> 12 == pc >> 12
+            && (cur_pc & 0xfff) <= 0xffc
+        {
             let Ok(insn) = self.fetch_decode_same_page(bus, cur_pc, cur_pa) else {
                 break;
             };
             match bb_op_kind(insn.op) {
                 BbOpKind::Abort => break,
                 BbOpKind::Term => {
-                    insns[len] = insn;
-                    len += 1;
+                    self.bb_arena.push(insn);
                     break;
                 }
                 BbOpKind::Seq => {
-                    insns[len] = insn;
-                    len += 1;
+                    self.bb_arena.push(insn);
                     let step_len = u64::from(insn.len);
                     cur_pc = cur_pc.wrapping_add(step_len);
                     cur_pa = cur_pa.wrapping_add(step_len);
                 }
             }
         }
-        let entry = BbCacheEntry {
+        let len = self.bb_arena.len() - start;
+        self.bbcache[bb_idx] = BbCacheEntry {
             tag,
+            start: start as u32,
             len: len as u8,
-            insns,
         };
-        self.bbcache[bb_idx] = entry;
         len
     }
 
@@ -3345,3 +3432,68 @@ const SM4_SBOX: [u8; 256] = [
     0x89, 0x69, 0x97, 0x4a, 0x0c, 0x96, 0x77, 0x7e, 0x65, 0xb9, 0xf1, 0x09, 0xc5, 0x6e, 0xc6, 0x84,
     0x18, 0xf0, 0x7d, 0xec, 0x3a, 0xdc, 0x4d, 0x20, 0x79, 0xee, 0x5f, 0x3e, 0xd7, 0xcb, 0x39, 0x48,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rivemu_core::FrozenTimebase;
+    use rivemu_core::size::MIB;
+    use rivemu_mem::Ram;
+
+    /// Runs `addi a0, a0, imm; j .+4` blocks from `at` until the `wfi` after
+    /// them and returns `a0`.
+    fn run_blocks(h: &mut Hart, bus: &AddressSpace, at: u64) -> u64 {
+        h.wfi = false;
+        h.pc = at;
+        h.x[10] = 0;
+        let mut attempted = 0;
+        while !h.wfi && attempted < 1000 {
+            attempted += h.run(bus, 100);
+        }
+        assert!(h.wfi);
+        h.x[10]
+    }
+
+    /// Clearing the full block arena must also drop every index entry that
+    /// points into it; otherwise a block decoded before the clear runs the
+    /// instructions of whatever block reused its arena slots.
+    #[test]
+    fn clearing_the_block_arena_drops_index_entries() {
+        // A and B use different index slots, so only a stale A entry can
+        // point at B's instructions.
+        const A: u64 = 0x8000_0000;
+        const B: u64 = 0x8000_0100;
+        let mut bus = AddressSpace::new();
+        bus.add_ram("ram", A, Arc::new(Ram::new(MIB).unwrap()))
+            .unwrap();
+        for (base, imm) in [(A, 1u64), (B, 100)] {
+            for i in 0..4 {
+                let at = base + 8 * i;
+                bus.write(at, AccessSize::Word, (imm << 20) | 0x0005_0513)
+                    .unwrap(); // addi a0, a0, imm
+                bus.write(at + 4, AccessSize::Word, 0x0040_006f).unwrap(); // j .+4
+            }
+            bus.write(base + 32, AccessSize::Word, 0x1050_0073).unwrap(); // wfi
+        }
+        let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+        h.reset(A);
+        assert_eq!(run_blocks(&mut h, &bus, A), 4);
+        for i in 0..4 {
+            assert_ne!(
+                decode_cache_index(A + 8 * i, BBCACHE_SIZE),
+                decode_cache_index(B + 8 * i, BBCACHE_SIZE)
+            );
+        }
+        // Fill the arena up to the point where B's first block clears it, so
+        // B's blocks land in the slots that A's blocks used.
+        let filler = BB_ARENA_SIZE - BB_MAX_INSNS + 1 - h.bb_arena.len();
+        h.bb_arena
+            .extend(std::iter::repeat_n(Insn::ILLEGAL, filler));
+        assert_eq!(run_blocks(&mut h, &bus, B), 400);
+        assert!(
+            h.bb_arena.len() < BB_ARENA_SIZE / 2,
+            "the arena was cleared"
+        );
+        assert_eq!(run_blocks(&mut h, &bus, A), 4);
+    }
+}

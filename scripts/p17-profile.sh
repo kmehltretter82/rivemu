@@ -11,6 +11,8 @@
 # Both boots use "nokaslr" so that the symbols match.
 #
 # Usage: scripts/p17-profile.sh [smp ...]   (default: 1 4)
+# With P17_PROFILE_SUMMARY=<file>, everything but the console logs is also
+# appended to <file>.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -28,23 +30,24 @@ boot() {
     "$BIN" -M virt -smp "$smp" -m 256M -nographic \
         -bios "$IMG/fw_dynamic.bin" -kernel "$IMG/Image" -initrd "$IMG/rootfs.cpio" "$@"
 }
+SUMMARY="${P17_PROFILE_SUMMARY:-/dev/null}"
+# say: print a summary line (stdin) to the log and the summary file.
+say() { tee -a "$SUMMARY"; }
 [[ $# -gt 0 ]] || set -- 1 4
 for smp in "$@"; do
-    echo "== smp=$smp"
-    start=$(date +%s)
+    echo "== smp=$smp" | say
     # bash's `time` reports wall, user and sys for the emulator process.
     { time RIVEMU_STATS=1 RIVEMU_PC_PROFILE="$pcs.$smp" boot "$smp" -append "$APPEND" \
-        > "$log" 2>&1; } 2>&1
-    echo "exit after $(( $(date +%s) - start ))s"
-    grep -a "instructions in" "$log" || true
+        > "$log" 2>&1; } 2>&1 | grep -v '^$' | say
+    grep -a "instructions in" "$log" | say || true
     grep -aq RIVEMU_SMOKE_OK "$log" || { tail -20 "$log"; exit 1; }
-    echo "largest gaps between kernel log lines (seconds before the line):"
+    echo "largest gaps between kernel log lines (seconds before the line):" | say
     awk -F'[][]' '/^\[ *[0-9]+\.[0-9]+\]/ {
             t = $2 + 0
             if (seen) printf "%8.3f %s\n", t - prev, $0
             prev = t; seen = 1
-        }' "$log" | sort -rn | head -15
-    echo "last kernel timestamp: $(grep -ao '^\[ *[0-9]*\.[0-9]*\]' "$log" | tail -1)"
+        }' "$log" | sort -rn | head -15 | say
+    echo "last kernel timestamp: $(grep -ao '^\[ *[0-9]*\.[0-9]*\]' "$log" | tail -1)" | say
     echo "::group::console smp=$smp"
     cat "$log"
     echo "::endgroup::"
@@ -52,7 +55,7 @@ done
 if [[ "${PROFILE:-1}" == 1 && -f "$pcs.1" ]]; then
     boot 1 -append "$APPEND rivemu.kallsyms" | tr -d '\r' \
         | grep -aE '^[0-9a-f]{16} [tTwW] ' > "$syms" || true
-    echo "== guest functions by instructions executed (smp=1, $(wc -l < "$syms") symbols)"
-    python3 "$ROOT/scripts/pc-profile.py" "$pcs.1" "$syms" 40
+    echo "== guest functions by instructions executed (smp=1, $(wc -l < "$syms") symbols)" | say
+    python3 "$ROOT/scripts/pc-profile.py" "$pcs.1" "$syms" 40 | say
 fi
 rm -f "$pcs".*
