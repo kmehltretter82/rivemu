@@ -16,8 +16,9 @@ overlap. Findings, causes and fixes are in
 | Area | Evidence | Result |
 |---|---|---|
 | `riscv-arch-test` privileged subset | `tests/arch-test/README.md`; `evidence/2026-11-02/arch-test/` | **418/418** in 15 privileged suites (Sail 0.16 reference). Before the three fixes it found (`mcycle`, `mtime`→`time`, CBO PMA), 411/418. |
+| `riscv-arch-test` unprivileged suites | `evidence/2026-11-02/arch-test/summary-rv64i.txt` | **833/833** in the 43 `rv64i` suites (I, M, A, F, D, Zfh, Zfa, C, B, scalar crypto, Zicond, Zimop, Zicbo*, counters and others). |
 | Official `riscv-tests`, fresh build | `RIVEMU_REQUIRE_RISCV_TESTS=1 cargo test --release -p rivemu-cpu-riscv` | 244/244 from a from-scratch build. Before `b8045b9`, a fresh build failed 22 `-v` tests, and CI passed only from a cache. |
-| Linux device E2E: reboot, NVMe, virtio-gpu/input, vsock, SBI PMU/perf, Snapshot v2 | `RIVEMU_LINUX_DEVICES_TEST=1 cargo test --release -p rivemu-machine --test linux_devices`; `evidence/2026-11-02/linux-devices-e2e.log` | 6/6 with Linux 6.12 + OpenSBI v1.7. Snapshot v2 does not contain disk contents (the test shares the backend). |
+| Linux device E2E: reboot, NVMe, virtio-gpu/input, vsock, SBI PMU/perf, Snapshot v2 | `RIVEMU_LINUX_DEVICES_TEST=1 cargo test --release -p rivemu-machine --test linux_devices`; `evidence/2026-11-02/linux-devices-e2e.log` | 6/6 with Linux 6.12 + OpenSBI v1.7, locally and in CI (job `linux-devices`, required mode). Snapshot v2 does not contain disk contents (the test shares the backend). |
 | P27–P32 per-suite differential campaigns | `rivemu-lockstep/docs/evidence/2026-11-02-campaigns/summary.txt` | 18 suites × {QEMU 11.1.3 `--step-check`, Sail 0.16}: 36/36 PASS. |
 | Expanded `Suite::Vector` (random LMUL/SEW/mask, segments, indexed, reserved encodings) | `rivemu-lockstep` `3c57b83` | 256 blocks pass against Sail and QEMU after three RVV fixes. |
 | Boot lockstep P16/P26 (OpenSBI v1.7 + Linux 6.12 vs QEMU 11.1.3) | `rivemu-lockstep/docs/evidence/2026-11-02-boot-lockstep/run10-pass-3M-steps.log` | **3,000,000 instructions, 0 divergences** with `--check-csrs`. The 9 earlier runs each stopped at a harness configuration difference or a rivemu bug (`mstateen` reset); all are fixed. |
@@ -162,10 +163,9 @@ Ranked; details in [`REVIEW-20261102.md`](REVIEW-20261102.md) §6.
 2. Extend boot lockstep past the first 3M instructions (checkpointed
    windows) and add the 3M-step run to CI as a scheduled job.
 3. Resolve the RVA23 claim: implement Zama16b and H, or narrow the README.
-4. Run the unprivileged `riscv-arch-test` suites (`rv64i`, about 1,000
-   tests) and add an ACT job to CI.
-5. Decide whether CI should build `images/linux-src` (about 25 min, cached)
-   so that `linux_devices` runs there; it runs locally today.
+4. Add an ACT job to CI. The unprivileged suites now pass 833/833 locally.
+5. `linux_devices` now runs in CI (job `linux-devices`; the images build in
+   about 20 min and are then cached).
 6. Decide whether CI should supply the 9p-capable kernel and enable
    `RIVEMU_REQUIRE_9P=1`.
 7. Add an explicit arbitrary outbound-UDP NAT guest test.

@@ -139,8 +139,8 @@ use std::hint::black_box;
 extern "C" {
     fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
     fn connect(fd: i32, addr: *const u8, len: u32) -> i32;
-    fn write(fd: i32, buf: *const u8, n: usize) -> isize;
-    fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
+    fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
+    fn read(fd: i32, buf: *mut core::ffi::c_void, n: usize) -> isize;
     fn close(fd: i32) -> i32;
     fn ioctl(fd: i32, request: u64, ...) -> i32;
     fn syscall(number: i64, ...) -> i64;
@@ -156,7 +156,7 @@ fn main() {
             addr[8..12].copy_from_slice(&2u32.to_ne_bytes()); // VMADDR_CID_HOST
             let rc = connect(fd, addr.as_ptr(), 16);
             let msg = b"VSOCK_HELLO_FROM_GUEST";
-            let n = write(fd, msg.as_ptr(), msg.len());
+            let n = write(fd, msg.as_ptr().cast(), msg.len());
             close(fd);
             println!("VSOCK fd={fd} connect={rc} write={n}");
         },
@@ -176,7 +176,7 @@ fn main() {
             }
             ioctl(fd, 0x2401, 0); // PERF_EVENT_IOC_DISABLE
             let mut count = [0u8; 8];
-            let n = read(fd, count.as_mut_ptr(), 8);
+            let n = read(fd, count.as_mut_ptr().cast(), 8);
             println!("PERF fd={fd} read={n} instructions={} acc={acc}", u64::from_ne_bytes(count));
         },
         _ => println!("usage: helper vsock|perf"),
