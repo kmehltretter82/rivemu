@@ -22,6 +22,12 @@ clang 20.1.2, all 418 tests in the 15 privileged suites passed:
 
 Logs: [`docs/evidence/2026-11-02/arch-test/`](../../docs/evidence/2026-11-02/arch-test/).
 
+The 43 unprivileged `rv64i` suites (833 tests: I, M, A/Zaamo/Zalrsc/Zabha/Zacas, F, D,
+Zfh/Zfhmin/Zfbfmin/Zfa, C/Zca/Zcb/Zcd/Zcmop, B and the scalar-crypto suites, Zicond, Zimop,
+Zicbo*, Zicsr, Zicntr/Zihpm and others) also pass: **833/833**
+(`summary-rv64i.txt`). Build them with the same command, using
+`EXTENSIONS=$(ls tests/rv64i | paste -sd,)`.
+
 The 7 failures were rivemu bugs:
 
 - `Sm_mcsr_cntr-00`:

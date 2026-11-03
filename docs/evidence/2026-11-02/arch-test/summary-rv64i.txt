@@ -1,0 +1,8 @@
+binary: /tmp/claude-0/-home-user/79f4ee1e-e5af-54ff-957c-ab10ded0132a/scratchpad/perf2/rivemu-fasttlb (rivemu-system-riscv64 version 0.1.0)
+binary sha256: 485b267fb42fc24b7571a2dbb99d380c9f1c38a726a7e39f7b38e62500950cea
+elfs: /home/user/act-work/rivemu-rv64/elfs/rv64i
+args: -nographic -semihosting -M virt -cpu rv64,smdbltrp=on -bios <elf>; timeout 60s
+total: 833
+PASS: 833
+FAIL: 0
+TIMEOUT: 0
