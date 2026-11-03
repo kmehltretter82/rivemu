@@ -185,6 +185,80 @@ const fn bb_op_kind(op: Op) -> BbOpKind {
     }
 }
 
+/// The result of a Zba, Zbb, Zbs or Zicond operation (the same as in
+/// `execute`), or `None` for any other operation. Kept out of
+/// [`Hart::exec_inline`]'s `match` (which slows the common path when it
+/// grows) but still far cheaper than `execute`; kernels use these in their
+/// string functions (strcmp_zbb and others).
+#[inline(never)]
+fn bitmanip_value(op: Op, rs1: u64, rs2: u64, imm: u64) -> Option<u64> {
+    Some(match op {
+        Op::AddUw => rs2.wrapping_add(u64::from(rs1 as u32)),
+        Op::Sh1add => rs2.wrapping_add(rs1 << 1),
+        Op::Sh2add => rs2.wrapping_add(rs1 << 2),
+        Op::Sh3add => rs2.wrapping_add(rs1 << 3),
+        Op::Sh1addUw => rs2.wrapping_add(u64::from(rs1 as u32) << 1),
+        Op::Sh2addUw => rs2.wrapping_add(u64::from(rs1 as u32) << 2),
+        Op::Sh3addUw => rs2.wrapping_add(u64::from(rs1 as u32) << 3),
+        Op::SlliUw => u64::from(rs1 as u32) << (imm & 63),
+        Op::Andn => rs1 & !rs2,
+        Op::Orn => rs1 | !rs2,
+        Op::Xnor => !(rs1 ^ rs2),
+        Op::Clz => u64::from(rs1.leading_zeros()),
+        Op::Ctz => u64::from(rs1.trailing_zeros()),
+        Op::Cpop => u64::from(rs1.count_ones()),
+        Op::Clzw => u64::from((rs1 as u32).leading_zeros()),
+        Op::Ctzw => u64::from((rs1 as u32).trailing_zeros()),
+        Op::Cpopw => u64::from((rs1 as u32).count_ones()),
+        Op::SextB => rs1 as i8 as i64 as u64,
+        Op::SextH => rs1 as i16 as i64 as u64,
+        Op::ZextH => u64::from(rs1 as u16),
+        Op::Min => (rs1 as i64).min(rs2 as i64) as u64,
+        Op::Minu => rs1.min(rs2),
+        Op::Max => (rs1 as i64).max(rs2 as i64) as u64,
+        Op::Maxu => rs1.max(rs2),
+        Op::Rol => rs1.rotate_left((rs2 & 63) as u32),
+        Op::Ror => rs1.rotate_right((rs2 & 63) as u32),
+        Op::Rolw => sext32(u64::from((rs1 as u32).rotate_left((rs2 & 31) as u32))),
+        Op::Rorw => sext32(u64::from((rs1 as u32).rotate_right((rs2 & 31) as u32))),
+        Op::Rori => rs1.rotate_right((imm & 63) as u32),
+        Op::Roriw => sext32(u64::from((rs1 as u32).rotate_right((imm & 31) as u32))),
+        Op::OrcB => {
+            let mut out = 0u64;
+            for i in 0..8 {
+                if (rs1 >> (i * 8)) & 0xff != 0 {
+                    out |= 0xff << (i * 8);
+                }
+            }
+            out
+        }
+        Op::Rev8 => rs1.swap_bytes(),
+        Op::Bclr => rs1 & !(1u64 << (rs2 & 63)),
+        Op::Bext => (rs1 >> (rs2 & 63)) & 1,
+        Op::Binv => rs1 ^ (1u64 << (rs2 & 63)),
+        Op::Bset => rs1 | (1u64 << (rs2 & 63)),
+        Op::Bclri => rs1 & !(1u64 << (imm & 63)),
+        Op::Bexti => (rs1 >> (imm & 63)) & 1,
+        Op::Binvi => rs1 ^ (1u64 << (imm & 63)),
+        Op::Bseti => rs1 | (1u64 << (imm & 63)),
+        Op::CzeroEqz => {
+            if rs2 == 0 {
+                0
+            } else {
+                rs1
+            }
+        }
+        Op::CzeroNez => {
+            if rs2 != 0 {
+                0
+            } else {
+                rs1
+            }
+        }
+        _ => return None,
+    })
+}
+
 /// What a block's inline loads and stores use: the fast-TLB slot of the
 /// block's translation context with its epoch, and a view of guest RAM. All
 /// of it stays valid for the whole block (see [`Hart::try_step_bb`]).
@@ -243,6 +317,48 @@ const fn writes_only_rd(op: Op) -> bool {
             | Op::Divuw
             | Op::Remw
             | Op::Remuw
+            | Op::AddUw
+            | Op::Sh1add
+            | Op::Sh2add
+            | Op::Sh3add
+            | Op::Sh1addUw
+            | Op::Sh2addUw
+            | Op::Sh3addUw
+            | Op::SlliUw
+            | Op::Andn
+            | Op::Orn
+            | Op::Xnor
+            | Op::Clz
+            | Op::Ctz
+            | Op::Cpop
+            | Op::Clzw
+            | Op::Ctzw
+            | Op::Cpopw
+            | Op::SextB
+            | Op::SextH
+            | Op::ZextH
+            | Op::Min
+            | Op::Minu
+            | Op::Max
+            | Op::Maxu
+            | Op::Rol
+            | Op::Ror
+            | Op::Rolw
+            | Op::Rorw
+            | Op::Rori
+            | Op::Roriw
+            | Op::OrcB
+            | Op::Rev8
+            | Op::Bclr
+            | Op::Bext
+            | Op::Binv
+            | Op::Bset
+            | Op::Bclri
+            | Op::Bexti
+            | Op::Binvi
+            | Op::Bseti
+            | Op::CzeroEqz
+            | Op::CzeroNez
     )
 }
 
@@ -1172,7 +1288,7 @@ impl Hart {
                 return ok.then_some(next);
             }
             Op::Nop => return Some(next),
-            _ => return None,
+            _ => bitmanip_value(insn.op, rs1, rs2, imm)?,
         };
         // Blocks store operations that write x0 as `Nop` (`block_insn`).
         debug_assert!(rd != 0);

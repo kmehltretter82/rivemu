@@ -29,6 +29,11 @@
 #    ALU arms write rd without testing for x0; the block loop uses an index.
 # 4. Block chains rerun a block that branches to its own start without a
 #    lookup, and count retired instructions once per chain.
+# 5. Zba/Zbb/Zbs/Zicond operations (the kernel's strcmp_zbb and other string
+#    functions) run inline through a separate non-inlined helper reached from
+#    exec_inline's `_` arm: an andn loop 2,586 M -> 1,389 M host instructions
+#    (-46%; 84 -> 46 per instruction). Putting them into the match itself
+#    made them cheaper still but slowed the common path by 3%.
 # (Tried and reverted: an exhaustive match instead of `_` in exec_inline, to
 # drop the jump-table range check: +3.8% host instructions.)
 #
@@ -43,6 +48,15 @@
 # Wall clock, crypto_bench (1.68 G guest instructions), 3 alternating runs:
 #   before 7.09 / 7.91 / 8.13 s (median 7.91), after 6.01 / 6.10 / 6.66 s
 #   (median 6.10): -23%.
+#
+# CI run 41619541764 (c2ffc78), p17-bench, 9 samples, head vs base (main)
+# on the same runner:
+#   macos-latest   head 7.899 s SMP1 (p95 11.269), 8.860 s SMP4 (p95 10.828);
+#                  base 21.424 / 22.416 s
+#   ubuntu-latest  head 8.412 / 9.007 s; base 30.604 / 36.019 s
+# head/base on macOS is about the same as before (0.369 vs 0.366 at
+# 27ddcbf), on Ubuntu it improved (0.275 vs 0.297): the Apple cores gain
+# less from fewer instructions than the x86 ones.
 #
 # Checks: all workspace tests (with new block_x0_hints_self_loops_and_
 # misaligned_accesses_match_single_stepping and a RamView test),
