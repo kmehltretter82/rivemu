@@ -66,6 +66,11 @@ from the rivemu bugs above.
 
 ## Building the ELFs
 
+`scripts/build-arch-test.sh <work-dir>` does all of the steps below from
+pinned inputs: the Sail compiler, the Sail model, riscv-arch-test and the
+ELFs. The CI job `arch-test` runs it, caches the ELFs by configuration
+hash, and requires every test to pass. To build by hand:
+
 Requirements:
 
 - Sail 0.16 (`rivemu-lockstep/scripts/build-sail-debug-v1.sh`);
