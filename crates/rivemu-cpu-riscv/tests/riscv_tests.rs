@@ -2034,6 +2034,71 @@ fn svnapot_sv57_and_zawrs_semantics() {
     assert_eq!(h.csr.mtval, 0x00d0_0073);
 }
 
+/// PMP verdicts are cached per 4 KiB page while all PMP boundaries are
+/// page-aligned. A PMP write must invalidate them, and M-mode and S/U-mode
+/// verdicts must not share a cache slot.
+#[test]
+fn pmp_page_cache_follows_pmp_writes_and_privilege() {
+    use rivemu_cpu_riscv::{Priv, cause, csr};
+
+    const CODE: u64 = 0x8000_0000;
+    const DATA: u64 = 0x8001_0000;
+    const MTVEC: u64 = 0x8000_0800;
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    bus.write(CODE, AccessSize::Word, 0x0005_3583).unwrap(); // ld x11, 0(x10)
+    bus.write(CODE + 4, AccessSize::Word, 0x00c5_3023).unwrap(); // sd x12, 0(x10)
+    bus.write(DATA, AccessSize::Double, 0x1122_3344_5566_7788)
+        .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mtvec = MTVEC;
+    // Entry 0: NAPOT 64 KiB of code, RWX. Entry 1: NAPOT 4 KiB at DATA.
+    h.csr_write(csr::PMPADDR0, (CODE | 0x7fff) >> 2).unwrap();
+    h.csr_write(csr::PMPADDR0 + 1, (DATA | 0x7ff) >> 2).unwrap();
+    let set_data_perms = |h: &mut Hart, rwx: u64| {
+        h.prv = Priv::Machine;
+        h.csr_write(csr::PMPCFG0, ((0x18 | rwx) << 8) | 0x1f)
+            .unwrap();
+    };
+    let run_s = |h: &mut Hart, pc: u64| {
+        h.prv = Priv::Supervisor;
+        h.pc = pc;
+        h.x[10] = DATA;
+        h.x[12] = 0xabcd;
+        h.step(&bus);
+    };
+
+    // R only: S-mode load succeeds (and caches the verdict), store faults.
+    set_data_perms(&mut h, 0b001);
+    run_s(&mut h, CODE);
+    assert_eq!(h.x[11], 0x1122_3344_5566_7788);
+    run_s(&mut h, CODE + 4);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE), Some(cause::STORE_ACCESS));
+
+    // RW: the cached "store denied" must not survive the PMP write.
+    set_data_perms(&mut h, 0b011);
+    run_s(&mut h, CODE + 4);
+    assert_eq!(h.pc, CODE + 8);
+    assert_eq!(bus.read(DATA, AccessSize::Double).unwrap(), 0xabcd);
+
+    // No permissions: S-mode load faults, while M-mode (entry not locked)
+    // still loads from the same page.
+    set_data_perms(&mut h, 0b000);
+    run_s(&mut h, CODE);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE), Some(cause::LOAD_ACCESS));
+    h.prv = Priv::Machine;
+    h.pc = CODE;
+    h.x[11] = 0;
+    h.step(&bus);
+    assert_eq!(h.x[11], 0xabcd);
+    assert_eq!(h.pc, CODE + 4);
+}
+
 /// Zicbom/Zicboz: a cache-block operation on physical memory with no PMA
 /// region raises a store/AMO access fault (Sail `phys_access_check`). Found by
 /// riscv-arch-test Sv_Zicbo_*_zicbom_exceptions (cp_leaf_PTE_to_nonexistent_pa):

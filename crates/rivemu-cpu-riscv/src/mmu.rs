@@ -101,6 +101,53 @@ impl Default for TlbEntry {
     }
 }
 
+/// Number of entries in [`PmpCache`] (direct-mapped by physical page).
+const PMP_CACHE_SIZE: usize = 256;
+
+/// One page's cached PMP verdicts.
+#[derive(Clone, Copy, Default)]
+struct PmpCacheEntry {
+    /// `(pa >> 12) + 1` (0 means invalid).
+    tag: u64,
+    /// [`PmpCache::epoch`] when the entry was filled.
+    epoch: u32,
+    /// Bit `access + 8 * is_machine` is set once that check has run.
+    checked: u16,
+    /// The same bit is set when that check allowed the access.
+    allowed: u16,
+}
+
+/// PMP verdicts per 4 KiB physical page.
+///
+/// While every active PMP entry starts and ends on a page boundary
+/// (`!pmp_subpage`), the same entries match every byte of a page, so one
+/// [`Hart::pmp_check`] per page, access type and privilege class (M or S/U)
+/// decides all later accesses. [`Hart::update_pmp_state`] invalidates the
+/// cache whenever the PMP configuration changes.
+pub(crate) struct PmpCache {
+    entries: Box<[PmpCacheEntry; PMP_CACHE_SIZE]>,
+    epoch: u32,
+}
+
+impl Default for PmpCache {
+    fn default() -> Self {
+        Self {
+            entries: Box::new([PmpCacheEntry::default(); PMP_CACHE_SIZE]),
+            epoch: 1,
+        }
+    }
+}
+
+impl PmpCache {
+    fn invalidate(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.entries.fill(PmpCacheEntry::default());
+            self.epoch = 1;
+        }
+    }
+}
+
 /// Direct-mapped TLB caching leaf translations. Permissions are re-checked
 /// on every hit, so privilege/MPRV/SUM/MXR changes need no flush.
 #[derive(Clone, Debug)]
@@ -287,6 +334,7 @@ impl Hart {
             && (!self.csr.pmpaddr[0]).trailing_zeros() >= 53;
         self.pmp_enforced = !full_open_entry0 && (any_active || self.strict_pmp || mseccfg_active);
         self.pmp_subpage = self.pmp_enforced && subpage;
+        self.pmp_cache.invalidate();
     }
 
     /// Returns the inclusive physical address range `(lo, hi_inclusive)` matched
@@ -381,6 +429,35 @@ impl Hart {
         }
     }
 
+    /// [`Self::pmp_check`] for a 1-byte access, cached per physical page
+    /// (see [`PmpCache`]) unless a PMP entry boundary lies inside a page.
+    #[inline]
+    fn pmp_allows(&mut self, pa: u64, prv: Priv, acc: Access) -> bool {
+        if self.pmp_subpage {
+            return self.pmp_check(pa, 1, prv, acc);
+        }
+        let bit = 1u16 << (acc as u16 + if prv == Priv::Machine { 8 } else { 0 });
+        let page = pa >> 12;
+        let idx = (page as usize) & (PMP_CACHE_SIZE - 1);
+        let mut e = self.pmp_cache.entries[idx];
+        if e.tag != page + 1 || e.epoch != self.pmp_cache.epoch {
+            e = PmpCacheEntry {
+                tag: page + 1,
+                epoch: self.pmp_cache.epoch,
+                checked: 0,
+                allowed: 0,
+            };
+        }
+        if e.checked & bit == 0 {
+            e.checked |= bit;
+            if self.pmp_check(pa, 1, prv, acc) {
+                e.allowed |= bit;
+            }
+            self.pmp_cache.entries[idx] = e;
+        }
+        e.allowed & bit != 0
+    }
+
     #[inline]
     pub(crate) fn check_pmp_access(
         &self,
@@ -397,7 +474,8 @@ impl Hart {
 
     /// Translates a virtual address and returns `(pa, fast_ram_offset)` where
     /// `fast_ram_offset != u64::MAX` when the translated 4 KiB page has
-    /// `PBMT == 0`, `!pmp_enforced`, and lies inside `AddressSpace::fast_ram`.
+    /// `PBMT == 0`, lies inside `AddressSpace::fast_ram`, and no PMP entry
+    /// boundary falls inside a page (`!pmp_subpage`).
     #[inline]
     pub(crate) fn translate_with_ram_off(
         &mut self,
@@ -413,7 +491,7 @@ impl Hart {
             }
             if self.pmp_enforced
                 && (prv != Priv::Machine || self.pmp_any_locked)
-                && !self.pmp_check(va, 1, prv, acc)
+                && !self.pmp_allows(va, prv, acc)
             {
                 return Err(acc.access_fault(va));
             }
@@ -435,10 +513,14 @@ impl Hart {
             let off = va & 0xfff;
             let pa = e.pa_page | off;
             if self.pmp_enforced {
-                if !self.pmp_check(pa, 1, prv, acc) {
+                if !self.pmp_allows(pa, prv, acc) {
                     return Err(acc.access_fault(va));
                 }
-                return Ok((pa, u64::MAX));
+                // Multi-byte accesses within a page need their own check only
+                // when a PMP boundary can fall inside the page.
+                if self.pmp_subpage {
+                    return Ok((pa, u64::MAX));
+                }
             }
             let ram_off = if e.ram_page_off != u64::MAX {
                 e.ram_page_off | off
@@ -448,7 +530,7 @@ impl Hart {
             return Ok((pa, ram_off));
         }
         let pa = self.walk(bus, va, acc, prv, mode)?;
-        if self.pmp_enforced && !self.pmp_check(pa, 1, prv, acc) {
+        if self.pmp_enforced && !self.pmp_allows(pa, prv, acc) {
             return Err(acc.access_fault(va));
         }
         Ok((pa, u64::MAX))

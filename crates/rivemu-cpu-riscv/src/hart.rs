@@ -9,7 +9,7 @@ use rivemu_mem::{AddressSpace, RegionKind};
 use crate::csr::{self, Csrs, envcfg, irq, status};
 use crate::decode::{Insn, Op, amo, decode, decode_compressed};
 use crate::log::{LogFlags, Logger};
-use crate::mmu::{Access, Tlb};
+use crate::mmu::{Access, PmpCache, Tlb};
 
 /// Exception cause codes.
 #[allow(missing_docs)]
@@ -278,6 +278,7 @@ pub struct Hart {
     /// Active 64-byte cache-line `LR` reservation.
     reservation: Option<Reservation>,
     pub(crate) tlb: Tlb,
+    pub(crate) pmp_cache: PmpCache,
     icache: Box<[IcacheEntry; ICACHE_SIZE]>,
     bbcache: Box<[BbCacheEntry; BBCACHE_SIZE]>,
     icache_gen: u16,
@@ -382,6 +383,7 @@ impl Hart {
             timebase,
             reservation: None,
             tlb: Tlb::default(),
+            pmp_cache: PmpCache::default(),
             icache: Box::new([IcacheEntry::default(); ICACHE_SIZE]),
             bbcache: Box::new([BbCacheEntry::default(); BBCACHE_SIZE]),
             icache_gen: 1,
