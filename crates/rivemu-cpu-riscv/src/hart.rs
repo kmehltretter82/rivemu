@@ -341,6 +341,13 @@ pub struct Hart {
     /// `mstatus.MDT` was 1. The hart stops without updating any architectural
     /// state (there is no Smrnmi to take the trap instead).
     pub critical_error: bool,
+    /// Set when an instruction read a value that depends on device timing or
+    /// on the implementation rather than on architectural state: a load
+    /// below DRAM (MMIO), or a read of a counter, `time`, `seed`, `tinfo`,
+    /// `mip`/`sip` or `scountovf`. Co-simulation clears it before a step and,
+    /// when it is set afterwards, takes the reference model's result instead
+    /// of comparing it. The hart itself never clears it.
+    pub nondeterministic_read: bool,
     /// Per-hart SBI FWFT locks: bit 0 for landing pads, bit 1 for shadow stacks.
     pub fwft_locks: u8,
     /// Trap on any unaligned scalar load or store (`LOAD_MISALIGNED` / `STORE_MISALIGNED`).
@@ -426,6 +433,7 @@ impl Hart {
             hsm_stopped: false,
             smdbltrp: false,
             critical_error: false,
+            nondeterministic_read: false,
             fwft_locks: 0,
             strict_align: false,
             svade: false,
@@ -1804,6 +1812,9 @@ impl Hart {
                 return Ok(v);
             }
         }
+        if pa < 0x8000_0000 {
+            self.nondeterministic_read = true;
+        }
         bus.read(pa, size).map_err(|e| {
             if self.log_flags.has(LogFlags::GUEST_ERRORS) {
                 self.log_guest_error(format_args!("load fault at va={va:#x} pa={pa:#x}: {e}"));
@@ -2768,6 +2779,20 @@ impl Hart {
         } else {
             0
         };
+        if reads
+            && matches!(
+                num,
+                csr::SEED
+                    | csr::TINFO
+                    | csr::MIP
+                    | csr::SIP
+                    | 0xb00..=0xb1f
+                    | 0xc00..=0xc1f
+                    | 0xda0
+            )
+        {
+            self.nondeterministic_read = true;
+        }
         if writes {
             // Per RISC-V Privileged Spec 3.1.9, RMW operations on `mip` use only
             // the software-writable bits as their input, not external IRQ lines.
