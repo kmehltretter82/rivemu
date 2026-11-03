@@ -177,7 +177,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test -q --release -p rivemu-machine --test linux_perf -- --nocapture 2>&1 \
-            | tee p17-threshold.txt | grep -E '^P17_(SAMPLE|CALIB|RESULT)|panicked|threshold|test result'
+            | tee p17-threshold.txt | grep -E '^P17_(SAMPLE|CALIB|RESULT|THRESHOLD)|panicked|test result'
       - name: Summary
         run: |
           cat p17-profile.txt
@@ -185,7 +185,7 @@ jobs:
           echo "### P17 on ${{ matrix.os }} ($(uname -m))" >> "$GITHUB_STEP_SUMMARY"
           sed -n '/^label smp n median/,/^$/p' p17-compare.txt >> "$GITHUB_STEP_SUMMARY"
           if [ -f p17-threshold.txt ]; then
-            grep -E '^P17_RESULT|panicked|test result' p17-threshold.txt | tee -a "$GITHUB_STEP_SUMMARY"
+            grep -E '^P17_(RESULT|THRESHOLD)|panicked|test result' p17-threshold.txt | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
   p17-callgrind:

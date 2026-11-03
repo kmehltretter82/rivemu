@@ -199,6 +199,9 @@ fn p17_linux_to_shell_benchmark() {
     let timeout = Duration::from_secs(env_usize("RIVEMU_LINUX_PERF_TIMEOUT_SECS", 90) as u64);
     let assert_thresholds = std::env::var_os("RIVEMU_LINUX_PERF_ASSERT_THRESHOLDS").is_some();
 
+    // Every hart count runs before any threshold is checked, so a miss on
+    // one still reports the other.
+    let mut misses = Vec::new();
     for smp in selected_hart_counts() {
         for index in 0..warmups {
             timed_boot(&files, smp, timeout, "warmup", index);
@@ -217,12 +220,20 @@ fn p17_linux_to_shell_benchmark() {
             "P17_RESULT,smp={smp},samples_seconds={samples:?},median_seconds={median_seconds:.6},p95_seconds={p95_seconds:.6}"
         );
 
-        if assert_thresholds {
-            let threshold = if smp == 1 { 8.0 } else { 10.0 };
-            assert!(
-                median_seconds < threshold && p95_seconds < threshold,
-                "P17 smp={smp} threshold {threshold:.2}s missed: median={median_seconds:.6}s p95={p95_seconds:.6}s"
-            );
+        let threshold = if smp == 1 { 8.0 } else { 10.0 };
+        let met = median_seconds < threshold && p95_seconds < threshold;
+        eprintln!(
+            "P17_THRESHOLD,smp={smp},threshold_seconds={threshold:.2},median_and_p95_below={met}"
+        );
+        if !met {
+            misses.push(format!(
+                "smp={smp} threshold {threshold:.2}s: median={median_seconds:.6}s p95={p95_seconds:.6}s"
+            ));
         }
     }
+    assert!(
+        !assert_thresholds || misses.is_empty(),
+        "P17 thresholds missed: {}",
+        misses.join("; ")
+    );
 }
