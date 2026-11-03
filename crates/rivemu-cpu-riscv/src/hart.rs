@@ -259,6 +259,18 @@ fn bitmanip_value(op: Op, rs1: u64, rs2: u64, imm: u64) -> Option<u64> {
     })
 }
 
+/// The last value an inline instruction of a block wrote and its register
+/// (`rd` 32: none). With forwarding, the next instruction reads it from here
+/// instead of loading it back from `x`, which takes it off the store/load
+/// round trip through memory.
+#[derive(Clone, Copy)]
+struct Fwd {
+    rd: u8,
+    v: u64,
+}
+
+const NO_FWD: Fwd = Fwd { rd: 32, v: 0 };
+
 /// What a block's inline loads and stores use: the fast-TLB slot of the
 /// block's translation context with its epoch, and a view of guest RAM. All
 /// of it stays valid for the whole block (see [`Hart::try_step_bb`]).
@@ -530,6 +542,10 @@ pub struct Hart {
     /// Active `-d` flags (`0` when logging is disabled).
     pub(crate) log_flags: LogFlags,
     pub(crate) logger: Option<Arc<Logger>>,
+    /// Experiment: blocks forward the last inline result to the next
+    /// instruction instead of reading it back from `x`.
+    #[doc(hidden)]
+    pub block_forwarding: bool,
     /// Active debugger PC breakpoints.
     pub breakpoints: Vec<u64>,
     /// Active debugger data watchpoints: `(addr, len, kind)` where `kind` is `1` (read), `2` (write), `3` (access).
@@ -647,6 +663,7 @@ impl Hart {
             hpm_written_mask: 0,
             log_flags: LogFlags::default(),
             logger: None,
+            block_forwarding: std::env::var_os("RIVEMU_BLOCK_FWD").is_some(),
             breakpoints: Vec::new(),
             watchpoints: Vec::new(),
             hit_breakpoint: false,
@@ -1006,7 +1023,11 @@ impl Hart {
             let block_pc = self.pc;
             let start = self.bbcache[idx].start as usize;
             let limit = avail.min((max_insns - total) as usize);
-            let (done, completed) = self.run_block(bus, &arena[start..start + limit], mem);
+            let (done, completed) = if self.block_forwarding {
+                self.run_block::<true>(bus, &arena[start..start + limit], mem)
+            } else {
+                self.run_block::<false>(bus, &arena[start..start + limit], mem)
+            };
             total += done;
             if !completed || total >= max_insns {
                 if completed {
@@ -1071,7 +1092,7 @@ impl Hart {
     /// whether all of `insns` ran without a trap, interrupt check, `wfi` or
     /// yield.
     #[inline(always)]
-    fn run_block(
+    fn run_block<const FWD: bool>(
         &mut self,
         bus: &AddressSpace,
         insns: &[Insn],
@@ -1082,6 +1103,7 @@ impl Hart {
         // store-to-load dependency through `self.pc` between consecutive
         // instructions.
         let mut pc = self.pc;
+        let mut fwd = NO_FWD;
         let mut i = 0;
         while i < insns.len() {
             let insn = &insns[i];
@@ -1093,10 +1115,11 @@ impl Hart {
             // with landing pads disabled and `elp` clear (see `run`), and
             // nothing in a block sets `elp`.
             debug_assert!(!self.elp);
-            if let Some(next) = self.exec_inline(bus, insn, mem, pc) {
+            if let Some(next) = self.exec_inline::<FWD>(bus, insn, mem, pc, &mut fwd) {
                 pc = next;
                 continue;
             }
+            fwd = NO_FWD;
             self.pc = pc;
             match self.execute(bus, insn) {
                 Ok(()) => {
@@ -1134,16 +1157,25 @@ impl Hart {
     /// arm of [`Self::execute`]; returns `false` (and does nothing) for
     /// every other instruction. One `match` dispatches both kinds.
     #[inline(always)]
-    fn exec_inline(
+    fn exec_inline<const FWD: bool>(
         &mut self,
         bus: &AddressSpace,
         insn: &Insn,
         mem: Option<FastMem<'_>>,
         pc: u64,
+        fwd: &mut Fwd,
     ) -> Option<u64> {
         let next = pc.wrapping_add(u64::from(insn.len));
-        let rs1 = self.x[usize::from(insn.rs1 & 31)];
-        let rs2 = self.x[usize::from(insn.rs2 & 31)];
+        let rs1 = if FWD && insn.rs1 == fwd.rd {
+            fwd.v
+        } else {
+            self.x[usize::from(insn.rs1 & 31)]
+        };
+        let rs2 = if FWD && insn.rs2 == fwd.rd {
+            fwd.v
+        } else {
+            self.x[usize::from(insn.rs2 & 31)]
+        };
         let imm = insn.imm as u64;
         let rd = insn.rd;
         let v = match insn.op {
@@ -1230,61 +1262,71 @@ impl Hart {
             }
             Op::Jal => {
                 self.set_x(rd, next);
+                if FWD {
+                    *fwd = NO_FWD;
+                }
                 return Some(pc.wrapping_add(imm));
             }
             // Blocks run only with landing pads disabled (see `run`), so
             // Jalr never sets `elp` here.
             Op::Jalr => {
                 self.set_x(rd, next);
+                if FWD {
+                    *fwd = NO_FWD;
+                }
                 return Some(rs1.wrapping_add(imm) & !1);
             }
             // One arm per opcode, so that each inlined access has a
             // constant size.
             Op::Ld => {
-                let ok = self.exec_load_inline(bus, insn, mem, AccessSize::Double, |v| v);
+                let ok =
+                    self.exec_load_inline::<FWD>(insn, mem, rs1, fwd, AccessSize::Double, |v| v);
                 return ok.then_some(next);
             }
             Op::Lw => {
-                let ok =
-                    self.exec_load_inline(bus, insn, mem, AccessSize::Word, |v| v as i32 as u64);
+                let ok = self.exec_load_inline::<FWD>(insn, mem, rs1, fwd, AccessSize::Word, |v| {
+                    v as i32 as u64
+                });
                 return ok.then_some(next);
             }
             Op::Lwu => {
-                let ok = self.exec_load_inline(bus, insn, mem, AccessSize::Word, |v| v);
+                let ok = self.exec_load_inline::<FWD>(insn, mem, rs1, fwd, AccessSize::Word, |v| v);
                 return ok.then_some(next);
             }
             Op::Lbu => {
-                let ok = self.exec_load_inline(bus, insn, mem, AccessSize::Byte, |v| v);
+                let ok = self.exec_load_inline::<FWD>(insn, mem, rs1, fwd, AccessSize::Byte, |v| v);
                 return ok.then_some(next);
             }
             Op::Lb => {
-                let ok =
-                    self.exec_load_inline(bus, insn, mem, AccessSize::Byte, |v| v as i8 as u64);
+                let ok = self.exec_load_inline::<FWD>(insn, mem, rs1, fwd, AccessSize::Byte, |v| {
+                    v as i8 as u64
+                });
                 return ok.then_some(next);
             }
             Op::Lhu => {
-                let ok = self.exec_load_inline(bus, insn, mem, AccessSize::Half, |v| v);
+                let ok = self.exec_load_inline::<FWD>(insn, mem, rs1, fwd, AccessSize::Half, |v| v);
                 return ok.then_some(next);
             }
             Op::Lh => {
-                let ok =
-                    self.exec_load_inline(bus, insn, mem, AccessSize::Half, |v| v as i16 as u64);
+                let ok = self.exec_load_inline::<FWD>(insn, mem, rs1, fwd, AccessSize::Half, |v| {
+                    v as i16 as u64
+                });
                 return ok.then_some(next);
             }
             Op::Sd => {
-                let ok = self.exec_store_inline(bus, insn, mem, AccessSize::Double);
+                let ok = self.exec_store_inline(bus, insn, mem, rs1, rs2, AccessSize::Double);
                 return ok.then_some(next);
             }
             Op::Sw => {
-                let ok = self.exec_store_inline(bus, insn, mem, AccessSize::Word);
+                let ok = self.exec_store_inline(bus, insn, mem, rs1, rs2, AccessSize::Word);
                 return ok.then_some(next);
             }
             Op::Sb => {
-                let ok = self.exec_store_inline(bus, insn, mem, AccessSize::Byte);
+                let ok = self.exec_store_inline(bus, insn, mem, rs1, rs2, AccessSize::Byte);
                 return ok.then_some(next);
             }
             Op::Sh => {
-                let ok = self.exec_store_inline(bus, insn, mem, AccessSize::Half);
+                let ok = self.exec_store_inline(bus, insn, mem, rs1, rs2, AccessSize::Half);
                 return ok.then_some(next);
             }
             Op::Nop => return Some(next),
@@ -1293,6 +1335,9 @@ impl Hart {
         // Blocks store operations that write x0 as `Nop` (`block_insn`).
         debug_assert!(rd != 0);
         self.x[usize::from(rd & 31)] = v;
+        if FWD {
+            *fwd = Fwd { rd, v };
+        }
         Some(next)
     }
 
@@ -1303,18 +1348,19 @@ impl Hart {
     /// inline: no pointer masking and no strict alignment. Blocks never run
     /// with triggers, watchpoints or logging.
     #[inline(always)]
-    fn exec_load_inline(
+    fn exec_load_inline<const FWD: bool>(
         &mut self,
-        _bus: &AddressSpace,
         insn: &Insn,
         mem: Option<FastMem<'_>>,
+        rs1: u64,
+        fwd: &mut Fwd,
         size: AccessSize,
         ext: impl Fn(u64) -> u64,
     ) -> bool {
         let Some(m) = mem else {
             return false;
         };
-        let va = self.x[usize::from(insn.rs1 & 31)].wrapping_add(insn.imm as u64);
+        let va = rs1.wrapping_add(insn.imm as u64);
         // A naturally aligned access stays within its page; `read_aligned`
         // refuses the others, which take the full path.
         let slot = &self.tlb.fast.slots[m.slot % FAST_TLB_SLOTS];
@@ -1324,7 +1370,15 @@ impl Hart {
         let Some(v) = m.ram.read_aligned(e.ram_page_off | (va & 0xfff), size) else {
             return false;
         };
-        self.set_x(insn.rd, ext(v));
+        let v = ext(v);
+        self.set_x(insn.rd, v);
+        if FWD {
+            *fwd = if insn.rd != 0 {
+                Fwd { rd: insn.rd, v }
+            } else {
+                NO_FWD
+            };
+        }
         true
     }
 
@@ -1335,12 +1389,14 @@ impl Hart {
         bus: &AddressSpace,
         insn: &Insn,
         mem: Option<FastMem<'_>>,
+        rs1: u64,
+        rs2: u64,
         size: AccessSize,
     ) -> bool {
         let Some(m) = mem else {
             return false;
         };
-        let va = self.x[usize::from(insn.rs1 & 31)].wrapping_add(insn.imm as u64);
+        let va = rs1.wrapping_add(insn.imm as u64);
         let slot = &self.tlb.fast.slots[m.slot % FAST_TLB_SLOTS];
         let Some(e) = FastTlbSlot::hit(&slot.store, m.epoch_hi, va) else {
             return false;
@@ -1348,10 +1404,7 @@ impl Hart {
         let (pa, off) = (e.pa_page | (va & 0xfff), e.ram_page_off | (va & 0xfff));
         // The page's dirty bit is set (see `FastTlb`); `write_aligned`
         // refuses misaligned accesses, which take the full path.
-        if m.ram
-            .write_aligned(off, size, self.x[usize::from(insn.rs2 & 31)])
-            .is_none()
-        {
+        if m.ram.write_aligned(off, size, rs2).is_none() {
             return false;
         }
         self.invalidate_reservation(pa);

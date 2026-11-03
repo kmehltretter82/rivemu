@@ -175,6 +175,30 @@ jobs:
           echo "### P17 on ${{ matrix.os }} ($(uname -m))" >> "$GITHUB_STEP_SUMMARY"
           tail -6 p17-compare.txt >> "$GITHUB_STEP_SUMMARY"
 
+  p17-variants:
+    # A/B of run-time interpreter variants on one runner: the P17 boot
+    # (SMP1) and toolchain-free microbenchmarks, each variant selected by an
+    # environment variable on the same binaries. Informational.
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: images/linux-test
+          key: linux-test-${{ runner.os }}-${{ hashFiles('scripts/fetch-linux-test.sh') }}
+      - run: scripts/fetch-linux-test.sh
+      - run: cargo build --release -p rivemu-cli
+      - run: python3 scripts/interp-microbench.py target/release/rivemu-system-riscv64 3 base= fwd=RIVEMU_BLOCK_FWD=1
+      - run: scripts/p17-ab.sh 3 base= fwd=RIVEMU_BLOCK_FWD=1
+
   msrv:
     name: msrv (1.85)
     runs-on: ubuntu-latest
