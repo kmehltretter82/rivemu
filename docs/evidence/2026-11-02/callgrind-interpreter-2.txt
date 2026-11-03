@@ -1,0 +1,4 @@
+# Same deterministic boot as callgrind-interpreter.txt, after Zama16b put zama16b into the device tree:
+# 314,576,084 guest instructions for both builds below (RIVEMU_STATS; identical, so the fast path does not change guest behavior).
+cur    64,126,421,797 smoke_ok=1   # d48642d
+simple 59,414,735,546 smoke_ok=1   # + inline simple ops + pointer-masking fast path

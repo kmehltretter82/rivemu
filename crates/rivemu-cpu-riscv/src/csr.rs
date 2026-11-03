@@ -229,6 +229,8 @@ pub mod mseccfg {
     pub const MLPE: u64 = 1 << 10;
     pub const PMM_SHIFT: u32 = 32;
     pub const PMM_MASK: u64 = 3 << PMM_SHIFT;
+    // `Hart::mask_data_addr` tests all three PMM fields with one mask.
+    const _: () = assert!(PMM_MASK == super::envcfg::PMM_MASK);
 }
 
 /// `mstateen0..3` / `sstateen0..3` bits (`Smstateen` / `Ssstateen`).

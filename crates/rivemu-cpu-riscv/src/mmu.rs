@@ -322,6 +322,12 @@ impl Hart {
     /// virtual address when enabled for the effective data privilege level.
     #[inline]
     pub(crate) fn mask_data_addr(&self, va: u64) -> u64 {
+        // Pointer masking is off unless some PMM field is set; all three sit
+        // at bits [33:32]. Skips the effective-privilege lookup on every
+        // access in the common case.
+        if (self.csr.menvcfg | self.csr.senvcfg | self.csr.mseccfg) & envcfg::PMM_MASK == 0 {
+            return va;
+        }
         let prv = self.effective_priv(Access::Load);
         let pmlen = self.csr.effective_pmlen(prv);
         if pmlen == 0 {

@@ -698,6 +698,13 @@ impl Hart {
         // the other flushing instructions end a block (`BbOpKind::Abort`).
         for i in 0..limit {
             let insn = self.bbcache[bb_idx].insns[i];
+            // Integer ALU, Lui/Auipc, Jal and branches cannot trap, touch
+            // memory or set check_irq/wfi/yield_slice, so they skip the
+            // `execute` call and the per-instruction flag check. A pending
+            // landing-pad check (`elp`) still goes through `execute`.
+            if !self.elp && self.exec_simple(&insn) {
+                continue;
+            }
             match self.execute(bus, &insn) {
                 Ok(()) => {
                     if self.check_irq || self.wfi || self.yield_slice {
@@ -725,6 +732,75 @@ impl Hart {
         let done = limit as u64;
         self.bump_counters(done);
         done
+    }
+
+    /// Executes `insn` if it is one of the simple integer instructions,
+    /// with the same semantics as the matching arm of [`Self::execute`];
+    /// returns `false` (and does nothing) for every other instruction.
+    #[inline(always)]
+    fn exec_simple(&mut self, insn: &Insn) -> bool {
+        let pc = self.pc;
+        let rs1 = self.x[insn.rs1 as usize];
+        let rs2 = self.x[insn.rs2 as usize];
+        let imm = insn.imm as u64;
+        let rd = insn.rd;
+        let v = match insn.op {
+            Op::Addi => rs1.wrapping_add(imm),
+            Op::Add => rs1.wrapping_add(rs2),
+            Op::Sub => rs1.wrapping_sub(rs2),
+            Op::Lui => imm,
+            Op::Auipc => pc.wrapping_add(imm),
+            Op::Andi => rs1 & imm,
+            Op::Ori => rs1 | imm,
+            Op::Xori => rs1 ^ imm,
+            Op::Slli => rs1 << (imm & 63),
+            Op::Srli => rs1 >> (imm & 63),
+            Op::Srai => ((rs1 as i64) >> (imm & 63)) as u64,
+            Op::Slti => u64::from((rs1 as i64) < i64::from(insn.imm)),
+            Op::Sltiu => u64::from(rs1 < imm),
+            Op::And => rs1 & rs2,
+            Op::Or => rs1 | rs2,
+            Op::Xor => rs1 ^ rs2,
+            Op::Sll => rs1 << (rs2 & 63),
+            Op::Srl => rs1 >> (rs2 & 63),
+            Op::Sra => ((rs1 as i64) >> (rs2 & 63)) as u64,
+            Op::Slt => u64::from((rs1 as i64) < (rs2 as i64)),
+            Op::Sltu => u64::from(rs1 < rs2),
+            Op::Addiw => sext32(rs1.wrapping_add(imm)),
+            Op::Slliw => sext32(rs1 << (imm & 31)),
+            Op::Srliw => sext32(u64::from((rs1 as u32) >> (imm & 31))),
+            Op::Sraiw => ((rs1 as i32) >> (imm & 31)) as i64 as u64,
+            Op::Addw => sext32(rs1.wrapping_add(rs2)),
+            Op::Subw => sext32(rs1.wrapping_sub(rs2)),
+            Op::Sllw => sext32(rs1 << (rs2 & 31)),
+            Op::Srlw => sext32(u64::from((rs1 as u32) >> (rs2 & 31))),
+            Op::Sraw => ((rs1 as i32) >> (rs2 & 31)) as i64 as u64,
+            Op::Beq | Op::Bne | Op::Blt | Op::Bge | Op::Bltu | Op::Bgeu => {
+                let taken = match insn.op {
+                    Op::Beq => rs1 == rs2,
+                    Op::Bne => rs1 != rs2,
+                    Op::Blt => (rs1 as i64) < (rs2 as i64),
+                    Op::Bge => (rs1 as i64) >= (rs2 as i64),
+                    Op::Bltu => rs1 < rs2,
+                    _ => rs1 >= rs2,
+                };
+                self.pc = if taken {
+                    pc.wrapping_add(imm)
+                } else {
+                    pc.wrapping_add(u64::from(insn.len))
+                };
+                return true;
+            }
+            Op::Jal => {
+                self.set_x(rd, pc.wrapping_add(u64::from(insn.len)));
+                self.pc = pc.wrapping_add(imm);
+                return true;
+            }
+            _ => return false,
+        };
+        self.set_x(rd, v);
+        self.pc = pc.wrapping_add(u64::from(insn.len));
+        true
     }
 
     #[cold]
