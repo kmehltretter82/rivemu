@@ -21,7 +21,7 @@ overlap. Findings, causes and fixes are in
 | Linux device E2E: reboot, NVMe, virtio-gpu/input, vsock, SBI PMU/perf, Snapshot v2 | `RIVEMU_LINUX_DEVICES_TEST=1 cargo test --release -p rivemu-machine --test linux_devices`; `evidence/2026-11-02/linux-devices-e2e.log` | 6/6 with Linux 6.12 + OpenSBI v1.7, locally and in CI (job `linux-devices`, required mode). Snapshot v2 does not contain disk contents (the test shares the backend). |
 | P27–P32 per-suite differential campaigns | `rivemu-lockstep/docs/evidence/2026-11-02-campaigns/summary.txt` | 18 suites × {QEMU 11.1.3 `--step-check`, Sail 0.16}: 36/36 PASS. |
 | Expanded `Suite::Vector` (random LMUL/SEW/mask, segments, indexed, reserved encodings) | `rivemu-lockstep` `3c57b83` | 256 blocks pass against Sail and QEMU after three RVV fixes. |
-| Boot lockstep P16/P26 (OpenSBI v1.7 + Linux 6.12 vs QEMU 11.1.3) | `rivemu-lockstep/docs/evidence/2026-11-02-boot-lockstep/run10-pass-3M-steps.log` | **3,000,000 instructions, 0 divergences** with `--check-csrs`. The 9 earlier runs each stopped at a harness configuration difference or a rivemu bug (`mstateen` reset); all are fixed. |
+| Boot lockstep P16/P26 (OpenSBI v1.7 + Linux 6.12 vs QEMU 11.1.3) | `rivemu-lockstep/docs/evidence/2026-11-02-boot-lockstep/run12-pass-10M-steps.log` | **10,000,000 instructions, 0 divergences** with `--check-csrs` (3M in run 10). Each earlier run stopped at a harness configuration difference or a rivemu bug (semihosting, `mstateen` reset); all are fixed. |
 | Sail multi-worker startup | `rivemu-lockstep/docs/evidence/2026-11-02-sail-startup/` | 25/25 clean 6-worker campaigns without the startup lock (was 17/24). |
 | CI hygiene | GitHub Actions on both PRs | `cargo fmt --check`, `clippy -D warnings`, MSRV 1.85, and `cargo deny` (rivemu) pass. rivemu-lockstep now has CI, including the differential suites. |
 
@@ -87,7 +87,7 @@ built-in-SBI Linux test both pass with the fix.
 | P17 `< 8 s` single-hart / `< 10 s` SMP4 | Failed (25–29% faster since 2026-11-02) | The P17 fixture (`tests/linux_perf.rs`: Debian inputs, `Machine::new()` to the first `~ # `) now runs in CI for the PR head and its base on the same runner (job `p17-bench`). On a GitHub ubuntu-latest runner, 9 samples each: base `0946319` median 30.52 s (SMP1) / 36.23 s (SMP4); head with the PMP page cache and interpreter changes 22.92 s / 25.69 s (`evidence/2026-11-02/p17-ci-same-runner.txt`). The earlier M-series campaign measured 18.905/21.103 s on the base. The targets are still missed on this runner; a from-source boot to poweroff on a 4-vCPU container takes 7.50/9.57 s (`evidence/2026-11-02/boot-bench-interpreter.txt`). |
 | `riscv-arch-test` privileged subset | Verified 2026-11-02 | 418/418 (`tests/arch-test/README.md`). |
 | Guest PMU/perf | Verified 2026-11-02 (counting) | `linux_devices`: `riscv-pmu-sbi` probes 16 firmware and 31 hardware counters, and `perf_event_open` counts instructions. PMU overflow interrupts are not asserted. |
-| Boot lockstep P16/P26 | Partial (first 3M instructions), 2026-11-02 | 3,000,000 instructions of OpenSBI + early Linux with 0 divergences against QEMU 11.1.3. A boot to the shell is about 10⁹ instructions and needs checkpointed windows. |
+| Boot lockstep P16/P26 | Partial (first 10M instructions), 2026-11-02 | 10,000,000 instructions of OpenSBI + early Linux with 0 divergences against QEMU 11.1.3. A boot to the shell is about 10⁹ instructions and needs checkpointed windows. |
 | P27-P32 Sail/QEMU differential claims | Verified per suite 2026-11-02 | All 18 suites pass against Sail and against QEMU with `--step-check`. The Vector suite needed rework first; it had ignored its RNG. |
 | Benchmarks | Partial | The repeated exact-boundary P17 boot benchmark is retained. No CoreMark, Dhrystone, or criterion history was found. |
 | CI hygiene | Partial | `git diff --check` passes, and the changed lockstep Sail file passes targeted `rustfmt --check`. Repo-wide formatting checks fail on broad existing drift, while `clippy -D warnings` stops on five untouched `qemu_rust` vector warnings and three unchanged lockstep QEMU-test warnings. `cargo-deny` is not installed. No broad unrelated rewrite was made. |
@@ -161,8 +161,8 @@ Ranked; details in [`REVIEW-20261102.md`](REVIEW-20261102.md) §6.
 1. P17: keep optimizing. The same-runner CI benchmark is 22.92/25.69 s
    (SMP1/SMP4), against 8/10 s targets; base was 30.52/36.23 s. Next
    candidates are in REVIEW §7.
-2. Extend boot lockstep past the first 3M instructions (checkpointed
-   windows) and add the 3M-step run to CI as a scheduled job.
+2. Extend boot lockstep past the first 10M instructions (checkpointed
+   windows) and add a 3M-step run to CI as a scheduled job.
 3. Resolve the RVA23 claim: implement Zama16b and H, or narrow the README.
 4. Add an ACT job to CI. The unprivileged suites now pass 833/833 locally.
 5. `linux_devices` now runs in CI (job `linux-devices`; the images build in
