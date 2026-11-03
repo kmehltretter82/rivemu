@@ -149,6 +149,9 @@ const BB_MAX_INSNS: usize = 32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BbOpKind {
     Seq,
+    /// A conditional branch: the block goes on after it, and a taken branch
+    /// leaves the block early.
+    Branch,
     Term,
     Abort,
 }
@@ -178,9 +181,8 @@ const fn bb_op_kind(op: Op) -> BbOpKind {
         | Op::SfenceWInval
         | Op::SfenceInvalIr
         | Op::CboInval => BbOpKind::Abort,
-        Op::Jal | Op::Jalr | Op::Beq | Op::Bne | Op::Blt | Op::Bge | Op::Bltu | Op::Bgeu => {
-            BbOpKind::Term
-        }
+        Op::Beq | Op::Bne | Op::Blt | Op::Bge | Op::Bltu | Op::Bgeu => BbOpKind::Branch,
+        Op::Jal | Op::Jalr => BbOpKind::Term,
         _ => BbOpKind::Seq,
     }
 }
@@ -259,17 +261,15 @@ fn bitmanip_value(op: Op, rs1: u64, rs2: u64, imm: u64) -> Option<u64> {
     })
 }
 
-/// The last value an inline instruction of a block wrote and its register
-/// (`rd` 32: none). With forwarding, the next instruction reads it from here
-/// instead of loading it back from `x`, which takes it off the store/load
-/// round trip through memory.
-#[derive(Clone, Copy)]
-struct Fwd {
-    rd: u8,
-    v: u64,
+/// What [`Hart::exec_inline`] did with an instruction.
+enum Inline {
+    /// Ran it; execution goes on at this PC, the next instruction.
+    Next(u64),
+    /// Ran a taken branch or a jump to this PC, which leaves the block.
+    Jump(u64),
+    /// Did nothing: the instruction needs `execute`.
+    Slow,
 }
-
-const NO_FWD: Fwd = Fwd { rd: 32, v: 0 };
 
 /// What a block's inline loads and stores use: the fast-TLB slot of the
 /// block's translation context with its epoch, and a view of guest RAM. All
@@ -542,10 +542,6 @@ pub struct Hart {
     /// Active `-d` flags (`0` when logging is disabled).
     pub(crate) log_flags: LogFlags,
     pub(crate) logger: Option<Arc<Logger>>,
-    /// Experiment: blocks forward the last inline result to the next
-    /// instruction instead of reading it back from `x`.
-    #[doc(hidden)]
-    pub block_forwarding: bool,
     /// Active debugger PC breakpoints.
     pub breakpoints: Vec<u64>,
     /// Active debugger data watchpoints: `(addr, len, kind)` where `kind` is `1` (read), `2` (write), `3` (access).
@@ -663,7 +659,6 @@ impl Hart {
             hpm_written_mask: 0,
             log_flags: LogFlags::default(),
             logger: None,
-            block_forwarding: std::env::var_os("RIVEMU_BLOCK_FWD").is_some(),
             breakpoints: Vec::new(),
             watchpoints: Vec::new(),
             hit_breakpoint: false,
@@ -954,6 +949,8 @@ impl Hart {
         if pc & 0xfff > 0xffc {
             return 0;
         }
+        // The fetch page cache holds only addresses the decode caches can tag
+        // (below 2^48), so a hit needs no check.
         let vpn_tag = (pc >> 12) + 1;
         let pa = if self.fetch_vpn == vpn_tag {
             self.fetch_pa_page | (pc & 0xfff)
@@ -961,13 +958,13 @@ impl Hart {
             let Ok(pa) = self.translate(bus, pc, Access::Fetch) else {
                 return 0;
             };
+            if pa >> 48 != 0 {
+                return 0;
+            }
             self.fetch_vpn = vpn_tag;
             self.fetch_pa_page = pa & !0xfff;
             pa
         };
-        if pa >> 48 != 0 {
-            return 0;
-        }
         let bb_idx = decode_cache_index(pa, BBCACHE_SIZE);
         let tag = (pa << 16) | u64::from(self.icache_gen);
         let old_tag = self.bbcache[bb_idx].tag;
@@ -1023,11 +1020,7 @@ impl Hart {
             let block_pc = self.pc;
             let start = self.bbcache[idx].start as usize;
             let limit = avail.min((max_insns - total) as usize);
-            let (done, completed) = if self.block_forwarding {
-                self.run_block::<true>(bus, &arena[start..start + limit], mem)
-            } else {
-                self.run_block::<false>(bus, &arena[start..start + limit], mem)
-            };
+            let (done, completed) = self.run_block(bus, &arena[start..start + limit], mem);
             total += done;
             if !completed || total >= max_insns {
                 if completed {
@@ -1044,7 +1037,8 @@ impl Hart {
             // Chain into the next block while it is already decoded: the
             // block-invariant state above (privilege, mstatus, the envcfg
             // CSRs) only changes through something that ends the chain.
-            match self.cached_block_at_pc(bus) {
+            let fetch_slot = mem.as_ref().map(|m| (m.slot, m.epoch_hi));
+            match self.cached_block_at_pc(bus, fetch_slot) {
                 Some(next) => (idx, avail) = next,
                 None => break,
             }
@@ -1063,24 +1057,42 @@ impl Hart {
     /// The decoded block at `self.pc` if the cache holds it for the current
     /// decode generation (no re-validation or decoding: the arena may be
     /// moved out of the hart while this runs), as `(index, length)`.
+    /// `fetch_slot` is the chain's fast-TLB slot and its epoch: a fetch from
+    /// another page looks there before it takes the full translation.
     #[inline(always)]
-    fn cached_block_at_pc(&mut self, bus: &AddressSpace) -> Option<(usize, usize)> {
+    fn cached_block_at_pc(
+        &mut self,
+        bus: &AddressSpace,
+        fetch_slot: Option<(usize, u64)>,
+    ) -> Option<(usize, usize)> {
+        // No block starts within the last 3 bytes of a page (`try_step_bb`
+        // decodes none there), so such a PC simply finds no block.
         let pc = self.pc;
-        if pc & 0xfff > 0xffc {
-            return None;
-        }
         let vpn_tag = (pc >> 12) + 1;
         let pa = if self.fetch_vpn == vpn_tag {
             self.fetch_pa_page | (pc & 0xfff)
         } else {
-            let pa = self.translate(bus, pc, Access::Fetch).ok()?;
+            let fast = fetch_slot.and_then(|(slot, epoch_hi)| {
+                let table = &self.tlb.fast.slots[slot % FAST_TLB_SLOTS].fetch;
+                FastTlbSlot::hit(table, epoch_hi, pc).map(|e| e.pa_page | (pc & 0xfff))
+            });
+            let pa = match fast {
+                Some(pa) => pa,
+                None => {
+                    let (pa, ram_off) = self.translate_with_ram_off(bus, pc, Access::Fetch).ok()?;
+                    if pa >> 48 != 0 {
+                        return None;
+                    }
+                    if fetch_slot.is_some() {
+                        self.fast_tlb_fill_fetch(pc, pa, ram_off);
+                    }
+                    pa
+                }
+            };
             self.fetch_vpn = vpn_tag;
             self.fetch_pa_page = pa & !0xfff;
             pa
         };
-        if pa >> 48 != 0 {
-            return None;
-        }
         let idx = decode_cache_index(pa, BBCACHE_SIZE);
         let entry = &self.bbcache[idx];
         (entry.tag == (pa << 16) | u64::from(self.icache_gen) && entry.len != 0)
@@ -1092,7 +1104,7 @@ impl Hart {
     /// whether all of `insns` ran without a trap, interrupt check, `wfi` or
     /// yield.
     #[inline(always)]
-    fn run_block<const FWD: bool>(
+    fn run_block(
         &mut self,
         bus: &AddressSpace,
         insns: &[Insn],
@@ -1103,7 +1115,6 @@ impl Hart {
         // store-to-load dependency through `self.pc` between consecutive
         // instructions.
         let mut pc = self.pc;
-        let mut fwd = NO_FWD;
         let mut i = 0;
         while i < insns.len() {
             let insn = &insns[i];
@@ -1115,11 +1126,19 @@ impl Hart {
             // with landing pads disabled and `elp` clear (see `run`), and
             // nothing in a block sets `elp`.
             debug_assert!(!self.elp);
-            if let Some(next) = self.exec_inline::<FWD>(bus, insn, mem, pc, &mut fwd) {
-                pc = next;
-                continue;
+            match self.exec_inline(bus, insn, mem, pc) {
+                Inline::Next(next) => {
+                    pc = next;
+                    continue;
+                }
+                Inline::Jump(target) => {
+                    // Blocks go on past conditional branches: a taken one
+                    // ends the block here (`try_step_bb` counts it).
+                    self.pc = target;
+                    return (i as u64, true);
+                }
+                Inline::Slow => {}
             }
-            fwd = NO_FWD;
             self.pc = pc;
             match self.execute(bus, insn) {
                 Ok(()) => {
@@ -1157,25 +1176,16 @@ impl Hart {
     /// arm of [`Self::execute`]; returns `false` (and does nothing) for
     /// every other instruction. One `match` dispatches both kinds.
     #[inline(always)]
-    fn exec_inline<const FWD: bool>(
+    fn exec_inline(
         &mut self,
         bus: &AddressSpace,
         insn: &Insn,
         mem: Option<FastMem<'_>>,
         pc: u64,
-        fwd: &mut Fwd,
-    ) -> Option<u64> {
+    ) -> Inline {
         let next = pc.wrapping_add(u64::from(insn.len));
-        let rs1 = if FWD && insn.rs1 == fwd.rd {
-            fwd.v
-        } else {
-            self.x[usize::from(insn.rs1 & 31)]
-        };
-        let rs2 = if FWD && insn.rs2 == fwd.rd {
-            fwd.v
-        } else {
-            self.x[usize::from(insn.rs2 & 31)]
-        };
+        let rs1 = self.x[usize::from(insn.rs1 & 31)];
+        let rs2 = self.x[usize::from(insn.rs2 & 31)];
         let imm = insn.imm as u64;
         let rd = insn.rd;
         let v = match insn.op {
@@ -1258,87 +1268,81 @@ impl Hart {
                     Op::Bltu => rs1 < rs2,
                     _ => rs1 >= rs2,
                 };
-                return Some(if taken { pc.wrapping_add(imm) } else { next });
+                return if taken {
+                    Inline::Jump(pc.wrapping_add(imm))
+                } else {
+                    Inline::Next(next)
+                };
             }
             Op::Jal => {
                 self.set_x(rd, next);
-                if FWD {
-                    *fwd = NO_FWD;
-                }
-                return Some(pc.wrapping_add(imm));
+                return Inline::Jump(pc.wrapping_add(imm));
             }
             // Blocks run only with landing pads disabled (see `run`), so
             // Jalr never sets `elp` here.
             Op::Jalr => {
                 self.set_x(rd, next);
-                if FWD {
-                    *fwd = NO_FWD;
-                }
-                return Some(rs1.wrapping_add(imm) & !1);
+                return Inline::Jump(rs1.wrapping_add(imm) & !1);
             }
             // One arm per opcode, so that each inlined access has a
             // constant size.
             Op::Ld => {
-                let ok =
-                    self.exec_load_inline::<FWD>(insn, mem, rs1, fwd, AccessSize::Double, |v| v);
-                return ok.then_some(next);
+                let ok = self.exec_load_inline(insn, mem, rs1, AccessSize::Double, |v| v);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
             }
             Op::Lw => {
-                let ok = self.exec_load_inline::<FWD>(insn, mem, rs1, fwd, AccessSize::Word, |v| {
-                    v as i32 as u64
-                });
-                return ok.then_some(next);
+                let ok =
+                    self.exec_load_inline(insn, mem, rs1, AccessSize::Word, |v| v as i32 as u64);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
             }
             Op::Lwu => {
-                let ok = self.exec_load_inline::<FWD>(insn, mem, rs1, fwd, AccessSize::Word, |v| v);
-                return ok.then_some(next);
+                let ok = self.exec_load_inline(insn, mem, rs1, AccessSize::Word, |v| v);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
             }
             Op::Lbu => {
-                let ok = self.exec_load_inline::<FWD>(insn, mem, rs1, fwd, AccessSize::Byte, |v| v);
-                return ok.then_some(next);
+                let ok = self.exec_load_inline(insn, mem, rs1, AccessSize::Byte, |v| v);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
             }
             Op::Lb => {
-                let ok = self.exec_load_inline::<FWD>(insn, mem, rs1, fwd, AccessSize::Byte, |v| {
-                    v as i8 as u64
-                });
-                return ok.then_some(next);
+                let ok =
+                    self.exec_load_inline(insn, mem, rs1, AccessSize::Byte, |v| v as i8 as u64);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
             }
             Op::Lhu => {
-                let ok = self.exec_load_inline::<FWD>(insn, mem, rs1, fwd, AccessSize::Half, |v| v);
-                return ok.then_some(next);
+                let ok = self.exec_load_inline(insn, mem, rs1, AccessSize::Half, |v| v);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
             }
             Op::Lh => {
-                let ok = self.exec_load_inline::<FWD>(insn, mem, rs1, fwd, AccessSize::Half, |v| {
-                    v as i16 as u64
-                });
-                return ok.then_some(next);
+                let ok =
+                    self.exec_load_inline(insn, mem, rs1, AccessSize::Half, |v| v as i16 as u64);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
             }
             Op::Sd => {
                 let ok = self.exec_store_inline(bus, insn, mem, rs1, rs2, AccessSize::Double);
-                return ok.then_some(next);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
             }
             Op::Sw => {
                 let ok = self.exec_store_inline(bus, insn, mem, rs1, rs2, AccessSize::Word);
-                return ok.then_some(next);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
             }
             Op::Sb => {
                 let ok = self.exec_store_inline(bus, insn, mem, rs1, rs2, AccessSize::Byte);
-                return ok.then_some(next);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
             }
             Op::Sh => {
                 let ok = self.exec_store_inline(bus, insn, mem, rs1, rs2, AccessSize::Half);
-                return ok.then_some(next);
+                return if ok { Inline::Next(next) } else { Inline::Slow };
             }
-            Op::Nop => return Some(next),
-            _ => bitmanip_value(insn.op, rs1, rs2, imm)?,
+            Op::Nop => return Inline::Next(next),
+            _ => match bitmanip_value(insn.op, rs1, rs2, imm) {
+                Some(v) => v,
+                None => return Inline::Slow,
+            },
         };
         // Blocks store operations that write x0 as `Nop` (`block_insn`).
         debug_assert!(rd != 0);
         self.x[usize::from(rd & 31)] = v;
-        if FWD {
-            *fwd = Fwd { rd, v };
-        }
-        Some(next)
+        Inline::Next(next)
     }
 
     /// An integer load in a block that stays within one page and hits the
@@ -1348,12 +1352,11 @@ impl Hart {
     /// inline: no pointer masking and no strict alignment. Blocks never run
     /// with triggers, watchpoints or logging.
     #[inline(always)]
-    fn exec_load_inline<const FWD: bool>(
+    fn exec_load_inline(
         &mut self,
         insn: &Insn,
         mem: Option<FastMem<'_>>,
         rs1: u64,
-        fwd: &mut Fwd,
         size: AccessSize,
         ext: impl Fn(u64) -> u64,
     ) -> bool {
@@ -1370,15 +1373,7 @@ impl Hart {
         let Some(v) = m.ram.read_aligned(e.ram_page_off | (va & 0xfff), size) else {
             return false;
         };
-        let v = ext(v);
-        self.set_x(insn.rd, v);
-        if FWD {
-            *fwd = if insn.rd != 0 {
-                Fwd { rd: insn.rd, v }
-            } else {
-                NO_FWD
-            };
-        }
+        self.set_x(insn.rd, ext(v));
         true
     }
 
@@ -1476,6 +1471,12 @@ impl Hart {
                     self.bb_arena.push(insn);
                     break;
                 }
+                BbOpKind::Branch => {
+                    self.bb_arena.push(insn);
+                    let step_len = u64::from(insn.len);
+                    cur_pc = cur_pc.wrapping_add(step_len);
+                    cur_pa = cur_pa.wrapping_add(step_len);
+                }
                 BbOpKind::Seq => {
                     self.bb_arena.push(block_insn(insn));
                     let step_len = u64::from(insn.len);
@@ -1506,13 +1507,13 @@ impl Hart {
             let Ok(pa) = self.translate(bus, pc, Access::Fetch) else {
                 return false;
             };
+            if pa >> 48 != 0 {
+                return false;
+            }
             self.fetch_vpn = vpn_tag;
             self.fetch_pa_page = pa & !0xfff;
             pa
         };
-        if pa >> 48 != 0 {
-            return false;
-        }
         let idx = decode_cache_index(pa, ICACHE_SIZE);
         let tag = (pa << 16) | u64::from(self.icache_gen);
         let fused = if self.icache[idx].tag == tag {
@@ -2093,8 +2094,10 @@ impl Hart {
                 self.fetch_pa_page | (pc & 0xfff)
             } else {
                 let pa = self.translate(bus, pc, Access::Fetch)?;
-                self.fetch_vpn = vpn_tag;
-                self.fetch_pa_page = pa & !0xfff;
+                if pa >> 48 == 0 {
+                    self.fetch_vpn = vpn_tag;
+                    self.fetch_pa_page = pa & !0xfff;
+                }
                 pa
             };
             if pa >> 48 == 0 {

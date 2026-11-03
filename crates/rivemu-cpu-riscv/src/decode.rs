@@ -9,7 +9,8 @@ use crate::rvc;
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
-    Illegal,
+    // The operations `Hart::exec_inline` runs come first, from 0, so that its
+    // jump table needs no offset.
     /// No effect. Never decoded: the block cache stores an integer operation
     /// that writes x0 (a hint) as `Nop`, so that its fast path can write
     /// `rd` without testing for x0.
@@ -82,6 +83,7 @@ pub enum Op {
     Divuw,
     Remw,
     Remuw,
+    Illegal,
     // A / Zacas / Zabha / Zalasr (`imm` holds funct3 width 0..=4; `funct` holds funct5)
     Lr,
     Sc,

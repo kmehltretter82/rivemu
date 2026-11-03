@@ -3828,6 +3828,73 @@ fn block_x0_hints_self_loops_and_misaligned_accesses_match_single_stepping() {
     }
 }
 
+/// Blocks go on past conditional branches, and a taken branch leaves the
+/// block early. A loop whose blocks contain branches taken 1 in 4 and 3 in
+/// 8 times, with loads and stores after them, must end exactly as
+/// single-stepping does, for any slice budget (which cuts blocks at odd
+/// points).
+#[test]
+fn blocks_with_inner_branches_match_single_stepping() {
+    const CODE: u64 = 0x8000_0000;
+    const DATA: u64 = 0x8001_0000;
+    const PROGRAM: &[u32] = &[
+        0xfff6_0613, // loop:  addi a2, a2, -1
+        0x0036_7293, //        andi t0, a2, 3
+        0x0002_8a63, //        beqz t0, skip
+        0x0017_0713, //        addi a4, a4, 1
+        0x00e5_3023, //        sd   a4, 0(a0)
+        0x0005_3783, //        ld   a5, 0(a0)
+        0x00f8_0833, //        add  a6, a6, a5
+        0x0076_7313, // skip:  andi t1, a2, 7
+        0x00d3_6a63, //        bltu t1, a3, other
+        0x00c8_c8b3, //        xor  a7, a7, a2
+        0x0115_2423, //        sw   a7, 8(a0)
+        0x0085_6383, //        lwu  t2, 8(a0)
+        0x0078_0833, //        add  a6, a6, t2
+        0x0026_1e13, // other: slli t3, a2, 2
+        0xfc06_14e3, //        bnez a2, loop
+        0x1050_0073, //        wfi
+    ];
+    let setup = || {
+        let mut bus = AddressSpace::new();
+        bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+            .unwrap();
+        for (i, &w) in PROGRAM.iter().enumerate() {
+            bus.write(CODE + 4 * i as u64, AccessSize::Word, u64::from(w))
+                .unwrap();
+        }
+        let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+        h.reset(CODE);
+        h.x[10] = DATA;
+        h.x[12] = 1000;
+        h.x[13] = 3;
+        (bus, h)
+    };
+    let (step_bus, mut stepped) = setup();
+    while !stepped.wfi && stepped.instret() < 100_000 {
+        stepped.step(&step_bus);
+    }
+    assert!(stepped.wfi);
+    for budget in [2, 3, 5, 7, 11, 100_000] {
+        let (bus, mut h) = setup();
+        let mut attempted = 0;
+        while !h.wfi && attempted < 100_000 {
+            attempted += h.run(&bus, budget);
+        }
+        assert!(h.wfi, "budget {budget}");
+        assert_eq!(h.instret(), stepped.instret(), "budget {budget}");
+        assert_eq!(h.pc, stepped.pc, "budget {budget}");
+        assert_eq!(h.x, stepped.x, "budget {budget}");
+        for off in [0, 8] {
+            assert_eq!(
+                bus.read(DATA + off, AccessSize::Double).unwrap(),
+                step_bus.read(DATA + off, AccessSize::Double).unwrap(),
+                "budget {budget}"
+            );
+        }
+    }
+}
+
 /// More distinct blocks than the block arena holds: the arena is cleared
 /// once it is full, and every block must still run (twice, so the second
 /// pass also runs blocks decoded after the clear).
@@ -3928,4 +3995,117 @@ fn block_m_extension_matches_single_stepping() {
             assert_eq!(block[19], 0, "rem overflow");
         }
     }
+}
+
+/// Blocks chain into a block on another page through the fast TLB's fetch
+/// table. After a switch to another address space (another ASID), after a
+/// remap with `sfence.vma`, and from another privilege mode, the chain must
+/// see the new translation, not the cached one.
+#[test]
+fn block_chains_across_pages_follow_remaps_and_privilege() {
+    use rivemu_cpu_riscv::{Priv, cause, csr};
+
+    const CODE: u64 = 0x8000_0000; // VA = PA (gigapage 2), S-only RWX
+    const MTVEC: u64 = 0x8000_0800;
+    const OLD: u64 = CODE + 0x1000; // addi a0, a0, 7
+    const NEW: u64 = CODE + 0x2000; // addi a0, a0, 9
+    const TARGET_VA: u64 = 0x4000_1000; // a 4 KiB page -> OLD or NEW
+    const U_CODE_VA: u64 = 0x0; // gigapage 0 -> CODE, U|RX
+    // Two address spaces: root, level-1 and level-0 tables.
+    const A: [u64; 3] = [0x8002_0000, 0x8002_1000, 0x8002_2000];
+    const B: [u64; 3] = [0x8003_0000, 0x8003_1000, 0x8003_2000];
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    let w = |bus: &AddressSpace, pa: u64, insn: u32| {
+        bus.write(pa, AccessSize::Word, u64::from(insn)).unwrap();
+    };
+    // CODE: li a0, 0; jalr x0, 0(t0). At CODE + 0x40: sfence.vma; wfi.
+    w(&bus, CODE, 0x0000_0513);
+    w(&bus, CODE + 4, 0x0002_8067);
+    w(&bus, CODE + 0x40, 0x1200_0073);
+    w(&bus, CODE + 0x44, 0x1050_0073);
+    w(&bus, MTVEC, 0x1050_0073); // the trap handler: wfi
+    for (base, add) in [(OLD, 7u32), (NEW, 9u32)] {
+        w(&bus, base, 0x0005_0513 | (add << 20));
+        w(&bus, base + 4, 0x1050_0073); // wfi
+    }
+    let pte = |pa: u64, flags: u64| ((pa >> 12) << 10) | flags;
+    let dw = |bus: &AddressSpace, pa: u64, v: u64| {
+        bus.write(pa, AccessSize::Double, v).unwrap();
+    };
+    for t in [A, B] {
+        dw(&bus, t[0] + 2 * 8, pte(CODE, 0xcf)); // D|A|X|W|R|V
+        dw(&bus, t[0], pte(CODE, 0x5b)); // A|U|X|R|V
+        dw(&bus, t[0] + 8, pte(t[1], 1)); // VA 0x4000_0000: next level
+        dw(&bus, t[1], pte(t[2], 1));
+    }
+    let map_target = |bus: &AddressSpace, t: [u64; 3], pa: u64| {
+        dw(bus, t[2] + 8, pte(pa, 0x4b)); // A|X|R|V
+    };
+    map_target(&bus, A, OLD);
+    map_target(&bus, B, NEW);
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mtvec = MTVEC;
+    let satp = |t: [u64; 3], asid: u64| (8u64 << 60) | (asid << 44) | (t[0] >> 12);
+    let set_satp = |h: &mut Hart, v: u64| {
+        h.prv = Priv::Machine;
+        h.csr_write(csr::SATP, v).unwrap();
+    };
+    let run_to_wfi = |h: &mut Hart, prv: Priv, pc: u64| {
+        h.prv = prv;
+        h.pc = pc;
+        h.wfi = false;
+        h.x[5] = TARGET_VA;
+        let mut n = 0;
+        while !h.wfi && n < 100 {
+            n += h.run(&bus, 100);
+        }
+    };
+    // Several passes each: the first decodes both blocks, later ones chain
+    // through the fetch table (filled, then hit).
+    let expect = |h: &mut Hart, a0: u64, what: &str| {
+        for _ in 0..4 {
+            run_to_wfi(h, Priv::Supervisor, CODE);
+            assert!(h.wfi && h.prv == Priv::Supervisor, "{what}");
+            assert_eq!(h.x[10], a0, "{what}");
+        }
+    };
+    // U-mode runs the same code through gigapage 0 and jumps to the S-only
+    // target page: an instruction page fault. The first runs also give
+    // U-mode a fast-TLB slot of its own, live while S-mode fills its table
+    // below (twice: the slot's context includes mstatus.MPP, which the first
+    // trap changes).
+    let u_faults = |h: &mut Hart, what: &str| {
+        run_to_wfi(h, Priv::User, U_CODE_VA);
+        assert_eq!(h.prv, Priv::Machine, "{what}");
+        assert_eq!(h.x[10], 0, "{what}: U-mode ran the S-only page");
+        assert_eq!(
+            h.csr_read(csr::MCAUSE),
+            Some(cause::INSN_PAGE_FAULT),
+            "{what}"
+        );
+        assert_eq!(h.csr_read(csr::MTVAL), Some(TARGET_VA), "{what}");
+    };
+
+    set_satp(&mut h, satp(A, 1));
+    u_faults(&mut h, "U-mode before S-mode ran");
+    u_faults(&mut h, "U-mode again before S-mode ran");
+    expect(&mut h, 7, "address space A");
+    set_satp(&mut h, satp(B, 2));
+    expect(&mut h, 9, "switched to address space B");
+    set_satp(&mut h, satp(A, 1));
+    expect(&mut h, 7, "back to address space A");
+
+    // Remap A's target page and flush with sfence.vma.
+    map_target(&bus, A, NEW);
+    run_to_wfi(&mut h, Priv::Supervisor, CODE + 0x40);
+    assert!(h.wfi, "sfence.vma; wfi");
+    expect(&mut h, 9, "remapped and flushed with sfence.vma");
+
+    // S-mode filled the fetch table for the target page; U-mode still
+    // faults.
+    u_faults(&mut h, "U-mode after S-mode ran");
 }

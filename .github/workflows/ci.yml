@@ -175,16 +175,13 @@ jobs:
           echo "### P17 on ${{ matrix.os }} ($(uname -m))" >> "$GITHUB_STEP_SUMMARY"
           tail -6 p17-compare.txt >> "$GITHUB_STEP_SUMMARY"
 
-  p17-variants:
-    # A/B of run-time interpreter variants on one runner: the P17 boot
-    # (SMP1) and toolchain-free microbenchmarks, each variant selected by an
-    # environment variable on the same binaries. Informational.
+  p17-callgrind:
+    # Host instructions of the P17 Debian boot under callgrind with
+    # -icount shift=3: the same guest work on every run, so the total and
+    # the hottest lines compare across commits without runner noise.
+    # Informational.
     if: github.event_name == 'pull_request'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -195,14 +192,8 @@ jobs:
           path: images/linux-test
           key: linux-test-${{ runner.os }}-${{ hashFiles('scripts/fetch-linux-test.sh') }}
       - run: scripts/fetch-linux-test.sh
-      - run: cargo build --release -p rivemu-cli
-      - run: python3 scripts/interp-microbench.py target/release/rivemu-system-riscv64 3 base= fwd=RIVEMU_BLOCK_FWD=1
-      - run: scripts/p17-ab.sh 3 base= fwd=RIVEMU_BLOCK_FWD=1
-      - name: Host profile of the P17 boot (callgrind, deterministic -icount)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get install -y -q valgrind > /dev/null
-          scripts/p17-callgrind.sh cg.out
+      - run: sudo apt-get install -y -q valgrind > /dev/null
+      - run: scripts/p17-callgrind.sh cg.out
 
   msrv:
     name: msrv (1.85)

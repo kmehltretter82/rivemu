@@ -5,7 +5,7 @@
 # runner. Prints the median and p95 per variant and hart count.
 #
 # Usage: scripts/p17-ab.sh <rounds> <label>=[VAR=value,...] [...]
-# e.g.   scripts/p17-ab.sh 3 base= fwd=RIVEMU_BLOCK_FWD=1
+# e.g.   scripts/p17-ab.sh 3 base= variant=RIVEMU_SOME_SWITCH=1
 # Hart counts: RIVEMU_LINUX_PERF_SMPS (default 1). Needs images/linux-test.
 set -euo pipefail
 

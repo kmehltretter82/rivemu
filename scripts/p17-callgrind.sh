@@ -28,4 +28,4 @@ callgrind_annotate --auto=yes --show-percs=no "$OUT" 2>/dev/null \
     | awk '/^-- Auto-annotated source: / { file = $NF }
            $1 ~ /^[0-9,]+$/ && file != "" && !/=>|events annotated|<counts for/ {
                n = $1; gsub(",", "", n); if (n + 0 > 0) print n, file ":" $0 }' \
-    | sort -rn | head -60 | cut -c1-200
+    | sort -rn | head -60 | cut -c1-200 || true

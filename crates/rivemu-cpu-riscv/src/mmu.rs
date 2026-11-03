@@ -196,6 +196,9 @@ pub(crate) struct FastTlbSlot {
     pub(crate) epoch_hi: u64,
     pub(crate) load: Box<[FastTlbEntry; FAST_TLB_SIZE]>,
     pub(crate) store: Box<[FastTlbEntry; FAST_TLB_SIZE]>,
+    /// Instruction fetches: blocks chain through it when the next block is
+    /// on another page.
+    pub(crate) fetch: Box<[FastTlbEntry; FAST_TLB_SIZE]>,
 }
 
 impl Default for FastTlbSlot {
@@ -205,6 +208,7 @@ impl Default for FastTlbSlot {
             epoch_hi: 1 << FAST_EPOCH_SHIFT,
             load: Box::new([FastTlbEntry::default(); FAST_TLB_SIZE]),
             store: Box::new([FastTlbEntry::default(); FAST_TLB_SIZE]),
+            fetch: Box::new([FastTlbEntry::default(); FAST_TLB_SIZE]),
         }
     }
 }
@@ -217,6 +221,7 @@ impl FastTlbSlot {
         if next >= 1 << (64 - FAST_EPOCH_SHIFT) {
             self.load.fill(FastTlbEntry::default());
             self.store.fill(FastTlbEntry::default());
+            self.fetch.fill(FastTlbEntry::default());
             self.epoch_hi = 1 << FAST_EPOCH_SHIFT;
         } else {
             self.epoch_hi = next << FAST_EPOCH_SHIFT;
@@ -730,6 +735,18 @@ impl Hart {
     /// (which set the page's dirty bit).
     #[inline]
     pub(crate) fn fast_tlb_fill(&mut self, va: u64, pa: u64, ram_off: u64, store: bool) {
+        self.fast_tlb_fill_table(va, pa, ram_off, if store { 1 } else { 0 });
+    }
+
+    /// Records an instruction-fetch translation that the full path allowed
+    /// (see [`Self::fast_tlb_fill`]). The slot's context includes the
+    /// privilege mode, which is all a fetch translation depends on besides
+    /// what invalidates every slot.
+    pub(crate) fn fast_tlb_fill_fetch(&mut self, va: u64, pa: u64, ram_off: u64) {
+        self.fast_tlb_fill_table(va, pa, ram_off, 2);
+    }
+
+    fn fast_tlb_fill_table(&mut self, va: u64, pa: u64, ram_off: u64, table: u8) {
         if ram_off == u64::MAX || self.pmp_subpage {
             return;
         }
@@ -742,10 +759,10 @@ impl Hart {
             ram_page_off: ram_off & !0xfff,
         };
         let idx = ((va >> 12) as usize) & (FAST_TLB_SIZE - 1);
-        if store {
-            slot.store[idx] = e;
-        } else {
-            slot.load[idx] = e;
+        match table {
+            0 => slot.load[idx] = e,
+            1 => slot.store[idx] = e,
+            _ => slot.fetch[idx] = e,
         }
     }
 
