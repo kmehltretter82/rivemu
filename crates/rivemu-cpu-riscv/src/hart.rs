@@ -733,8 +733,6 @@ impl Hart {
         if avail == 0 {
             return 0;
         }
-        let limit = avail.min(max_insns as usize);
-        let start = self.bbcache[bb_idx].start as usize;
         // Everything the inline load/store path depends on besides the fast
         // TLB itself is constant within a block: the privilege mode,
         // mstatus, senvcfg and the pointer-masking CSRs change only through
@@ -749,19 +747,70 @@ impl Hart {
         // instructions end a block (`BbOpKind::Abort`).
         let arena = std::mem::take(&mut self.bb_arena);
         let gen_before = self.icache_gen;
-        let done = self.run_block(bus, &arena[start..start + limit], mem_ctx);
+        let mut total = 0u64;
+        let (mut idx, mut avail) = (bb_idx, avail);
+        loop {
+            let start = self.bbcache[idx].start as usize;
+            let limit = avail.min((max_insns - total) as usize);
+            let (done, completed) = self.run_block(bus, &arena[start..start + limit], mem_ctx);
+            total += done;
+            if !completed || total >= max_insns {
+                break;
+            }
+            // Chain into the next block while it is already decoded: the
+            // block-invariant state above (privilege, mstatus, the envcfg
+            // CSRs) only changes through something that ends the chain.
+            match self.cached_block_at_pc(bus) {
+                Some(next) => (idx, avail) = next,
+                None => break,
+            }
+        }
         debug_assert_eq!(
             self.icache_gen, gen_before,
             "a block flushed the decode caches"
         );
         self.bb_arena = arena;
-        done
+        total
+    }
+
+    /// The decoded block at `self.pc` if the cache holds it for the current
+    /// decode generation (no re-validation or decoding: the arena may be
+    /// moved out of the hart while this runs), as `(index, length)`.
+    #[inline(always)]
+    fn cached_block_at_pc(&mut self, bus: &AddressSpace) -> Option<(usize, usize)> {
+        let pc = self.pc;
+        if pc & 0xfff > 0xffc {
+            return None;
+        }
+        let vpn_tag = (pc >> 12) + 1;
+        let pa = if self.fetch_vpn == vpn_tag {
+            self.fetch_pa_page | (pc & 0xfff)
+        } else {
+            let pa = self.translate(bus, pc, Access::Fetch).ok()?;
+            self.fetch_vpn = vpn_tag;
+            self.fetch_pa_page = pa & !0xfff;
+            pa
+        };
+        if pa >> 48 != 0 {
+            return None;
+        }
+        let idx = decode_cache_index(pa, BBCACHE_SIZE);
+        let entry = &self.bbcache[idx];
+        (entry.tag == (pa << 16) | u64::from(self.icache_gen) && entry.len != 0)
+            .then_some((idx, usize::from(entry.len)))
     }
 
     /// Runs the decoded instructions of one block (see [`Self::try_step_bb`])
-    /// and returns the number attempted, including one that trapped.
+    /// and returns the number attempted, including one that trapped, and
+    /// whether all of `insns` ran without a trap, interrupt check, `wfi` or
+    /// yield.
     #[inline(always)]
-    fn run_block(&mut self, bus: &AddressSpace, insns: &[Insn], mem_ctx: Option<u64>) -> u64 {
+    fn run_block(
+        &mut self,
+        bus: &AddressSpace,
+        insns: &[Insn],
+        mem_ctx: Option<u64>,
+    ) -> (u64, bool) {
         // The PC stays in a local while inline instructions run and is
         // written back before anything that reads it. This removes a
         // store-to-load dependency through `self.pc` between consecutive
@@ -789,7 +838,7 @@ impl Hart {
                         if self.check_irq {
                             self.take_pending_interrupt();
                         }
-                        return done;
+                        return (done, false);
                     }
                 }
                 Err(e) => {
@@ -801,14 +850,14 @@ impl Hart {
                     self.cycle_written = false;
                     self.hpm_written_mask = 0;
                     self.trap(e.cause, false, e.tval);
-                    return retired + 1;
+                    return (retired + 1, false);
                 }
             }
         }
         self.pc = pc;
         let done = insns.len() as u64;
         self.bump_counters(done);
-        done
+        (done, true)
     }
 
     /// Executes `insn` if it is one of the simple integer instructions, or
