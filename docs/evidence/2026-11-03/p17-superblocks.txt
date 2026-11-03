@@ -76,3 +76,16 @@
 #    Round 1 on macOS was slow for both builds (base SMP1 up to 34.5 s
 #    against 24 to 25 s in rounds 2 and 3); the SMP4 p95 above 10 s is those
 #    three samples.
+#
+# 6. CI run 41640005441 (4bbacc7: 21acfa8 plus documentation only), a second
+#    macos-latest runner:
+#      head SMP1 median 6.940 s, p95 10.527; samples 7.867 9.089 10.527 /
+#        5.668 6.940 7.021 / 5.413 5.799 5.739
+#      head SMP4 median 6.593 s, p95 9.376; samples 9.376 7.573 7.924 /
+#        6.018 6.339 6.593 / 6.317 6.354 7.175
+#      base SMP1 22.045 s (round 1: 24.425 21.757 29.285), SMP4 25.250 s
+#      head/base 0.315 / 0.261
+#    Again round 1 was slow for both builds. Over both runs: 16 of 18 SMP1
+#    samples under 8 s (the two others in round 1 of this run), 15 of 18 SMP4
+#    samples under 10 s (the three others in round 1 of 41636562098);
+#    medians 6.22 / 7.03 s and 6.94 / 6.59 s.
