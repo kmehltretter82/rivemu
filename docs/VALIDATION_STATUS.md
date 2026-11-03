@@ -22,6 +22,8 @@ overlap. Findings, causes and fixes are in
 | P27–P32 per-suite differential campaigns | `rivemu-lockstep/docs/evidence/2026-11-02-campaigns/summary.txt` | 18 suites × {QEMU 11.1.3 `--step-check`, Sail 0.16}: 36/36 PASS. |
 | Expanded `Suite::Vector` (random LMUL/SEW/mask, segments, indexed, reserved encodings) | `rivemu-lockstep` `3c57b83` | 256 blocks pass against Sail and QEMU after three RVV fixes. |
 | Boot lockstep P16/P26 (OpenSBI v1.7 + Linux 6.12 vs QEMU 11.1.3) | `rivemu-lockstep/docs/evidence/2026-11-02-boot-lockstep/run13-pass-30M-steps.log` | **30,000,000 instructions, 0 divergences** with `--check-csrs` (3M in run 10, 10M in run 12). Each earlier run stopped at a harness configuration difference or a rivemu bug (semihosting, `mstateen` reset); all are fixed. |
+| Trace-driven boot lockstep to the shell prompt | `rivemu-lockstep/docs/evidence/2026-11-03-boot-trace/` | OpenSBI + Linux 6.12 + BusyBox from the firmware entry to `~ # `: 3/3 runs, 358.6–362.8 M instructions each, 0 divergences; CI job `boot-trace` in rivemu-lockstep. |
+| P17 on Apple Silicon | `evidence/2026-11-03/p17-ci-apple-silicon.txt` | CI `p17-bench (macos-latest)`, `eabd681`: 7.15 s SMP1 / 7.56 s SMP4 medians (targets 8 / 10 s); base 18.75 / 20.67 s. |
 | Sail multi-worker startup | `rivemu-lockstep/docs/evidence/2026-11-02-sail-startup/` | 25/25 clean 6-worker campaigns without the startup lock (was 17/24). |
 | CI hygiene | GitHub Actions on both PRs | `cargo fmt --check`, `clippy -D warnings`, MSRV 1.85, and `cargo deny` (rivemu) pass. rivemu-lockstep now has CI, including the differential suites. |
 
@@ -84,10 +86,10 @@ built-in-SBI Linux test both pass with the fix.
 | P19 NVMe, vsock, Snapshot v2 exits | Verified 2026-11-02, except disk state | `linux_devices`: Linux reads and writes NVMe, connects `AF_VSOCK` to CID 2, and NVMe and virtio-pci keep working after save/restore into a fresh machine. Snapshots do not contain disk contents, so no QCOW2 restore is claimed. |
 | Poweroff and reboot | Verified 2026-11-02 | `linux_devices`: `reboot -f` reaches `PowerEvent::Reset`, twice. |
 | SMP4 stability | Partial | The functional SMP4 boots pass and the isolated P17 campaign completed 20/20 SMP4 shell boots, but there is no repeated full device-smoke campaign. |
-| P17 `< 8 s` single-hart / `< 10 s` SMP4 | Failed (27–33% faster since 2026-11-02) | The P17 fixture (`tests/linux_perf.rs`: Debian inputs, `Machine::new()` to the first `~ # `) runs in CI for the PR head and its base on the same runner (job `p17-bench`). Latest (`b14129f`, `evidence/2026-11-02/p17-ci-same-runner-2.txt`): head 26.33 s (SMP1) / 29.70 s (SMP4) vs base 36.15 / 44.40 s on the same runner. The first comparison (`p17-ci-same-runner.txt`, faster runner) gave 22.92 / 25.69 s vs 30.52 / 36.23 s. The earlier M-series campaign measured 18.905/21.103 s on the base. The targets are still missed on GitHub runners. A from-source boot to poweroff on a 4-vCPU container takes 6.72 s (SMP1) (`evidence/2026-11-02/boot-bench-interpreter-2.txt`). |
+| P17 `< 8 s` single-hart / `< 10 s` SMP4 | **Met on Apple Silicon** (medians), 2026-11-03 | `docs/PLAN.md` defines the target on Apple Silicon. CI job `p17-bench (macos-latest)` (GitHub's M1-class arm64 runner) runs the P17 fixture (`tests/linux_perf.rs`: Debian inputs, `Machine::new()` to the first `~ # `) for the PR head and its base on the same runner, 9 samples each. `eabd681`: **7.15 s** (p95 7.39) SMP1, **7.56 s** (p95 8.13) SMP4, against base 18.75 / 20.67 s. `7860b3a`, on a slower runner (base 21.24 / 25.21 s): 7.94 s (p95 8.73) / 7.61 s (p95 9.35). Earlier rounds and the Ubuntu runner, where the targets are still missed (17.35 / 18.51 s at `a84d83b`), are in `evidence/2026-11-03/p17-ci-apple-silicon.txt`. |
 | `riscv-arch-test` privileged subset | Verified 2026-11-02 | 418/418 (`tests/arch-test/README.md`). |
 | Guest PMU/perf | Verified 2026-11-02 (counting) | `linux_devices`: `riscv-pmu-sbi` probes 16 firmware and 31 hardware counters, and `perf_event_open` counts instructions. PMU overflow interrupts are not asserted. |
-| Boot lockstep P16/P26 | Partial (first 30M instructions), 2026-11-02 | 30,000,000 instructions of OpenSBI + early Linux with 0 divergences against QEMU 11.1.3. A boot to the shell is about 10⁹ instructions and needs checkpointed windows. |
+| Boot lockstep P16/P26 | **Verified to the shell prompt**, 2026-11-03 | `rivemu-lockstep boot-trace` (QEMU at full speed with a trace plugin; rivemu checks every instruction, mirrors QEMU's interrupts, and takes QEMU's results for device-dependent reads): OpenSBI v1.7 + Linux 6.12 + BusyBox from the firmware entry to `~ # `, three runs of 358.6 M to 362.8 M instructions with 12,129 to 13,077 interrupts, **0 divergences** (`rivemu-lockstep/docs/evidence/2026-11-03-boot-trace/`). An injected `sraiw` bug is caught after 18.2 M instructions. The GDB-stepped `boot` mode reached 30,000,000 instructions with `--check-csrs` on 2026-11-02. Limits: one hart; rivemu runs through `Hart::step`, so the block and inline fast paths are covered by the equivalence tests, riscv-arch-test and the Linux E2E tests instead. |
 | P27-P32 Sail/QEMU differential claims | Verified per suite 2026-11-02 | All 18 suites pass against Sail and against QEMU with `--step-check`. The Vector suite needed rework first; it had ignored its RNG. |
 | Benchmarks | Partial | The repeated exact-boundary P17 boot benchmark is retained. No CoreMark, Dhrystone, or criterion history was found. |
 | CI hygiene | Partial | `git diff --check` passes, and the changed lockstep Sail file passes targeted `rustfmt --check`. Repo-wide formatting checks fail on broad existing drift, while `clippy -D warnings` stops on five untouched `qemu_rust` vector warnings and three unchanged lockstep QEMU-test warnings. `cargo-deny` is not installed. No broad unrelated rewrite was made. |
@@ -158,11 +160,12 @@ kernel bug was fixed.
 
 Ranked; details in [`REVIEW-20261102.md`](REVIEW-20261102.md) §6.
 
-1. P17: keep optimizing. The same-runner CI benchmark is 27–33% faster
-   than base, but still about 3× above the 8 s / 10 s targets on GitHub
-   runners. Next candidates (threaded/JIT-style dispatch) are in REVIEW §7.
-2. Extend boot lockstep past the first 30M instructions (checkpointed
-   windows) and add a 3M-step run to CI as a scheduled job.
+1. P17 is met on Apple Silicon by median; the SMP1 p95 (8.73 s) exceeded
+   8 s on one slower runner. More margin needs dispatch work beyond the
+   current block interpreter (REVIEW §7). On x86 GitHub runners the boot
+   takes 17–18 s.
+2. Trace lockstep: SMP (trace every hart), and a mode that runs rivemu's
+   block path (`Hart::run`) instead of `Hart::step` between records.
 3. H extension (RVA23S64). Zama16b is implemented, and the README claims RVA23U64 only.
 4. riscv-arch-test runs in CI (job `arch-test`, 1251/1251 in run 41568117929; the ELFs are cached by configuration).
 5. `linux_devices` now runs in CI (job `linux-devices`; the images build in
