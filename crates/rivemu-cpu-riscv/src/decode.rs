@@ -10,6 +10,10 @@ use crate::rvc;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
     Illegal,
+    /// No effect. Never decoded: the block cache stores an integer operation
+    /// that writes x0 (a hint) as `Nop`, so that its fast path can write
+    /// `rd` without testing for x0.
+    Nop,
     // RV64I
     Lui,
     Auipc,

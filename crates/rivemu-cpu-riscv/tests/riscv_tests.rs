@@ -3764,6 +3764,70 @@ fn block_loads_and_stores_match_single_stepping() {
     assert_eq!(block.x[6] & 0xffff_ffff, block.x[9]);
 }
 
+/// Blocks store integer operations that write x0 as `Nop`, rerun a block
+/// that branches to its own start without a lookup, count retired
+/// instructions once per chain, and send misaligned loads and stores (which
+/// the inline fast path refuses) through the full path: all as single-step.
+#[test]
+fn block_x0_hints_self_loops_and_misaligned_accesses_match_single_stepping() {
+    const CODE: u64 = 0x8000_0000;
+    const DATA: u64 = 0x8001_0000;
+    const PROGRAM: &[u32] = &[
+        0x00c5_8033, // add  zero, a1, a2
+        0x02c5_8033, // mul  zero, a1, a2
+        0x1234_5037, // lui  zero, 0x12345
+        0x0076_8013, // addi zero, a3, 7
+        0x0035_0513, // addi a0, a0, 3      (misaligned from here on)
+        0x00b5_3023, // sd   a1, 0(a0)
+        0x0005_3683, // ld   a3, 0(a0)
+        0x00c5_2223, // sw   a2, 4(a0)
+        0x0065_5783, // lhu  a5, 6(a0)
+        0x00d7_0733, // add  a4, a4, a3
+        0x00f7_0733, // add  a4, a4, a5
+        0xfff6_0613, // addi a2, a2, -1
+        0xfc06_18e3, // bnez a2, loop       (back to its own block)
+        0x1050_0073, // wfi
+    ];
+    let setup = || {
+        let mut bus = AddressSpace::new();
+        bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+            .unwrap();
+        for (i, &w) in PROGRAM.iter().enumerate() {
+            bus.write(CODE + 4 * i as u64, AccessSize::Word, u64::from(w))
+                .unwrap();
+        }
+        let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+        h.reset(CODE);
+        h.x[10] = DATA;
+        h.x[11] = 0x0123_4567_89ab_cdef;
+        h.x[12] = 500;
+        (bus, h)
+    };
+    let (block_bus, mut block) = setup();
+    let mut attempted = 0;
+    while !block.wfi && attempted < 100_000 {
+        attempted += block.run(&block_bus, 100_000);
+    }
+    let (step_bus, mut stepped) = setup();
+    while !stepped.wfi && stepped.instret() < 100_000 {
+        stepped.step(&step_bus);
+    }
+    assert!(block.wfi && stepped.wfi);
+    assert_eq!(block.instret(), 500 * 13 + 1);
+    assert_eq!(block.instret(), stepped.instret());
+    assert_eq!(block.pc, stepped.pc);
+    assert_eq!(block.x, stepped.x);
+    assert_eq!(block.x[0], 0);
+    for off in (0..0x800).step_by(8) {
+        assert_eq!(
+            block_bus.read(DATA + off, AccessSize::Double).unwrap(),
+            step_bus.read(DATA + off, AccessSize::Double).unwrap(),
+            "memory differs at {:#x}",
+            DATA + off
+        );
+    }
+}
+
 /// More distinct blocks than the block arena holds: the arena is cleared
 /// once it is full, and every block must still run (twice, so the second
 /// pass also runs blocks decoded after the clear).

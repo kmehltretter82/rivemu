@@ -8,6 +8,7 @@
 //! No `&[u8]`/`&mut [u8]` view of guest memory is ever handed out.
 
 use std::io;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use memmap2::MmapMut;
@@ -36,7 +37,65 @@ impl std::fmt::Debug for Ram {
     }
 }
 
+/// A borrowed view of a [`Ram`] for the CPU's load/store fast path:
+/// naturally aligned accesses at byte offsets, checked only against the
+/// length and the alignment (two register compares).
+///
+/// Stores through a view do not set dirty bits. The CPU caches a store
+/// translation for a page only after a [`Ram::write`] to that page, which set
+/// its bit; dirty bits are cleared only while no vCPU runs (snapshot
+/// restore), and every hart's translations are flushed then.
+#[derive(Clone, Copy, Debug)]
+pub struct RamView<'a> {
+    ptr: *mut u8,
+    /// The length rounded down to a multiple of 8, so that an aligned
+    /// offset below it leaves room for the whole access.
+    len8: u64,
+    _ram: PhantomData<&'a Ram>,
+}
+
+impl RamView<'_> {
+    /// Little-endian read of a naturally aligned `size` at `offset`; `None`
+    /// if misaligned or out of bounds.
+    #[inline(always)]
+    pub fn read_aligned(&self, offset: u64, size: AccessSize) -> Option<u64> {
+        let n = size.bytes();
+        if offset & (n - 1) != 0 || offset >= self.len8 {
+            return None;
+        }
+        // SAFETY: `offset` is a multiple of `n` (at most 8) below `len8`, a
+        // multiple of 8 not above the mapping's length, so `offset + n` is in
+        // bounds; the mapping is page-aligned, so the pointer is aligned for
+        // the atomic of width `n`.
+        Some(unsafe { load_aligned(self.ptr.add(offset as usize), size) })
+    }
+
+    /// Little-endian write of the low `size` bytes of `value` at a naturally
+    /// aligned `offset`; `None` if misaligned or out of bounds. Does not set
+    /// the page's dirty bit (see the type's documentation).
+    #[inline(always)]
+    pub fn write_aligned(&self, offset: u64, size: AccessSize, value: u64) -> Option<()> {
+        let n = size.bytes();
+        if offset & (n - 1) != 0 || offset >= self.len8 {
+            return None;
+        }
+        // SAFETY: as in `read_aligned`.
+        unsafe { store_aligned(self.ptr.add(offset as usize), size, value) };
+        Some(())
+    }
+}
+
 impl Ram {
+    /// A [`RamView`] of this RAM.
+    #[inline]
+    pub fn view(&self) -> RamView<'_> {
+        RamView {
+            ptr: self.ptr,
+            len8: self.len & !7,
+            _ram: PhantomData,
+        }
+    }
+
     /// Allocates `size` bytes of zero-initialised RAM.
     ///
     /// The host mapping is lazy, so large guest RAM sizes only consume host
@@ -618,6 +677,48 @@ unsafe fn load(p: *mut u8, size: AccessSize) -> u64 {
 }
 
 /// # Safety
+/// `p` must be valid for reads of `size` bytes and aligned to `size`.
+#[inline(always)]
+unsafe fn load_aligned(p: *mut u8, size: AccessSize) -> u64 {
+    // SAFETY (all arms): the caller guarantees validity and alignment.
+    unsafe {
+        match size {
+            AccessSize::Byte => u64::from(AtomicU8::from_ptr(p).load(Ordering::Relaxed)),
+            AccessSize::Half => u64::from(u16::from_le(
+                AtomicU16::from_ptr(p.cast()).load(Ordering::Relaxed),
+            )),
+            AccessSize::Word => u64::from(u32::from_le(
+                AtomicU32::from_ptr(p.cast()).load(Ordering::Relaxed),
+            )),
+            AccessSize::Double => {
+                u64::from_le(AtomicU64::from_ptr(p.cast()).load(Ordering::Relaxed))
+            }
+        }
+    }
+}
+
+/// # Safety
+/// `p` must be valid for writes of `size` bytes and aligned to `size`.
+#[inline(always)]
+unsafe fn store_aligned(p: *mut u8, size: AccessSize, value: u64) {
+    // SAFETY (all arms): the caller guarantees validity and alignment.
+    unsafe {
+        match size {
+            AccessSize::Byte => AtomicU8::from_ptr(p).store(value as u8, Ordering::Relaxed),
+            AccessSize::Half => {
+                AtomicU16::from_ptr(p.cast()).store((value as u16).to_le(), Ordering::Relaxed)
+            }
+            AccessSize::Word => {
+                AtomicU32::from_ptr(p.cast()).store((value as u32).to_le(), Ordering::Relaxed)
+            }
+            AccessSize::Double => {
+                AtomicU64::from_ptr(p.cast()).store(value.to_le(), Ordering::Relaxed)
+            }
+        }
+    }
+}
+
+/// # Safety
 /// `p` must be valid for writes of `size` bytes.
 #[inline(always)]
 unsafe fn store(p: *mut u8, size: AccessSize, value: u64) {
@@ -658,6 +759,40 @@ mod tests {
     #[test]
     fn rejects_zero_size() {
         assert!(Ram::new(0).is_err());
+    }
+
+    #[test]
+    fn view_accesses_aligned_values_in_bounds_only() {
+        // A length that is not a multiple of 8: the last 4 bytes hold no
+        // aligned doubleword.
+        let ram = Ram::new(4096 + 12).unwrap();
+        let v = ram.view();
+        assert_eq!(
+            v.write_aligned(8, AccessSize::Double, 0x1122_3344_5566_7788),
+            Some(())
+        );
+        assert_eq!(ram.read(8, AccessSize::Double), Some(0x1122_3344_5566_7788));
+        assert_eq!(v.read_aligned(12, AccessSize::Word), Some(0x1122_3344));
+        assert_eq!(v.read_aligned(14, AccessSize::Half), Some(0x1122));
+        assert_eq!(v.read_aligned(15, AccessSize::Byte), Some(0x11));
+        // Misaligned: refused.
+        assert_eq!(v.read_aligned(9, AccessSize::Double), None);
+        assert_eq!(v.read_aligned(10, AccessSize::Word), None);
+        assert_eq!(v.write_aligned(13, AccessSize::Half, 0), None);
+        // The end: 4096 + 8 is the last aligned doubleword below len & !7.
+        assert_eq!(v.read_aligned(4096, AccessSize::Double), Some(0));
+        assert_eq!(v.read_aligned(4096 + 8, AccessSize::Double), None);
+        assert_eq!(v.read_aligned(4096 + 8, AccessSize::Word), None);
+        assert_eq!(v.read_aligned(!7, AccessSize::Double), None);
+        // Writes through a view leave the dirty bits alone.
+        let fresh = Ram::new(8192).unwrap();
+        fresh
+            .view()
+            .write_aligned(4096, AccessSize::Double, 5)
+            .unwrap();
+        assert!(fresh.dirty_non_zero_pages().is_empty());
+        fresh.write(0, AccessSize::Double, 5).unwrap();
+        assert_eq!(fresh.dirty_non_zero_pages(), vec![0]);
     }
 
     #[test]

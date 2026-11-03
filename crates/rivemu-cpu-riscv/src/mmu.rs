@@ -166,61 +166,123 @@ impl PmpCache {
     }
 }
 
-/// Entries per access type in [`FastTlb`] (direct-mapped by virtual page).
+/// Entries per access type in a [`FastTlb`] slot (direct-mapped by virtual
+/// page).
 const FAST_TLB_SIZE: usize = 256;
+/// Translation contexts the [`FastTlb`] keeps at once.
+pub(crate) const FAST_TLB_SLOTS: usize = 4;
+/// Bits above the virtual page number (`va >> 12` has 52) that hold a slot's
+/// epoch in the tags.
+const FAST_EPOCH_SHIFT: u32 = 52;
 
 #[derive(Clone, Copy, Debug, Default)]
-struct FastTlbEntry {
-    /// `(va >> 12) + 1` (0 means invalid).
-    tag: u64,
-    /// [`Hart::fast_tlb_ctx`] when the entry was filled.
-    ctx: u64,
+pub(crate) struct FastTlbEntry {
+    /// `(va >> 12) | epoch << 52` with the slot's epoch when the entry was
+    /// filled (epochs start at 1, so 0 is invalid). One compare checks both.
+    pub(crate) tag: u64,
     /// Physical address of the page.
-    pa_page: u64,
+    pub(crate) pa_page: u64,
     /// Byte offset of the page within `AddressSpace::fast_ram`.
-    ram_page_off: u64,
-    /// [`FastTlb::epoch`] when the entry was filled.
-    epoch: u32,
+    pub(crate) ram_page_off: u64,
 }
 
-/// Fast path for scalar loads and stores to RAM: one direct-mapped table per
-/// access type, from virtual page to RAM offset.
+/// The fast-TLB tables of one translation context.
+#[derive(Clone, Debug)]
+pub(crate) struct FastTlbSlot {
+    /// [`Hart::fast_tlb_ctx`] of this slot (`u64::MAX`: unused; a context
+    /// value never has every bit set).
+    ctx: u64,
+    /// The slot's epoch, shifted into tag position.
+    pub(crate) epoch_hi: u64,
+    pub(crate) load: Box<[FastTlbEntry; FAST_TLB_SIZE]>,
+    pub(crate) store: Box<[FastTlbEntry; FAST_TLB_SIZE]>,
+}
+
+impl Default for FastTlbSlot {
+    fn default() -> Self {
+        Self {
+            ctx: u64::MAX,
+            epoch_hi: 1 << FAST_EPOCH_SHIFT,
+            load: Box::new([FastTlbEntry::default(); FAST_TLB_SIZE]),
+            store: Box::new([FastTlbEntry::default(); FAST_TLB_SIZE]),
+        }
+    }
+}
+
+impl FastTlbSlot {
+    /// Invalidates every entry: a new epoch (clearing the tables when the
+    /// 12-bit epoch wraps).
+    fn invalidate(&mut self) {
+        let next = (self.epoch_hi >> FAST_EPOCH_SHIFT) + 1;
+        if next >= 1 << (64 - FAST_EPOCH_SHIFT) {
+            self.load.fill(FastTlbEntry::default());
+            self.store.fill(FastTlbEntry::default());
+            self.epoch_hi = 1 << FAST_EPOCH_SHIFT;
+        } else {
+            self.epoch_hi = next << FAST_EPOCH_SHIFT;
+        }
+    }
+
+    /// The entry for `va` in `table` if it is valid for this slot's epoch.
+    #[inline(always)]
+    pub(crate) fn hit(
+        table: &[FastTlbEntry; FAST_TLB_SIZE],
+        epoch_hi: u64,
+        va: u64,
+    ) -> Option<&FastTlbEntry> {
+        let e = &table[((va >> 12) as usize) & (FAST_TLB_SIZE - 1)];
+        (e.tag == (va >> 12) | epoch_hi).then_some(e)
+    }
+}
+
+/// Fast path for scalar loads and stores to RAM: per translation context,
+/// one direct-mapped table per access type, from virtual page to RAM offset.
 ///
 /// An entry is filled only after the full translation (privilege, PTE
 /// permissions, A/D, Svukte, PMP) allowed that access type on that page, the
-/// page is plain RAM (`PBMT == 0`), and no PMP boundary lies inside a page.
-/// A hit is valid only for the same translation context ([`Hart::fast_tlb_ctx`]:
-/// privilege, `MPRV`, `MPP`, `SUM`, `MXR`, `senvcfg.UKTE`). Everything else
-/// the full path depends on invalidates the whole table:
+/// page is plain RAM (`PBMT == 0`), and no PMP boundary lies inside a page; a
+/// store entry only after a store to the page set its dirty bit. A slot
+/// holds the entries of one translation context ([`Hart::fast_tlb_ctx`]:
+/// privilege, `MPRV`, `MPP`, `MPV`, `SUM`, `MXR`, `senvcfg.UKTE`), so a
+/// switch between, say, kernel and user mode keeps both. Everything else
+/// the full path depends on invalidates every slot:
 /// - `sfence.vma`, any TLB flush, and remote fences;
 /// - writes to `satp` (the table is not ASID-tagged) and `menvcfg`;
 /// - PMP changes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct FastTlb {
-    load: Box<[FastTlbEntry; FAST_TLB_SIZE]>,
-    store: Box<[FastTlbEntry; FAST_TLB_SIZE]>,
-    epoch: u32,
-}
-
-impl Default for FastTlb {
-    fn default() -> Self {
-        Self {
-            load: Box::new([FastTlbEntry::default(); FAST_TLB_SIZE]),
-            store: Box::new([FastTlbEntry::default(); FAST_TLB_SIZE]),
-            epoch: 1,
-        }
-    }
+    pub(crate) slots: [FastTlbSlot; FAST_TLB_SLOTS],
+    /// The slot to reassign next.
+    victim: usize,
 }
 
 impl FastTlb {
     #[inline]
     pub(crate) fn invalidate(&mut self) {
-        self.epoch = self.epoch.wrapping_add(1);
-        if self.epoch == 0 {
-            self.load.fill(FastTlbEntry::default());
-            self.store.fill(FastTlbEntry::default());
-            self.epoch = 1;
+        for s in &mut self.slots {
+            s.invalidate();
         }
+    }
+
+    /// The slot holding `ctx`, if any.
+    #[inline]
+    pub(crate) fn find(&self, ctx: u64) -> Option<usize> {
+        self.slots.iter().position(|s| s.ctx == ctx)
+    }
+
+    /// The slot for `ctx`, reassigning (and invalidating) one if none holds
+    /// it.
+    #[inline]
+    pub(crate) fn slot_for(&mut self, ctx: u64) -> usize {
+        if let Some(i) = self.find(ctx) {
+            return i;
+        }
+        let i = self.victim;
+        self.victim = (i + 1) % FAST_TLB_SLOTS;
+        let s = &mut self.slots[i];
+        s.ctx = ctx;
+        s.invalidate();
+        i
     }
 }
 
@@ -648,52 +710,42 @@ impl Hart {
     /// RAM offset for a load from `va` (within one page) on a fast-TLB hit.
     #[inline]
     pub(crate) fn fast_load_ram_off(&self, va: u64) -> Option<u64> {
-        self.fast_load_ram_off_ctx(va, self.fast_tlb_ctx())
-    }
-
-    /// [`Self::fast_load_ram_off`] with a precomputed [`Self::fast_tlb_ctx`],
-    /// for callers that know the context cannot have changed.
-    #[inline(always)]
-    pub(crate) fn fast_load_ram_off_ctx(&self, va: u64, ctx: u64) -> Option<u64> {
-        let e = &self.tlb.fast.load[((va >> 12) as usize) & (FAST_TLB_SIZE - 1)];
-        (e.tag == (va >> 12) + 1 && e.epoch == self.tlb.fast.epoch && e.ctx == ctx)
-            .then_some(e.ram_page_off | (va & 0xfff))
+        let f = &self.tlb.fast;
+        let s = &f.slots[f.find(self.fast_tlb_ctx())?];
+        FastTlbSlot::hit(&s.load, s.epoch_hi, va).map(|e| e.ram_page_off | (va & 0xfff))
     }
 
     /// `(pa, ram_off)` for a store to `va` (within one page) on a fast-TLB hit.
     #[inline]
     pub(crate) fn fast_store_ram_off(&self, va: u64) -> Option<(u64, u64)> {
-        self.fast_store_ram_off_ctx(va, self.fast_tlb_ctx())
-    }
-
-    /// [`Self::fast_store_ram_off`] with a precomputed [`Self::fast_tlb_ctx`].
-    #[inline(always)]
-    pub(crate) fn fast_store_ram_off_ctx(&self, va: u64, ctx: u64) -> Option<(u64, u64)> {
-        let e = &self.tlb.fast.store[((va >> 12) as usize) & (FAST_TLB_SIZE - 1)];
-        (e.tag == (va >> 12) + 1 && e.epoch == self.tlb.fast.epoch && e.ctx == ctx)
-            .then_some((e.pa_page | (va & 0xfff), e.ram_page_off | (va & 0xfff)))
+        let f = &self.tlb.fast;
+        let s = &f.slots[f.find(self.fast_tlb_ctx())?];
+        FastTlbSlot::hit(&s.store, s.epoch_hi, va)
+            .map(|e| (e.pa_page | (va & 0xfff), e.ram_page_off | (va & 0xfff)))
     }
 
     /// Records a translation that the full path allowed. `ram_off` is the
     /// value [`Self::translate_with_ram_off`] returned (`u64::MAX` for
-    /// anything but plain RAM).
+    /// anything but plain RAM). A store entry is recorded after the store
+    /// (which set the page's dirty bit).
     #[inline]
     pub(crate) fn fast_tlb_fill(&mut self, va: u64, pa: u64, ram_off: u64, store: bool) {
         if ram_off == u64::MAX || self.pmp_subpage {
             return;
         }
+        let ctx = self.fast_tlb_ctx();
+        let i = self.tlb.fast.slot_for(ctx);
+        let slot = &mut self.tlb.fast.slots[i];
         let e = FastTlbEntry {
-            tag: (va >> 12) + 1,
-            ctx: self.fast_tlb_ctx(),
+            tag: (va >> 12) | slot.epoch_hi,
             pa_page: pa & !0xfff,
             ram_page_off: ram_off & !0xfff,
-            epoch: self.tlb.fast.epoch,
         };
         let idx = ((va >> 12) as usize) & (FAST_TLB_SIZE - 1);
         if store {
-            self.tlb.fast.store[idx] = e;
+            slot.store[idx] = e;
         } else {
-            self.tlb.fast.load[idx] = e;
+            slot.load[idx] = e;
         }
     }
 

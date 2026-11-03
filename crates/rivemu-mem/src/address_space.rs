@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rivemu_core::{AccessSize, GuestAddr};
 use thiserror::Error;
 
-use crate::{MmioDevice, Ram};
+use crate::{MmioDevice, Ram, RamView};
 
 /// Number of 64-byte cache-line buckets in the reservation directory.
 const RESERVATION_BUCKETS: usize = 4096;
@@ -359,6 +359,13 @@ impl AddressSpace {
         let (base, len, _) = self.fast_ram.as_ref()?;
         let off = pa_page.wrapping_sub(*base);
         (off.saturating_add(0x1000) <= *len).then_some(off)
+    }
+
+    /// A [`RamView`] of the primary `fast_ram` region (offsets as from
+    /// [`Self::fast_ram_page_offset`]).
+    #[inline]
+    pub fn fast_ram_view(&self) -> Option<RamView<'_>> {
+        self.fast_ram.as_ref().map(|(_, _, ram)| ram.view())
     }
 
     /// Reads directly from the primary `fast_ram` region using a pre-validated

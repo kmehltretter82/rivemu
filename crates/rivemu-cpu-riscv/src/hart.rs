@@ -4,12 +4,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rivemu_core::{AccessSize, Timebase};
-use rivemu_mem::{AddressSpace, RegionKind};
+use rivemu_mem::{AddressSpace, RamView, RegionKind};
 
 use crate::csr::{self, Csrs, envcfg, hstatus, irq, status};
 use crate::decode::{Insn, Op, amo, decode, decode_compressed};
 use crate::log::{LogFlags, Logger};
-use crate::mmu::{Access, PmpCache, Tlb};
+use crate::mmu::{Access, FAST_TLB_SLOTS, FastTlbSlot, PmpCache, Tlb};
 
 /// Exception cause codes.
 #[allow(missing_docs)]
@@ -182,6 +182,83 @@ const fn bb_op_kind(op: Op) -> BbOpKind {
             BbOpKind::Term
         }
         _ => BbOpKind::Seq,
+    }
+}
+
+/// What a block's inline loads and stores use: the fast-TLB slot of the
+/// block's translation context with its epoch, and a view of guest RAM. All
+/// of it stays valid for the whole block (see [`Hart::try_step_bb`]).
+#[derive(Clone, Copy)]
+struct FastMem<'a> {
+    slot: usize,
+    epoch_hi: u64,
+    ram: RamView<'a>,
+}
+
+/// Whether `op` is an integer operation whose only effect is writing `rd`
+/// (the value-producing arms of [`Hart::exec_inline`]).
+const fn writes_only_rd(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Lui
+            | Op::Auipc
+            | Op::Addi
+            | Op::Slti
+            | Op::Sltiu
+            | Op::Xori
+            | Op::Ori
+            | Op::Andi
+            | Op::Slli
+            | Op::Srli
+            | Op::Srai
+            | Op::Add
+            | Op::Sub
+            | Op::Sll
+            | Op::Slt
+            | Op::Sltu
+            | Op::Xor
+            | Op::Srl
+            | Op::Sra
+            | Op::Or
+            | Op::And
+            | Op::Addiw
+            | Op::Slliw
+            | Op::Srliw
+            | Op::Sraiw
+            | Op::Addw
+            | Op::Subw
+            | Op::Sllw
+            | Op::Srlw
+            | Op::Sraw
+            | Op::Mul
+            | Op::Mulh
+            | Op::Mulhsu
+            | Op::Mulhu
+            | Op::Mulw
+            | Op::Div
+            | Op::Divu
+            | Op::Rem
+            | Op::Remu
+            | Op::Divw
+            | Op::Divuw
+            | Op::Remw
+            | Op::Remuw
+    )
+}
+
+/// An instruction as the block cache stores it: an integer operation that
+/// writes x0 has no effect and becomes [`Op::Nop`], so that
+/// [`Hart::exec_inline`] can write `rd` without testing for x0. The raw
+/// encoding stays (fence.i re-validation compares it).
+#[inline]
+fn block_insn(insn: Insn) -> Insn {
+    if insn.rd == 0 && writes_only_rd(insn.op) {
+        Insn {
+            op: Op::Nop,
+            ..insn
+        }
+    } else {
+        insn
     }
 }
 
@@ -780,11 +857,23 @@ impl Hart {
         // mstatus, senvcfg and the pointer-masking CSRs change only through
         // CSR writes, traps and xRET, and those end a block. `run` already
         // excluded triggers, watchpoints, logging and sub-page PMP.
-        let mem_ctx = (!self.strict_align
+        let mem = if !self.strict_align
             && (self.csr.menvcfg | self.csr.senvcfg | self.csr.mseccfg | self.csr.h.henvcfg)
                 & envcfg::PMM_MASK
-                == 0)
-            .then(|| self.fast_tlb_ctx());
+                == 0
+        {
+            bus.fast_ram_view().map(|ram| {
+                let ctx = self.fast_tlb_ctx();
+                let slot = self.tlb.fast.slot_for(ctx);
+                FastMem {
+                    slot,
+                    epoch_hi: self.tlb.fast.slots[slot].epoch_hi,
+                    ram,
+                }
+            })
+        } else {
+            None
+        };
         // The arena moves out of `self` while the block runs, so that the
         // loop walks a plain slice. Nothing a block can contain touches the
         // decode caches: fence.i, CSR accesses and the other flushing
@@ -792,14 +881,28 @@ impl Hart {
         let arena = std::mem::take(&mut self.bb_arena);
         let gen_before = self.icache_gen;
         let mut total = 0u64;
+        // Instructions of completed blocks, counted into minstret/mcycle once
+        // when the chain ends (nothing in a chain reads them: CSR accesses
+        // end blocks, and a block that stops early counts its own).
+        let mut completed_insns = 0u64;
         let (mut idx, mut avail) = (bb_idx, avail);
         loop {
+            let block_pc = self.pc;
             let start = self.bbcache[idx].start as usize;
             let limit = avail.min((max_insns - total) as usize);
-            let (done, completed) = self.run_block(bus, &arena[start..start + limit], mem_ctx);
+            let (done, completed) = self.run_block(bus, &arena[start..start + limit], mem);
             total += done;
             if !completed || total >= max_insns {
+                if completed {
+                    completed_insns += done;
+                }
                 break;
+            }
+            completed_insns += done;
+            // A loop that branches back to its own start runs the same
+            // block again (the decode caches do not change within a chain).
+            if self.pc == block_pc {
+                continue;
             }
             // Chain into the next block while it is already decoded: the
             // block-invariant state above (privilege, mstatus, the envcfg
@@ -808,6 +911,9 @@ impl Hart {
                 Some(next) => (idx, avail) = next,
                 None => break,
             }
+        }
+        if completed_insns != 0 {
+            self.bump_counters(completed_insns);
         }
         debug_assert_eq!(
             self.icache_gen, gen_before,
@@ -853,14 +959,17 @@ impl Hart {
         &mut self,
         bus: &AddressSpace,
         insns: &[Insn],
-        mem_ctx: Option<u64>,
+        mem: Option<FastMem<'_>>,
     ) -> (u64, bool) {
         // The PC stays in a local while inline instructions run and is
         // written back before anything that reads it. This removes a
         // store-to-load dependency through `self.pc` between consecutive
         // instructions.
         let mut pc = self.pc;
-        for (i, insn) in insns.iter().enumerate() {
+        let mut i = 0;
+        while i < insns.len() {
+            let insn = &insns[i];
+            i += 1;
             // Integer ALU, Lui/Auipc, Jal/Jalr and branches cannot trap,
             // touch memory or set check_irq/wfi/yield_slice, so they skip the
             // `execute` call and the per-instruction flag check. Neither can
@@ -868,7 +977,7 @@ impl Hart {
             // with landing pads disabled and `elp` clear (see `run`), and
             // nothing in a block sets `elp`.
             debug_assert!(!self.elp);
-            if let Some(next) = self.exec_inline(bus, insn, mem_ctx, pc) {
+            if let Some(next) = self.exec_inline(bus, insn, mem, pc) {
                 pc = next;
                 continue;
             }
@@ -877,7 +986,7 @@ impl Hart {
                 Ok(()) => {
                     pc = self.pc;
                     if self.check_irq || self.wfi || self.yield_slice {
-                        let done = (i + 1) as u64;
+                        let done = i as u64;
                         self.bump_counters(done);
                         if self.check_irq {
                             self.take_pending_interrupt();
@@ -886,7 +995,7 @@ impl Hart {
                     }
                 }
                 Err(e) => {
-                    let retired = i as u64;
+                    let retired = (i - 1) as u64;
                     if retired > 0 {
                         self.bump_counters(retired);
                     }
@@ -899,9 +1008,8 @@ impl Hart {
             }
         }
         self.pc = pc;
-        let done = insns.len() as u64;
-        self.bump_counters(done);
-        (done, true)
+        // The caller counts completed blocks into minstret/mcycle.
+        (insns.len() as u64, true)
     }
 
     /// Executes `insn` if it is one of the simple integer instructions, or
@@ -914,7 +1022,7 @@ impl Hart {
         &mut self,
         bus: &AddressSpace,
         insn: &Insn,
-        mem_ctx: Option<u64>,
+        mem: Option<FastMem<'_>>,
         pc: u64,
     ) -> Option<u64> {
         let next = pc.wrapping_add(u64::from(insn.len));
@@ -1017,55 +1125,58 @@ impl Hart {
             // One arm per opcode, so that each inlined access has a
             // constant size.
             Op::Ld => {
-                let ok = self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Double, |v| v);
+                let ok = self.exec_load_inline(bus, insn, mem, AccessSize::Double, |v| v);
                 return ok.then_some(next);
             }
             Op::Lw => {
-                let ok = self
-                    .exec_load_inline(bus, insn, mem_ctx, AccessSize::Word, |v| v as i32 as u64);
+                let ok =
+                    self.exec_load_inline(bus, insn, mem, AccessSize::Word, |v| v as i32 as u64);
                 return ok.then_some(next);
             }
             Op::Lwu => {
-                let ok = self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Word, |v| v);
+                let ok = self.exec_load_inline(bus, insn, mem, AccessSize::Word, |v| v);
                 return ok.then_some(next);
             }
             Op::Lbu => {
-                let ok = self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Byte, |v| v);
+                let ok = self.exec_load_inline(bus, insn, mem, AccessSize::Byte, |v| v);
                 return ok.then_some(next);
             }
             Op::Lb => {
                 let ok =
-                    self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Byte, |v| v as i8 as u64);
+                    self.exec_load_inline(bus, insn, mem, AccessSize::Byte, |v| v as i8 as u64);
                 return ok.then_some(next);
             }
             Op::Lhu => {
-                let ok = self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Half, |v| v);
+                let ok = self.exec_load_inline(bus, insn, mem, AccessSize::Half, |v| v);
                 return ok.then_some(next);
             }
             Op::Lh => {
-                let ok = self
-                    .exec_load_inline(bus, insn, mem_ctx, AccessSize::Half, |v| v as i16 as u64);
+                let ok =
+                    self.exec_load_inline(bus, insn, mem, AccessSize::Half, |v| v as i16 as u64);
                 return ok.then_some(next);
             }
             Op::Sd => {
-                let ok = self.exec_store_inline(bus, insn, mem_ctx, AccessSize::Double);
+                let ok = self.exec_store_inline(bus, insn, mem, AccessSize::Double);
                 return ok.then_some(next);
             }
             Op::Sw => {
-                let ok = self.exec_store_inline(bus, insn, mem_ctx, AccessSize::Word);
+                let ok = self.exec_store_inline(bus, insn, mem, AccessSize::Word);
                 return ok.then_some(next);
             }
             Op::Sb => {
-                let ok = self.exec_store_inline(bus, insn, mem_ctx, AccessSize::Byte);
+                let ok = self.exec_store_inline(bus, insn, mem, AccessSize::Byte);
                 return ok.then_some(next);
             }
             Op::Sh => {
-                let ok = self.exec_store_inline(bus, insn, mem_ctx, AccessSize::Half);
+                let ok = self.exec_store_inline(bus, insn, mem, AccessSize::Half);
                 return ok.then_some(next);
             }
+            Op::Nop => return Some(next),
             _ => return None,
         };
-        self.set_x(rd, v);
+        // Blocks store operations that write x0 as `Nop` (`block_insn`).
+        debug_assert!(rd != 0);
+        self.x[usize::from(rd & 31)] = v;
         Some(next)
     }
 
@@ -1078,23 +1189,23 @@ impl Hart {
     #[inline(always)]
     fn exec_load_inline(
         &mut self,
-        bus: &AddressSpace,
+        _bus: &AddressSpace,
         insn: &Insn,
-        mem_ctx: Option<u64>,
+        mem: Option<FastMem<'_>>,
         size: AccessSize,
         ext: impl Fn(u64) -> u64,
     ) -> bool {
-        let Some(ctx) = mem_ctx else {
+        let Some(m) = mem else {
             return false;
         };
         let va = self.x[usize::from(insn.rs1 & 31)].wrapping_add(insn.imm as u64);
-        if (va & 0xfff) + size.bytes() > 0x1000 {
+        // A naturally aligned access stays within its page; `read_aligned`
+        // refuses the others, which take the full path.
+        let slot = &self.tlb.fast.slots[m.slot % FAST_TLB_SLOTS];
+        let Some(e) = FastTlbSlot::hit(&slot.load, m.epoch_hi, va) else {
             return false;
-        }
-        let Some(v) = self
-            .fast_load_ram_off_ctx(va, ctx)
-            .and_then(|off| bus.read_fast_ram(off, size))
-        else {
+        };
+        let Some(v) = m.ram.read_aligned(e.ram_page_off | (va & 0xfff), size) else {
             return false;
         };
         self.set_x(insn.rd, ext(v));
@@ -1107,26 +1218,28 @@ impl Hart {
         &mut self,
         bus: &AddressSpace,
         insn: &Insn,
-        mem_ctx: Option<u64>,
+        mem: Option<FastMem<'_>>,
         size: AccessSize,
     ) -> bool {
-        let Some(ctx) = mem_ctx else {
+        let Some(m) = mem else {
             return false;
         };
         let va = self.x[usize::from(insn.rs1 & 31)].wrapping_add(insn.imm as u64);
-        if (va & 0xfff) + size.bytes() > 0x1000 {
-            return false;
-        }
-        let Some((pa, off)) = self.fast_store_ram_off_ctx(va, ctx) else {
+        let slot = &self.tlb.fast.slots[m.slot % FAST_TLB_SLOTS];
+        let Some(e) = FastTlbSlot::hit(&slot.store, m.epoch_hi, va) else {
             return false;
         };
-        self.invalidate_reservation(pa);
-        if bus
-            .write_fast_ram(pa, off, size, self.x[usize::from(insn.rs2 & 31)])
+        let (pa, off) = (e.pa_page | (va & 0xfff), e.ram_page_off | (va & 0xfff));
+        // The page's dirty bit is set (see `FastTlb`); `write_aligned`
+        // refuses misaligned accesses, which take the full path.
+        if m.ram
+            .write_aligned(off, size, self.x[usize::from(insn.rs2 & 31)])
             .is_none()
         {
             return false;
         }
+        self.invalidate_reservation(pa);
+        bus.invalidate_cache_line(pa, size);
         true
     }
 
@@ -1195,7 +1308,7 @@ impl Hart {
                     break;
                 }
                 BbOpKind::Seq => {
-                    self.bb_arena.push(insn);
+                    self.bb_arena.push(block_insn(insn));
                     let step_len = u64::from(insn.len);
                     cur_pc = cur_pc.wrapping_add(step_len);
                     cur_pa = cur_pa.wrapping_add(step_len);
@@ -2099,6 +2212,7 @@ impl Hart {
 
         match insn.op {
             Op::Illegal => return Err(Self::illegal(insn)),
+            Op::Nop => {}
             Op::Lui => self.set_x(rd, imm),
             Op::Auipc => self.set_x(rd, pc.wrapping_add(imm)),
             Op::Jal => {
