@@ -584,10 +584,13 @@ impl Hart {
         self.reservation = None;
     }
 
+    /// Register indices are masked with `& 31` here and in the hot paths:
+    /// decoded fields are always below 32, and the mask lets the compiler
+    /// drop the bounds check.
     #[inline]
     pub(crate) fn set_x(&mut self, rd: u8, v: u64) {
         if rd != 0 {
-            self.x[rd as usize] = v;
+            self.x[usize::from(rd & 31)] = v;
         }
     }
 
@@ -676,6 +679,15 @@ impl Hart {
     /// honouring `mcountinhibit.IR`/`.CY` and the Smcntrpmf mode filters.
     #[inline]
     fn bump_counters(&mut self, delta: u64) {
+        // Common case: neither counter inhibited or filtered by mode.
+        const MODE_INH: u64 = csr::hpmevent::MINH | csr::hpmevent::SINH | csr::hpmevent::UINH;
+        if self.csr.mcountinhibit & 5 == 0
+            && (self.csr.minstretcfg | self.csr.mcyclecfg) & MODE_INH == 0
+        {
+            self.csr.minstret = self.csr.minstret.wrapping_add(delta);
+            self.csr.mcycle = self.csr.mcycle.wrapping_add(delta);
+            return;
+        }
         if self.csr.mcountinhibit & 4 == 0 && !self.mode_inhibited(self.csr.minstretcfg) {
             self.csr.minstret = self.csr.minstret.wrapping_add(delta);
         }
@@ -718,7 +730,7 @@ impl Hart {
         } else {
             self.populate_bbcache_same_page(bus, pc, pa, bb_idx, tag)
         };
-        if avail < 2 {
+        if avail == 0 {
             return 0;
         }
         let limit = avail.min(max_insns as usize);
@@ -731,11 +743,26 @@ impl Hart {
         let mem_ctx = (!self.strict_align
             && (self.csr.menvcfg | self.csr.senvcfg | self.csr.mseccfg) & envcfg::PMM_MASK == 0)
             .then(|| self.fast_tlb_ctx());
-        // Read each instruction from the arena in place. Nothing a block can
-        // contain invalidates the cache: fence.i, CSR accesses and the other
-        // flushing instructions end a block (`BbOpKind::Abort`).
-        for i in 0..limit {
-            let insn = self.bb_arena[start + i];
+        // The arena moves out of `self` while the block runs, so that the
+        // loop walks a plain slice. Nothing a block can contain touches the
+        // decode caches: fence.i, CSR accesses and the other flushing
+        // instructions end a block (`BbOpKind::Abort`).
+        let arena = std::mem::take(&mut self.bb_arena);
+        let gen_before = self.icache_gen;
+        let done = self.run_block(bus, &arena[start..start + limit], mem_ctx);
+        debug_assert_eq!(
+            self.icache_gen, gen_before,
+            "a block flushed the decode caches"
+        );
+        self.bb_arena = arena;
+        done
+    }
+
+    /// Runs the decoded instructions of one block (see [`Self::try_step_bb`])
+    /// and returns the number attempted, including one that trapped.
+    #[inline(always)]
+    fn run_block(&mut self, bus: &AddressSpace, insns: &[Insn], mem_ctx: Option<u64>) -> u64 {
+        for (i, insn) in insns.iter().enumerate() {
             // Integer ALU, Lui/Auipc, Jal/Jalr and branches cannot trap,
             // touch memory or set check_irq/wfi/yield_slice, so they skip the
             // `execute` call and the per-instruction flag check. Neither can
@@ -743,15 +770,10 @@ impl Hart {
             // with landing pads disabled and `elp` clear (see `run`), and
             // nothing in a block sets `elp`.
             debug_assert!(!self.elp);
-            if self.exec_simple(&insn) {
+            if self.exec_inline(bus, insn, mem_ctx) {
                 continue;
             }
-            if let Some(ctx) = mem_ctx {
-                if self.exec_mem_fast(bus, &insn, ctx) {
-                    continue;
-                }
-            }
-            match self.execute(bus, &insn) {
+            match self.execute(bus, insn) {
                 Ok(()) => {
                     if self.check_irq || self.wfi || self.yield_slice {
                         let done = (i + 1) as u64;
@@ -775,19 +797,21 @@ impl Hart {
                 }
             }
         }
-        let done = limit as u64;
+        let done = insns.len() as u64;
         self.bump_counters(done);
         done
     }
 
-    /// Executes `insn` if it is one of the simple integer instructions,
-    /// with the same semantics as the matching arm of [`Self::execute`];
-    /// returns `false` (and does nothing) for every other instruction.
+    /// Executes `insn` if it is one of the simple integer instructions, or
+    /// (with `mem_ctx`, see [`Self::exec_load_inline`]) an integer load or
+    /// store that hits the fast TLB, with the same semantics as the matching
+    /// arm of [`Self::execute`]; returns `false` (and does nothing) for
+    /// every other instruction. One `match` dispatches both kinds.
     #[inline(always)]
-    fn exec_simple(&mut self, insn: &Insn) -> bool {
+    fn exec_inline(&mut self, bus: &AddressSpace, insn: &Insn, mem_ctx: Option<u64>) -> bool {
         let pc = self.pc;
-        let rs1 = self.x[insn.rs1 as usize];
-        let rs2 = self.x[insn.rs2 as usize];
+        let rs1 = self.x[usize::from(insn.rs1 & 31)];
+        let rs2 = self.x[usize::from(insn.rs2 & 31)];
         let imm = insn.imm as u64;
         let rd = insn.rd;
         let v = match insn.op {
@@ -849,6 +873,28 @@ impl Hart {
                 self.pc = rs1.wrapping_add(imm) & !1;
                 return true;
             }
+            // One arm per opcode, so that each inlined access has a
+            // constant size.
+            Op::Ld => return self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Double, |v| v),
+            Op::Lw => {
+                return self
+                    .exec_load_inline(bus, insn, mem_ctx, AccessSize::Word, |v| v as i32 as u64);
+            }
+            Op::Lwu => return self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Word, |v| v),
+            Op::Lbu => return self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Byte, |v| v),
+            Op::Lb => {
+                return self
+                    .exec_load_inline(bus, insn, mem_ctx, AccessSize::Byte, |v| v as i8 as u64);
+            }
+            Op::Lhu => return self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Half, |v| v),
+            Op::Lh => {
+                return self
+                    .exec_load_inline(bus, insn, mem_ctx, AccessSize::Half, |v| v as i16 as u64);
+            }
+            Op::Sd => return self.exec_store_inline(bus, insn, mem_ctx, AccessSize::Double),
+            Op::Sw => return self.exec_store_inline(bus, insn, mem_ctx, AccessSize::Word),
+            Op::Sb => return self.exec_store_inline(bus, insn, mem_ctx, AccessSize::Byte),
+            Op::Sh => return self.exec_store_inline(bus, insn, mem_ctx, AccessSize::Half),
             _ => return false,
         };
         self.set_x(rd, v);
@@ -856,63 +902,52 @@ impl Hart {
         true
     }
 
-    /// Executes an integer load or store that stays within one page and
-    /// hits the fast TLB, with the same result as [`Self::execute`]; returns
-    /// `false` (and does nothing) otherwise. `ctx` is [`Self::fast_tlb_ctx`].
-    /// Only for block execution: the caller guarantees no pointer masking,
-    /// no strict alignment, and no triggers, watchpoints or logging.
+    /// An integer load in a block that stays within one page and hits the
+    /// fast TLB: loads, extends with `ext` and writes `rd`. Returns `false`
+    /// (and does nothing) otherwise, or when `mem_ctx` is `None`.
+    /// `mem_ctx` is [`Self::fast_tlb_ctx`] when the block may access memory
+    /// inline: no pointer masking and no strict alignment. Blocks never run
+    /// with triggers, watchpoints or logging.
     #[inline(always)]
-    fn exec_mem_fast(&mut self, bus: &AddressSpace, insn: &Insn, ctx: u64) -> bool {
-        // One arm per opcode, so that each inlined access has a constant size.
-        let loaded = match insn.op {
-            Op::Ld => self.fast_load(bus, insn, ctx, AccessSize::Double),
-            Op::Lw => self
-                .fast_load(bus, insn, ctx, AccessSize::Word)
-                .map(|v| v as i32 as u64),
-            Op::Lwu => self.fast_load(bus, insn, ctx, AccessSize::Word),
-            Op::Lbu => self.fast_load(bus, insn, ctx, AccessSize::Byte),
-            Op::Lb => self
-                .fast_load(bus, insn, ctx, AccessSize::Byte)
-                .map(|v| v as i8 as u64),
-            Op::Lhu => self.fast_load(bus, insn, ctx, AccessSize::Half),
-            Op::Lh => self
-                .fast_load(bus, insn, ctx, AccessSize::Half)
-                .map(|v| v as i16 as u64),
-            Op::Sd => return self.fast_store(bus, insn, ctx, AccessSize::Double),
-            Op::Sw => return self.fast_store(bus, insn, ctx, AccessSize::Word),
-            Op::Sb => return self.fast_store(bus, insn, ctx, AccessSize::Byte),
-            Op::Sh => return self.fast_store(bus, insn, ctx, AccessSize::Half),
-            _ => return false,
-        };
-        let Some(v) = loaded else {
+    fn exec_load_inline(
+        &mut self,
+        bus: &AddressSpace,
+        insn: &Insn,
+        mem_ctx: Option<u64>,
+        size: AccessSize,
+        ext: impl Fn(u64) -> u64,
+    ) -> bool {
+        let Some(ctx) = mem_ctx else {
             return false;
         };
-        self.set_x(insn.rd, v);
+        let va = self.x[usize::from(insn.rs1 & 31)].wrapping_add(insn.imm as u64);
+        if (va & 0xfff) + size.bytes() > 0x1000 {
+            return false;
+        }
+        let Some(v) = self
+            .fast_load_ram_off_ctx(va, ctx)
+            .and_then(|off| bus.read_fast_ram(off, size))
+        else {
+            return false;
+        };
+        self.set_x(insn.rd, ext(v));
         self.pc = self.pc.wrapping_add(u64::from(insn.len));
         true
     }
 
-    /// The load half of [`Self::exec_mem_fast`]: the zero-extended value, or
-    /// `None` for anything but a single-page fast-TLB hit on RAM.
+    /// The store counterpart of [`Self::exec_load_inline`].
     #[inline(always)]
-    fn fast_load(
-        &self,
+    fn exec_store_inline(
+        &mut self,
         bus: &AddressSpace,
         insn: &Insn,
-        ctx: u64,
+        mem_ctx: Option<u64>,
         size: AccessSize,
-    ) -> Option<u64> {
-        let va = self.x[insn.rs1 as usize].wrapping_add(insn.imm as u64);
-        if (va & 0xfff) + size.bytes() > 0x1000 {
-            return None;
-        }
-        bus.read_fast_ram(self.fast_load_ram_off_ctx(va, ctx)?, size)
-    }
-
-    /// The store half of [`Self::exec_mem_fast`].
-    #[inline(always)]
-    fn fast_store(&mut self, bus: &AddressSpace, insn: &Insn, ctx: u64, size: AccessSize) -> bool {
-        let va = self.x[insn.rs1 as usize].wrapping_add(insn.imm as u64);
+    ) -> bool {
+        let Some(ctx) = mem_ctx else {
+            return false;
+        };
+        let va = self.x[usize::from(insn.rs1 & 31)].wrapping_add(insn.imm as u64);
         if (va & 0xfff) + size.bytes() > 0x1000 {
             return false;
         }
@@ -921,7 +956,7 @@ impl Hart {
         };
         self.invalidate_reservation(pa);
         if bus
-            .write_fast_ram(pa, off, size, self.x[insn.rs2 as usize])
+            .write_fast_ram(pa, off, size, self.x[usize::from(insn.rs2 & 31)])
             .is_none()
         {
             return false;
@@ -1765,8 +1800,8 @@ impl Hart {
             self.elp = false;
         }
         let next = pc.wrapping_add(u64::from(insn.len));
-        let rs1 = self.x[insn.rs1 as usize];
-        let rs2 = self.x[insn.rs2 as usize];
+        let rs1 = self.x[usize::from(insn.rs1 & 31)];
+        let rs2 = self.x[usize::from(insn.rs2 & 31)];
         let imm = insn.imm as u64;
         let rd = insn.rd;
         let mut new_pc = next;
