@@ -2228,7 +2228,15 @@ impl Hart {
             _ => (true, true),
         };
         self.check_data_triggers(addr, size.bytes(), is_load, is_store)?;
-        if addr & (size.bytes() - 1) != 0 {
+        // Zama16b: a misaligned AMO (Zaamo, Zabha, Zacas up to doubleword)
+        // that stays inside a naturally aligned 16-byte granule executes
+        // atomically. Other misaligned AMOs, and misaligned LR/SC and
+        // Zalasr accesses, raise address-misaligned.
+        let misaligned = addr & (size.bytes() - 1) != 0;
+        if misaligned
+            && (matches!(insn.op, Op::Lr | Op::Sc | Op::LoadAq | Op::StoreRl)
+                || (addr & 15) + size.bytes() > 16)
+        {
             let c = if matches!(insn.op, Op::Lr | Op::LoadAq) {
                 cause::LOAD_MISALIGNED
             } else {
@@ -2236,6 +2244,13 @@ impl Hart {
             };
             return Err(Exception::new(c, addr));
         }
+        let amo_rmw = |pa: u64, f: &mut dyn FnMut(u64) -> u64| {
+            if misaligned {
+                bus.atomic_rmw_granule(pa, size, f)
+            } else {
+                bus.atomic_rmw(pa, size, f)
+            }
+        };
         match insn.op {
             Op::Lr => {
                 let pa = self.translate(bus, addr, Access::Load)?;
@@ -2286,15 +2301,14 @@ impl Hart {
                 self.check_pmp_access(addr, pa, size.bytes(), Access::Store)?;
                 let cmp = zext(self.x[usize::from(insn.rd)]);
                 let new_val = zext(src);
-                let old = bus
-                    .atomic_rmw(pa, size, |old_raw| {
-                        if zext(old_raw) == cmp {
-                            new_val
-                        } else {
-                            old_raw
-                        }
-                    })
-                    .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
+                let old = amo_rmw(pa, &mut |old_raw| {
+                    if zext(old_raw) == cmp {
+                        new_val
+                    } else {
+                        old_raw
+                    }
+                })
+                .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
                 self.invalidate_reservation(pa);
                 self.set_x(insn.rd, sext(old));
             }
@@ -2304,23 +2318,22 @@ impl Hart {
                 let b_s = sext(src) as i64;
                 let b_u = zext(src);
                 let funct = insn.funct;
-                let old = bus
-                    .atomic_rmw(pa, size, |old_raw| {
-                        let a_s = sext(old_raw) as i64;
-                        let a_u = zext(old_raw);
-                        match funct {
-                            amo::SWAP => b_u,
-                            amo::ADD => a_u.wrapping_add(b_u),
-                            amo::XOR => a_u ^ b_u,
-                            amo::AND => a_u & b_u,
-                            amo::OR => a_u | b_u,
-                            amo::MIN => a_s.min(b_s) as u64,
-                            amo::MAX => a_s.max(b_s) as u64,
-                            amo::MINU => a_u.min(b_u),
-                            _ => a_u.max(b_u),
-                        }
-                    })
-                    .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
+                let old = amo_rmw(pa, &mut |old_raw| {
+                    let a_s = sext(old_raw) as i64;
+                    let a_u = zext(old_raw);
+                    match funct {
+                        amo::SWAP => b_u,
+                        amo::ADD => a_u.wrapping_add(b_u),
+                        amo::XOR => a_u ^ b_u,
+                        amo::AND => a_u & b_u,
+                        amo::OR => a_u | b_u,
+                        amo::MIN => a_s.min(b_s) as u64,
+                        amo::MAX => a_s.max(b_s) as u64,
+                        amo::MINU => a_u.min(b_u),
+                        _ => a_u.max(b_u),
+                    }
+                })
+                .map_err(|_| Exception::new(cause::STORE_ACCESS, addr))?;
                 self.invalidate_reservation(pa);
                 self.set_x(insn.rd, sext(old));
             }

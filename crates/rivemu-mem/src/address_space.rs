@@ -556,6 +556,33 @@ impl AddressSpace {
         }
     }
 
+    /// Atomic read-modify-write of a misaligned field inside one 16-byte
+    /// granule of guest RAM (Zama16b misaligned AMOs).
+    pub fn atomic_rmw_granule(
+        &self,
+        addr: GuestAddr,
+        size: AccessSize,
+        f: impl FnMut(u64) -> u64,
+    ) -> Result<u64, BusError> {
+        let r = self.find_access(addr, size)?;
+        let off = addr - r.base;
+        match &r.kind {
+            RegionKind::Ram(m) => {
+                let old = m
+                    .atomic_rmw_granule(off, size, f)
+                    .ok_or(BusError::CrossesBoundary {
+                        addr,
+                        size: size.bytes(),
+                    })?;
+                // A 16-byte granule never crosses a reservation line.
+                self.invalidate_cache_line(addr, size);
+                Ok(old)
+            }
+            RegionKind::Rom(_) => Err(BusError::ReadOnly { addr }),
+            RegionKind::Mmio(_) => Err(BusError::NotMemory { addr }),
+        }
+    }
+
     /// 128-bit atomic compare-and-swap on guest RAM (`amocas.q`).
     #[inline]
     pub fn atomic_cas128(

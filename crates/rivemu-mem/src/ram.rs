@@ -465,6 +465,75 @@ impl Ram {
         }
     }
 
+    /// Atomic read-modify-write of a misaligned `size`-byte field at
+    /// `offset` that lies inside one naturally aligned 16-byte granule
+    /// (Zama16b). Returns the old field value, or `None` if the field crosses
+    /// the granule or is out of bounds.
+    ///
+    /// A field inside one aligned doubleword uses a 64-bit compare-and-swap.
+    /// A field straddling the granule's two doublewords is updated with two
+    /// stores, like [`Self::atomic_cas128`]: atomic because every hart and
+    /// device of a machine runs on one thread (`Machine::run_slice`).
+    pub fn atomic_rmw_granule(
+        &self,
+        offset: u64,
+        size: AccessSize,
+        mut f: impl FnMut(u64) -> u64,
+    ) -> Option<u64> {
+        let n = size.bytes();
+        if (offset & 15) + n > 16 || !self.in_bounds(offset, n) {
+            return None;
+        }
+        self.mark_dirty_range(offset, n);
+        let mask = if n == 8 {
+            u64::MAX
+        } else {
+            (1u64 << (8 * n)) - 1
+        };
+        let dword = offset & !7;
+        if (offset - dword) + n <= 8 {
+            let shift = 8 * (offset - dword);
+            // SAFETY: `dword` is 8-byte aligned (the mapping is page-aligned)
+            // and `dword + 8 <= offset + n <= len` or the field would cross
+            // the granule end, which lies inside the mapping.
+            let atom = unsafe { AtomicU64::from_ptr(self.at(dword).cast()) };
+            let mut cur_le = atom.load(Ordering::Acquire);
+            loop {
+                let cur = u64::from_le(cur_le);
+                let old = (cur >> shift) & mask;
+                let next = (cur & !(mask << shift)) | ((f(old) & mask) << shift);
+                match atom.compare_exchange_weak(
+                    cur_le,
+                    next.to_le(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return Some(old),
+                    Err(actual) => cur_le = actual,
+                }
+            }
+        }
+        let granule = offset & !15;
+        if !self.in_bounds(granule, 16) {
+            return None;
+        }
+        let shift = 8 * (offset - granule);
+        // SAFETY: `granule` is 16-byte aligned and `granule + 16 <= len`.
+        let (lo, hi) = unsafe {
+            (
+                AtomicU64::from_ptr(self.at(granule).cast()),
+                AtomicU64::from_ptr(self.at(granule + 8).cast()),
+            )
+        };
+        let cur = u128::from(u64::from_le(lo.load(Ordering::Acquire)))
+            | (u128::from(u64::from_le(hi.load(Ordering::Acquire))) << 64);
+        let old = ((cur >> shift) as u64) & mask;
+        let next = (cur & !(u128::from(mask) << shift)) | (u128::from(f(old) & mask) << shift);
+        lo.store((next as u64).to_le(), Ordering::Release);
+        hi.store(((next >> 64) as u64).to_le(), Ordering::Release);
+        Some(old)
+    }
+
     /// 128-bit compare-and-swap (`amocas.q`) for 16-byte aligned guest RAM
     /// accesses. Returns the original `(lo, hi)` pair, or `None` if out of
     /// bounds or unaligned.

@@ -163,7 +163,7 @@ Ranked; details in [`REVIEW-20261102.md`](REVIEW-20261102.md) §6.
    candidates are in REVIEW §7.
 2. Extend boot lockstep past the first 10M instructions (checkpointed
    windows) and add a 3M-step run to CI as a scheduled job.
-3. Resolve the RVA23 claim: implement Zama16b and H, or narrow the README.
+3. H extension (RVA23S64). Zama16b is implemented, and the README claims RVA23U64 only.
 4. Add an ACT job to CI. The unprivileged suites now pass 833/833 locally.
 5. `linux_devices` now runs in CI (job `linux-devices`; the images build in
    about 20 min and are then cached).

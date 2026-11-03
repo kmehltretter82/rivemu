@@ -94,6 +94,50 @@ jobs:
         env:
           RIVEMU_REQUIRE_LINUX_DEVICES: 1
 
+  arch-test:
+    # riscv-arch-test (ACT4): the 15 privileged and all rv64i suites, Sail
+    # 0.16 as the reference (tests/arch-test/README.md). The ELFs are rebuilt
+    # only when the configuration or the build script changes.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - id: elfs
+        uses: actions/cache@v4
+        with:
+          path: arch-test-work/act-work/rivemu-rv64/elfs
+          key: arch-test-elfs-${{ hashFiles('tests/arch-test/rivemu-rv64/**', 'scripts/build-arch-test.sh') }}
+      - if: steps.elfs.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            arch-test-work/sail
+            arch-test-work/sail-riscv
+          key: arch-test-tools-${{ hashFiles('scripts/build-arch-test.sh') }}
+      - if: steps.elfs.outputs.cache-hit != 'true'
+        name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-20 lld-20 llvm-20 cmake libgmp-dev zlib1g-dev
+      - if: steps.elfs.outputs.cache-hit != 'true'
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - if: steps.elfs.outputs.cache-hit != 'true'
+        uses: astral-sh/setup-uv@v6
+      - if: steps.elfs.outputs.cache-hit != 'true'
+        run: scripts/build-arch-test.sh arch-test-work
+      - run: cargo build --release -p rivemu-cli
+      - run: scripts/run-arch-test.sh "$PWD/arch-test-work/act-work/rivemu-rv64/elfs" "$RUNNER_TEMP/act"
+      - name: Require every test to pass
+        run: |
+          cat "$RUNNER_TEMP/act/summary.txt" >> "$GITHUB_STEP_SUMMARY"
+          grep -qx 'FAIL: 0' "$RUNNER_TEMP/act/summary.txt"
+          grep -qx 'TIMEOUT: 0' "$RUNNER_TEMP/act/summary.txt"
+          test "$(sed -n 's/^total: //p' "$RUNNER_TEMP/act/summary.txt")" -ge 1251
+
   p17-bench:
     # P17 Linux-to-shell benchmark (tests/linux_perf.rs, Debian inputs) for the
     # PR head and its base, alternating on the same runner so that both see

@@ -47,8 +47,8 @@ QEMU implements.
 
 | File | Origin | Changes |
 |---|---|---|
-| `rivemu-rv64.yaml` (UDB) | `qemu-rv64-max.yaml` | Removed: H and the hypervisor-dependent Sh\* extensions, Smaia/Ssaia, Smcdeleg, Smcsrind/Sscsrind, Smctr/Ssctr, Ssccfg, Q, Zv\* crypto/FP16/BF16, B, Zama16b. Added: Svukte, Zvl256b. `VLEN` 256; `MARCHID_IMPLEMENTED` false; delegation masks match rivemu. |
-| `sail.json` | `qemu-rv64-max/sail.json` | The same extensions disabled. `medeleg` delegatable bits `0x4b3ff` (rivemu's `MEDELEG_MASK`); `vlen_exp` 8; `archid` 0; misaligned AMOs raise address-misaligned (rivemu's choice; the spec also allows an access fault). |
+| `rivemu-rv64.yaml` (UDB) | `qemu-rv64-max.yaml` | Removed: H and the hypervisor-dependent Sh\* extensions, Smaia/Ssaia, Smcdeleg, Smcsrind/Sscsrind, Smctr/Ssctr, Ssccfg, Q, Zv\* crypto/FP16/BF16, B. Added: Svukte, Zvl256b. `VLEN` 256; `MARCHID_IMPLEMENTED` false; delegation masks match rivemu. |
+| `sail.json` | `qemu-rv64-max/sail.json` | The same extensions disabled. `medeleg` delegatable bits `0x4b3ff` (rivemu's `MEDELEG_MASK`); `vlen_exp` 8; `archid` 0. Zama16b: RAM has a 16-byte misaligned-atomicity granule, and misaligned AMOs crossing it raise address-misaligned (rivemu's choice; the spec also allows an access fault). |
 | `rvmodel_macros.h` | `qemu-rv64-m/rvmodel_macros.h`, unchanged | rivemu's `virt` has the same CLINT, PLIC, UART and semihosting exit. |
 | `link.ld` | `qemu-rv64-max/link.ld`, unchanged | |
 
@@ -57,8 +57,8 @@ make either way, and rivemu reports them as follows:
 
 - **misa.B:** rivemu reads 0 even though Zba, Zbb and Zbs are implemented.
   QEMU's `rv64` model does the same.
-- **Misaligned AMOs:** rivemu raises address-misaligned. It does not
-  implement Zama16b, which RVA23U64 requires.
+- **Misaligned AMOs outside a 16-byte granule:** rivemu raises
+  address-misaligned. Inside a granule they execute (Zama16b).
 
 The first run still had QEMU's VLEN (128), B, archid (5) and misaligned-AMO
 settings, with Svukte off. It failed 21 tests: 14 from those settings and 7

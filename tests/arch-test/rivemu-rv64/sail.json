@@ -278,7 +278,9 @@
         },
         // Similarly, a misaligned AMO and LR/SC can be configured with the same
         // option values.
-        "amo": { "Some": "AlignmentException" },
+        "amo": {
+          "None": null
+        },
         "lrsc": { "Some": "AlignmentException" }
       },
       // If multiple memory operations are needed, this controls whether they
@@ -419,8 +421,8 @@
             "vector": {
               "None": null
             },
-            "amo": "AccessFault",
-            "lrsc": "AccessFault"
+            "amo": "AlignmentException",
+            "lrsc": "AlignmentException"
           },
           "atomic_support": "AMOCASQ",
           "misaligned_atomicity_granule_size_exp": 4,
@@ -761,7 +763,7 @@
     // cacheable main memory region is >= 4, otherwise you will get a
     // config validation error.
     "Zama16b": {
-      "supported": false
+      "supported": true
     },
     "Zawrs": {
       "supported": true,

@@ -2034,6 +2034,72 @@ fn svnapot_sv57_and_zawrs_semantics() {
     assert_eq!(h.csr.mtval, 0x00d0_0073);
 }
 
+/// Zama16b (RVA23U64): a misaligned AMO that stays inside a naturally aligned
+/// 16-byte granule executes; one that crosses the granule, and any misaligned
+/// LR/SC, raises address-misaligned.
+#[test]
+fn zama16b_misaligned_amos_inside_a_granule_execute() {
+    use rivemu_cpu_riscv::{cause, csr};
+
+    const CODE: u64 = 0x8000_0000;
+    const MTVEC: u64 = 0x8000_0800;
+    const DATA: u64 = 0x8001_0000;
+    const AMOADD_W: u64 = 0x00c5_25af; // amoadd.w x11, x12, (x10)
+    const AMOADD_D: u64 = 0x00c5_35af; // amoadd.d x11, x12, (x10)
+    const AMOCAS_W: u64 = 0x28c5_25af; // amocas.w x11, x12, (x10)
+    const LR_W: u64 = 0x1005_25af; // lr.w x11, (x10)
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    for (i, w) in [AMOADD_W, AMOADD_D, AMOCAS_W, LR_W].into_iter().enumerate() {
+        bus.write(CODE + 4 * i as u64, AccessSize::Word, w).unwrap();
+    }
+    let bytes: Vec<u8> = (0u8..16).collect();
+    bus.load_bytes(DATA, &bytes).unwrap();
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mtvec = MTVEC;
+    let run = |h: &mut Hart, insn: u64, addr: u64, rs2: u64, rd_in: u64| {
+        h.pc = CODE + 4 * insn;
+        h.x[10] = addr;
+        h.x[11] = rd_in;
+        h.x[12] = rs2;
+        h.step(&bus);
+    };
+    let read = |addr: u64, size: AccessSize| bus.read(addr, size).unwrap();
+
+    // Word at offset 2: inside one doubleword.
+    run(&mut h, 0, DATA + 2, 0x0101_0101, 0);
+    assert_eq!(h.pc, CODE + 4);
+    assert_eq!(h.x[11], 0x0504_0302);
+    assert_eq!(read(DATA + 2, AccessSize::Word), 0x0605_0403);
+
+    // Doubleword at offset 4: straddles the granule's two doublewords.
+    let before = read(DATA + 4, AccessSize::Double);
+    run(&mut h, 1, DATA + 4, 1, 0);
+    assert_eq!(h.pc, CODE + 8);
+    assert_eq!(h.x[11], before);
+    assert_eq!(read(DATA + 4, AccessSize::Double), before + 1);
+
+    // amocas.w at offset 9: compare matches, so the new value is stored.
+    let cur = read(DATA + 9, AccessSize::Word);
+    run(&mut h, 2, DATA + 9, 0xdead_beef, cur);
+    assert_eq!(h.pc, CODE + 12);
+    assert_eq!(h.x[11], cur as u32 as i32 as i64 as u64);
+    assert_eq!(read(DATA + 9, AccessSize::Word), 0xdead_beef);
+
+    // Doubleword at offset 12 crosses the granule: address-misaligned.
+    run(&mut h, 1, DATA + 12, 1, 0);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE), Some(cause::STORE_MISALIGNED));
+    assert_eq!(h.csr_read(csr::MTVAL), Some(DATA + 12));
+
+    // LR is not covered by Zama16b.
+    run(&mut h, 3, DATA + 2, 0, 0);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE), Some(cause::LOAD_MISALIGNED));
+}
+
 /// The load/store fast TLB must not outlive the context it was filled in:
 /// clearing `mstatus.SUM` and switching `satp` to another ASID whose mapping is
 /// read-only must both take effect on the next access to an already-cached page.
