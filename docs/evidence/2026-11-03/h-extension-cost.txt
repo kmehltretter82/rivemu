@@ -1,0 +1,25 @@
+# Cost of the H extension code when H is off (2026-11-03)
+
+## Host instructions (valgrind --tool=callgrind), deterministic boot
+# rivemu -M virt -smp 1 -m 512M -icount shift=3, OpenSBI v1.7 + Linux 6.12
+# (images/linux-src) to RIVEMU_SMOKE_OK + poweroff; "Collected" = total Ir.
+69f234d (before H)   26,007,025,371   RIVEMU_SMOKE_OK
+27ddcbf (with H)     26,031,774,030   RIVEMU_SMOKE_OK
+# +24.7 M host instructions, +0.095%.
+
+## CI p17-bench, run 41608020067 (27ddcbf), head vs base (main) on the same runner, 9 samples
+label smp n median p95 (seconds)
+# macos-latest (a slower runner than in run 41594273005: base 24.49 s vs 18.75 s there)
+head 1 9 8.963 14.820
+head 4 9 9.958 12.704
+base 1 9 24.490 33.270
+base 4 9 28.000 32.587
+# ubuntu-latest
+head 1 9 10.881 10.921
+head 4 9 11.321 11.431
+base 1 9 36.652 37.197
+base 4 9 46.325 47.122
+# head/base on macOS: 0.366 (SMP1), 0.356 (SMP4); at eabd681 0.381 / 0.366,
+# at 7860b3a 0.374 / 0.302. On this slower runner the SMP1 median (8.96 s)
+# is above the 8 s target; the same code met it on the runners of the
+# earlier runs (evidence/2026-11-03/p17-ci-apple-silicon.txt).
