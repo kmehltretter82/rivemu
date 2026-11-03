@@ -114,7 +114,7 @@ const BBCACHE_SIZE: usize = 4096;
 fn decode_cache_index(pa: u64, size: usize) -> usize {
     (((pa >> 1) ^ (pa >> 13)) as usize) & (size - 1)
 }
-const BB_MAX_INSNS: usize = 8;
+const BB_MAX_INSNS: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BbOpKind {
@@ -127,7 +127,6 @@ enum BbOpKind {
 const fn bb_op_kind(op: Op) -> BbOpKind {
     match op {
         Op::Illegal
-        | Op::Fence
         | Op::FenceI
         | Op::Ecall
         | Op::Ebreak
@@ -398,7 +397,12 @@ impl Hart {
             tlb: Tlb::default(),
             pmp_cache: PmpCache::default(),
             icache: Box::new([IcacheEntry::default(); ICACHE_SIZE]),
-            bbcache: Box::new([BbCacheEntry::default(); BBCACHE_SIZE]),
+            // Built on the heap: the cache is about 2 MiB, more than a test
+            // thread's stack.
+            bbcache: vec![BbCacheEntry::default(); BBCACHE_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .expect("BBCACHE_SIZE entries"),
             icache_gen: 1,
             fetch_vpn: 0,
             fetch_pa_page: 0,
@@ -692,18 +696,34 @@ impl Hart {
             return 0;
         }
         let limit = avail.min(max_insns as usize);
+        // Everything the inline load/store path depends on besides the fast
+        // TLB itself is constant within a block: the privilege mode,
+        // mstatus, senvcfg and the pointer-masking CSRs change only through
+        // CSR writes, traps and xRET, and those end a block. `run` already
+        // excluded triggers, watchpoints, logging and sub-page PMP.
+        let mem_ctx = (!self.strict_align
+            && (self.csr.menvcfg | self.csr.senvcfg | self.csr.mseccfg) & envcfg::PMM_MASK == 0)
+            .then(|| self.fast_tlb_ctx());
         // Read each instruction from the cache entry in place instead of
         // copying the whole entry (about 176 bytes) per block. Nothing a
         // block can contain invalidates the cache: fence.i, CSR accesses and
         // the other flushing instructions end a block (`BbOpKind::Abort`).
         for i in 0..limit {
             let insn = self.bbcache[bb_idx].insns[i];
-            // Integer ALU, Lui/Auipc, Jal and branches cannot trap, touch
-            // memory or set check_irq/wfi/yield_slice, so they skip the
-            // `execute` call and the per-instruction flag check. A pending
+            // Integer ALU, Lui/Auipc, Jal/Jalr and branches cannot trap,
+            // touch memory or set check_irq/wfi/yield_slice, so they skip the
+            // `execute` call and the per-instruction flag check. Neither can
+            // a RAM load or store that hits the fast TLB. A pending
             // landing-pad check (`elp`) still goes through `execute`.
-            if !self.elp && self.exec_simple(&insn) {
-                continue;
+            if !self.elp {
+                if self.exec_simple(&insn) {
+                    continue;
+                }
+                if let Some(ctx) = mem_ctx {
+                    if self.exec_mem_fast(bus, &insn, ctx) {
+                        continue;
+                    }
+                }
             }
             match self.execute(bus, &insn) {
                 Ok(()) => {
@@ -796,10 +816,69 @@ impl Hart {
                 self.pc = pc.wrapping_add(imm);
                 return true;
             }
+            // Blocks run only with landing pads disabled (see `run`), so
+            // Jalr never sets `elp` here.
+            Op::Jalr => {
+                self.set_x(rd, pc.wrapping_add(u64::from(insn.len)));
+                self.pc = rs1.wrapping_add(imm) & !1;
+                return true;
+            }
             _ => return false,
         };
         self.set_x(rd, v);
         self.pc = pc.wrapping_add(u64::from(insn.len));
+        true
+    }
+
+    /// Executes an integer load or store that stays within one page and
+    /// hits the fast TLB, with the same result as [`Self::execute`]; returns
+    /// `false` (and does nothing) otherwise. `ctx` is [`Self::fast_tlb_ctx`].
+    /// Only for block execution: the caller guarantees no pointer masking,
+    /// no strict alignment, and no triggers, watchpoints or logging.
+    #[inline(always)]
+    fn exec_mem_fast(&mut self, bus: &AddressSpace, insn: &Insn, ctx: u64) -> bool {
+        let (size, store) = match insn.op {
+            Op::Ld => (AccessSize::Double, false),
+            Op::Sd => (AccessSize::Double, true),
+            Op::Lw | Op::Lwu => (AccessSize::Word, false),
+            Op::Sw => (AccessSize::Word, true),
+            Op::Lbu | Op::Lb => (AccessSize::Byte, false),
+            Op::Sb => (AccessSize::Byte, true),
+            Op::Lh | Op::Lhu => (AccessSize::Half, false),
+            Op::Sh => (AccessSize::Half, true),
+            _ => return false,
+        };
+        let va = self.x[insn.rs1 as usize].wrapping_add(insn.imm as u64);
+        if (va & 0xfff) + size.bytes() > 0x1000 {
+            return false;
+        }
+        if store {
+            let Some((pa, off)) = self.fast_store_ram_off_ctx(va, ctx) else {
+                return false;
+            };
+            self.invalidate_reservation(pa);
+            if bus
+                .write_fast_ram(pa, off, size, self.x[insn.rs2 as usize])
+                .is_none()
+            {
+                return false;
+            }
+        } else {
+            let Some(v) = self
+                .fast_load_ram_off_ctx(va, ctx)
+                .and_then(|off| bus.read_fast_ram(off, size))
+            else {
+                return false;
+            };
+            let v = match insn.op {
+                Op::Lb => v as i8 as u64,
+                Op::Lh => v as i16 as u64,
+                Op::Lw => v as i32 as u64,
+                _ => v,
+            };
+            self.set_x(insn.rd, v);
+        }
+        self.pc = self.pc.wrapping_add(u64::from(insn.len));
         true
     }
 

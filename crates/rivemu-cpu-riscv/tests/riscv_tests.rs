@@ -3680,3 +3680,86 @@ fn smdbltrp_reset_value_trap_entry_and_critical_error() {
     assert!(h.critical_error);
     assert_eq!(h.pc, 0x8000_0100);
 }
+
+/// Block execution runs RAM loads and stores that hit the fast TLB inline
+/// (`exec_mem_fast`). It must give the same registers, memory and retired
+/// count as single-stepping through `execute`: sign and zero extension for
+/// every width, a page-crossing load (which takes the full path), and a store
+/// between LR and SC that clears the reservation.
+#[test]
+fn block_loads_and_stores_match_single_stepping() {
+    const CODE: u64 = 0x8000_0000;
+    const DATA: u64 = 0x8001_0000;
+    const PROGRAM: &[u32] = &[
+        0x0005_3283, // ld   t0, 0(a0)
+        0x0045_2303, // lw   t1, 4(a0)
+        0x0065_1383, // lh   t2, 6(a0)
+        0x0075_0403, // lb   s0, 7(a0)
+        0x0045_6483, // lwu  s1, 4(a0)
+        0x0065_5683, // lhu  a3, 6(a0)
+        0x0075_4703, // lbu  a4, 7(a0)
+        0x0055_3423, // sd   t0, 8(a0)
+        0x0065_2823, // sw   t1, 16(a0)
+        0x0075_1a23, // sh   t2, 20(a0)
+        0x0085_0b23, // sb   s0, 22(a0)
+        0x0005_b783, // ld   a5, 0(a1)       (crosses a page)
+        0x1008_b82f, // lr.d a6, (a7)
+        0x0058_b023, // sd   t0, 0(a7)
+        0x1868_b92f, // sc.d s2, t1, (a7)
+        0x00f8_bc23, // sd   a5, 24(a7)
+        0x0185_0513, // addi a0, a0, 24
+        0x0015_8593, // addi a1, a1, 1
+        0xfff6_0613, // addi a2, a2, -1
+        0xfa06_1ae3, // bnez a2, loop
+        0x1050_0073, // wfi
+    ];
+    let setup = || {
+        let mut bus = AddressSpace::new();
+        bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+            .unwrap();
+        for (i, &w) in PROGRAM.iter().enumerate() {
+            bus.write(CODE + 4 * i as u64, AccessSize::Word, u64::from(w))
+                .unwrap();
+        }
+        for i in 0..0x2000u64 {
+            bus.write(DATA + i, AccessSize::Byte, (i * 37 + 0x80) & 0xff)
+                .unwrap();
+        }
+        let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+        h.reset(CODE);
+        h.x[10] = DATA;
+        h.x[11] = DATA + 0x1000 - 4;
+        h.x[12] = 10;
+        h.x[17] = DATA + 0x1800;
+        (bus, h)
+    };
+
+    let (block_bus, mut block) = setup();
+    let mut attempted = 0;
+    while !block.wfi && attempted < 10_000 {
+        attempted += block.run(&block_bus, 10_000);
+    }
+    let (step_bus, mut stepped) = setup();
+    while !stepped.wfi && stepped.instret() < 10_000 {
+        stepped.step(&step_bus);
+    }
+
+    assert!(block.wfi && stepped.wfi);
+    assert_eq!(block.instret(), 10 * 20 + 1);
+    assert_eq!(block.instret(), stepped.instret());
+    assert_eq!(block.pc, stepped.pc);
+    assert_eq!(block.x, stepped.x);
+    for off in (0..0x2000).step_by(8) {
+        assert_eq!(
+            block_bus.read(DATA + off, AccessSize::Double).unwrap(),
+            step_bus.read(DATA + off, AccessSize::Double).unwrap(),
+            "memory differs at {:#x}",
+            DATA + off
+        );
+    }
+    // The last iteration read bytes 0xd8.. of the pattern: sign extension
+    // differs from zero extension for these values.
+    assert_ne!(block.x[6] >> 32, 0, "lw sign-extends");
+    assert_eq!(block.x[9] >> 32, 0, "lwu zero-extends");
+    assert_eq!(block.x[6] & 0xffff_ffff, block.x[9]);
+}

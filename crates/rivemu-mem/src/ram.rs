@@ -79,7 +79,14 @@ impl Ram {
         let last_page = (offset.saturating_add(len - 1) >> 12) as usize;
         for p in first_page..=last_page {
             if let Some(w) = self.dirty.get(p >> 6) {
-                w.fetch_or(1u64 << (p & 63), Ordering::Relaxed);
+                // Bits are only cleared while the machine is stopped (reset,
+                // snapshot restore), so a set bit stays set while guests and
+                // devices write. Testing first skips the locked
+                // read-modify-write on every store to an already-dirty page.
+                let bit = 1u64 << (p & 63);
+                if w.load(Ordering::Relaxed) & bit == 0 {
+                    w.fetch_or(bit, Ordering::Relaxed);
+                }
             }
         }
     }

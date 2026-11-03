@@ -291,6 +291,10 @@ pub struct Machine {
     pub fdt_addr: GuestAddr,
     /// The harts.
     pub harts: Vec<Hart>,
+    /// Guest PC profile: when `Some`, every scheduling slice adds the number
+    /// of instructions a hart ran to the entry for the PC it stopped at, so
+    /// the totals approximate where guest instructions are spent.
+    pub pc_samples: Option<std::collections::HashMap<u64, u64>>,
     /// Console UART.
     pub uart: Arc<Uart16550>,
     /// Timer / software interrupt controller.
@@ -720,6 +724,7 @@ impl Machine {
             boot,
             fdt_addr,
             harts,
+            pc_samples: None,
             uart,
             clint,
             plic,
@@ -766,6 +771,11 @@ impl Machine {
                 }
                 if let Some(ic) = &self.icount {
                     ic.advance(ran);
+                }
+                if ran > 0 {
+                    if let Some(samples) = &mut self.pc_samples {
+                        *samples.entry(self.harts[i].pc).or_insert(0) += ran;
+                    }
                 }
                 rem = rem.saturating_sub(ran);
                 if self.harts[i].pending_sbi {

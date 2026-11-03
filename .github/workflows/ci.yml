@@ -141,10 +141,15 @@ jobs:
   p17-bench:
     # P17 Linux-to-shell benchmark (tests/linux_perf.rs, Debian inputs) for the
     # PR head and its base, alternating on the same runner so that both see
-    # the same machine. Informational: it reports medians and never fails on
-    # timing.
+    # the same machine. The P17 target (docs/PLAN.md) is defined on Apple
+    # Silicon, which macos-latest is. Informational: it reports medians and
+    # never fails on timing.
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
@@ -157,11 +162,15 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: images/linux-test
-          key: linux-test-${{ hashFiles('scripts/fetch-linux-test.sh') }}
+          key: linux-test-${{ runner.os }}-${{ hashFiles('scripts/fetch-linux-test.sh') }}
       - run: scripts/fetch-linux-test.sh
       - run: mkdir -p base/images && cp -r images/linux-test base/images/
+      - name: Boot profile (head, Debian inputs, to /init + poweroff)
+        run: scripts/p17-profile.sh
       - run: scripts/p17-compare.sh 3 head=. base=base | tee p17-compare.txt
-      - run: tail -6 p17-compare.txt >> "$GITHUB_STEP_SUMMARY"
+      - run: |
+          echo "### P17 on ${{ matrix.os }} ($(uname -m))" >> "$GITHUB_STEP_SUMMARY"
+          tail -6 p17-compare.txt >> "$GITHUB_STEP_SUMMARY"
 
   msrv:
     name: msrv (1.85)

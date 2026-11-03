@@ -513,16 +513,29 @@ impl Hart {
     /// RAM offset for a load from `va` (within one page) on a fast-TLB hit.
     #[inline]
     pub(crate) fn fast_load_ram_off(&self, va: u64) -> Option<u64> {
+        self.fast_load_ram_off_ctx(va, self.fast_tlb_ctx())
+    }
+
+    /// [`Self::fast_load_ram_off`] with a precomputed [`Self::fast_tlb_ctx`],
+    /// for callers that know the context cannot have changed.
+    #[inline(always)]
+    pub(crate) fn fast_load_ram_off_ctx(&self, va: u64, ctx: u64) -> Option<u64> {
         let e = &self.tlb.fast.load[((va >> 12) as usize) & (FAST_TLB_SIZE - 1)];
-        (e.tag == (va >> 12) + 1 && e.epoch == self.tlb.fast.epoch && e.ctx == self.fast_tlb_ctx())
+        (e.tag == (va >> 12) + 1 && e.epoch == self.tlb.fast.epoch && e.ctx == ctx)
             .then_some(e.ram_page_off | (va & 0xfff))
     }
 
     /// `(pa, ram_off)` for a store to `va` (within one page) on a fast-TLB hit.
     #[inline]
     pub(crate) fn fast_store_ram_off(&self, va: u64) -> Option<(u64, u64)> {
+        self.fast_store_ram_off_ctx(va, self.fast_tlb_ctx())
+    }
+
+    /// [`Self::fast_store_ram_off`] with a precomputed [`Self::fast_tlb_ctx`].
+    #[inline(always)]
+    pub(crate) fn fast_store_ram_off_ctx(&self, va: u64, ctx: u64) -> Option<(u64, u64)> {
         let e = &self.tlb.fast.store[((va >> 12) as usize) & (FAST_TLB_SIZE - 1)];
-        (e.tag == (va >> 12) + 1 && e.epoch == self.tlb.fast.epoch && e.ctx == self.fast_tlb_ctx())
+        (e.tag == (va >> 12) + 1 && e.epoch == self.tlb.fast.epoch && e.ctx == ctx)
             .then_some((e.pa_page | (va & 0xfff), e.ram_page_off | (va & 0xfff)))
     }
 

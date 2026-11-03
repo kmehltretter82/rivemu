@@ -136,6 +136,11 @@ done
 echo "=== rivemu BusyBox initramfs ==="
 /bin/busybox uname -srm
 if /bin/busybox grep -q "rivemu.poweroff" /proc/cmdline; then
+    # scripts/p17-profile.sh symbolizes guest PCs with this. Nested here so
+    # that the P17 path (no rivemu.poweroff) runs the same commands as before.
+    if /bin/busybox grep -q "rivemu.kallsyms" /proc/cmdline; then
+        /bin/busybox cat /proc/kallsyms
+    fi
     echo "RIVEMU_SMOKE_OK"
     /bin/busybox poweroff -f
 fi
