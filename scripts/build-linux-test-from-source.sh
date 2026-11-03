@@ -34,8 +34,8 @@ clone_verified() {
     fi
 }
 
-# 1. Linux kernel Image.
-clone_verified https://github.com/torvalds/linux.git "$LINUX_TAG" "$LINUX_COMMIT" "$SRC/linux"
+# 1. Linux kernel Image. Sources are cloned only when an output is missing,
+# so a cached Image/busybox (CI) needs no network.
 cat > "$OUT/linux.fragment" <<'EOF'
 CONFIG_MODULES=n
 CONFIG_DEBUG_INFO_NONE=y
@@ -80,6 +80,7 @@ CONFIG_EXT4_FS=y
 CONFIG_KVM=n
 EOF
 if [[ ! -f "$OUT/Image" ]]; then
+    clone_verified https://github.com/torvalds/linux.git "$LINUX_TAG" "$LINUX_COMMIT" "$SRC/linux"
     make -C "$SRC/linux" -s ARCH=riscv CROSS_COMPILE="$CROSS" O="$OUT/linux-build" defconfig
     "$SRC/linux/scripts/kconfig/merge_config.sh" -m -O "$OUT/linux-build" \
         "$OUT/linux-build/.config" "$OUT/linux.fragment" >/dev/null
@@ -99,8 +100,8 @@ if [[ ! -f "$OUT/Image" ]]; then
 fi
 
 # 2. Static BusyBox.
-clone_verified https://github.com/mirror/busybox.git "$BUSYBOX_TAG" "$BUSYBOX_COMMIT" "$SRC/busybox"
 if [[ ! -f "$OUT/busybox" ]]; then
+    clone_verified https://github.com/mirror/busybox.git "$BUSYBOX_TAG" "$BUSYBOX_COMMIT" "$SRC/busybox"
     mkdir -p "$OUT/busybox-build"
     make -C "$SRC/busybox" -s O="$OUT/busybox-build" defconfig
     sed -i -e 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' \

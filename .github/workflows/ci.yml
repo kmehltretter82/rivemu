@@ -62,6 +62,38 @@ jobs:
         env:
           RIVEMU_REQUIRE_LINUX_TEST: 1
 
+  linux-devices:
+    # Linux 6.12 + BusyBox built from pinned sources (about 25 min, then
+    # cached) and booted under OpenSBI v1.7 with NVMe, virtio-gpu/input,
+    # vsock, the SBI PMU, reboot and Snapshot v2 (tests/linux_devices.rs).
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64gc-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-linux-gnu flex bison bc cpio libssl-dev libelf-dev
+      - uses: actions/cache@v4
+        with:
+          path: images/linux-test
+          key: linux-test-${{ hashFiles('scripts/fetch-linux-test.sh') }}
+      - run: scripts/fetch-linux-test.sh
+      - uses: actions/cache@v4
+        with:
+          path: |
+            images/linux-src/Image
+            images/linux-src/busybox
+          key: linux-src-${{ hashFiles('scripts/build-linux-test-from-source.sh') }}
+      - run: scripts/build-linux-test-from-source.sh
+      - run: cargo test --release -p rivemu-machine --test linux_devices -- --nocapture --test-threads=1
+        env:
+          RIVEMU_REQUIRE_LINUX_DEVICES: 1
+
   msrv:
     name: msrv (1.85)
     runs-on: ubuntu-latest
