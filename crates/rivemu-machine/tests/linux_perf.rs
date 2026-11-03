@@ -59,7 +59,17 @@ fn selected_hart_counts() -> Vec<u32> {
     values
 }
 
-fn boot_to_shell_once(files: &Artifacts, smp: u32, timeout: Duration) -> Duration {
+/// One boot to the shell prompt: wall time, guest instructions executed
+/// (all harts), and the wall time the loop slept because every hart was
+/// waiting for an interrupt (guest timer waits cost wall time however fast
+/// the interpreter is).
+struct Boot {
+    elapsed: Duration,
+    instructions: u64,
+    idle: Duration,
+}
+
+fn boot_to_shell_once(files: &Artifacts, smp: u32, timeout: Duration) -> Boot {
     let mut machine = Machine::new(MachineConfig {
         ram_size: 256 * MIB,
         smp,
@@ -75,6 +85,7 @@ fn boot_to_shell_once(files: &Artifacts, smp: u32, timeout: Duration) -> Duratio
 
     // P17 deliberately excludes image loading and machine construction.
     let start = Instant::now();
+    let mut idle = Duration::ZERO;
     let mut console = String::new();
     while start.elapsed() < timeout {
         if let Some(event) = machine.run_slice() {
@@ -84,7 +95,11 @@ fn boot_to_shell_once(files: &Artifacts, smp: u32, timeout: Duration) -> Duratio
         if !bytes.is_empty() {
             console.push_str(&String::from_utf8_lossy(&bytes));
             if console.contains("~ # ") {
-                return start.elapsed();
+                return Boot {
+                    elapsed: start.elapsed(),
+                    instructions: machine.executed,
+                    idle,
+                };
             }
             if console.contains("Kernel panic")
                 || console.contains("hard LOCKUP")
@@ -94,7 +109,9 @@ fn boot_to_shell_once(files: &Artifacts, smp: u32, timeout: Duration) -> Duratio
             }
         }
         if machine.all_idle() {
+            let slept = Instant::now();
             std::thread::sleep(machine.idle_timeout().min(Duration::from_millis(2)));
+            idle += slept.elapsed();
         }
     }
     panic!(
@@ -126,9 +143,14 @@ fn calibrate() -> f64 {
 /// `P17_CALIB` line next to the `P17_SAMPLE` line.
 fn timed_boot(files: &Artifacts, smp: u32, timeout: Duration, phase: &str, index: usize) -> f64 {
     let before = calibrate();
-    let seconds = boot_to_shell_once(files, smp, timeout).as_secs_f64();
+    let boot = boot_to_shell_once(files, smp, timeout);
     let after = calibrate();
-    eprintln!("P17_SAMPLE,smp={smp},phase={phase},index={index},seconds={seconds:.6}");
+    let seconds = boot.elapsed.as_secs_f64();
+    eprintln!(
+        "P17_SAMPLE,smp={smp},phase={phase},index={index},insns={},idle={:.6},seconds={seconds:.6}",
+        boot.instructions,
+        boot.idle.as_secs_f64()
+    );
     eprintln!(
         "P17_CALIB,smp={smp},phase={phase},index={index},before={before:.6},after={after:.6}"
     );

@@ -35,7 +35,7 @@ echo "label smp n median p95 (seconds, recorded samples only)"
 for spec in "$@"; do
     label="${spec%%=*}"
     for smp in 1 4; do
-        grep "^$label,.*smp=$smp,phase=recorded" "$samples" | sed 's/.*seconds=//' | sort -n \
+        grep "^$label,.*P17_SAMPLE,smp=$smp,phase=recorded" "$samples" | sed 's/.*seconds=//' | sort -n \
             | awk -v l="$label" -v s="$smp" '
                 { v[NR] = $1 }
                 END {
@@ -51,7 +51,7 @@ done
 # workload (tests/linux_perf.rs `calibrate`). A boot taken while the runner
 # was slow shows a slow calibration next to it.
 echo
-echo "label smp round index seconds calib_before calib_after (recorded samples; calibration median per label and hart count first)"
+echo "label smp round index seconds guest_insns idle_s calib_before calib_after (recorded samples; calibration median per label and hart count first)"
 for spec in "$@"; do
     label="${spec%%=*}"
     for smp in 1 4; do
@@ -60,8 +60,10 @@ for spec in "$@"; do
                 { v[NR] = $1 }
                 END { if (NR) printf "%s %d calibration median %.3f s, max %.3f s\n", l, s, (NR % 2) ? v[(NR + 1) / 2] : (v[NR / 2] + v[NR / 2 + 1]) / 2, v[NR] }'
         paste -d' ' \
-            <(grep "^$label,.*P17_SAMPLE,smp=$smp,phase=recorded" "$samples" | sed 's/^[^,]*,round=\([0-9]*\),.*index=\([0-9]*\),seconds=/\1 \2 /') \
+            <(grep "^$label,.*P17_SAMPLE,smp=$smp,phase=recorded" "$samples" \
+                | sed 's/^[^,]*,round=\([0-9]*\),.*index=\([0-9]*\),/\1 \2 /; s/insns=//; s/idle=//; s/seconds=//; s/,/ /g' \
+                | awk '{ if (NF == 3) print $1, $2, $3, "-", "-"; else print $1, $2, $5, $3, $4 }') \
             <(grep "^$label,.*P17_CALIB,smp=$smp,phase=recorded" "$samples" | sed 's/.*before=//; s/,after=/ /') \
-            | awk -v l="$label" -v s="$smp" '{ printf "%s %d %s %s %.3f %.3f %.3f\n", l, s, $1, $2, $3, $4, $5 }'
+            | awk -v l="$label" -v s="$smp" '{ print l, s, $1, $2, $3, $4, $5, $6, $7 }'
     done
 done
