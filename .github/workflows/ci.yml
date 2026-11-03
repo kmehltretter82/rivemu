@@ -168,12 +168,25 @@ jobs:
       - name: Boot profile (head, Debian inputs, to /init + poweroff)
         run: P17_PROFILE_SUMMARY=p17-profile.txt scripts/p17-profile.sh
       - run: scripts/p17-compare.sh 3 head=. base=base | tee p17-compare.txt
+      - name: P17 threshold check on Apple Silicon (tests/linux_perf.rs as defined, 2 warmups and 20 samples, median and p95)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        env:
+          RIVEMU_REQUIRE_LINUX_PERF: 1
+          RIVEMU_LINUX_PERF_ASSERT_THRESHOLDS: 1
+        run: |
+          set -o pipefail
+          cargo test -q --release -p rivemu-machine --test linux_perf -- --nocapture 2>&1 \
+            | tee p17-threshold.txt | grep -E '^P17_(SAMPLE|CALIB|RESULT)|panicked|threshold|test result'
       - name: Summary
         run: |
           cat p17-profile.txt
-          tail -6 p17-compare.txt
+          sed -n '/^label smp n median/,$p' p17-compare.txt
           echo "### P17 on ${{ matrix.os }} ($(uname -m))" >> "$GITHUB_STEP_SUMMARY"
-          tail -6 p17-compare.txt >> "$GITHUB_STEP_SUMMARY"
+          sed -n '/^label smp n median/,/^$/p' p17-compare.txt >> "$GITHUB_STEP_SUMMARY"
+          if [ -f p17-threshold.txt ]; then
+            grep -E '^P17_RESULT|panicked|test result' p17-threshold.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
 
   p17-callgrind:
     # Host instructions of the P17 Debian boot under callgrind with

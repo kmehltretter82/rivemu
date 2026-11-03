@@ -26,7 +26,7 @@ for ((round = 1; round <= ROUNDS; round++)); do
     for spec in "$@"; do
         label="${spec%%=*}"
         (cd "${spec#*=}" && cargo test -q --release -p rivemu-machine --test linux_perf -- --nocapture 2>&1) \
-            | grep '^P17_SAMPLE' | sed "s/^/$label,round=$round,/" | tee -a "$samples"
+            | grep -E '^P17_(SAMPLE|CALIB)' | sed "s/^/$label,round=$round,/" | tee -a "$samples"
     done
 done
 
@@ -44,5 +44,24 @@ for spec in "$@"; do
                     r = int(0.95 * NR); if (r < 0.95 * NR) r++
                     printf "%s %d %d %.3f %.3f\n", l, s, NR, m, v[r]
                 }'
+    done
+done
+
+# The control: every boot runs between two timings of a fixed native
+# workload (tests/linux_perf.rs `calibrate`). A boot taken while the runner
+# was slow shows a slow calibration next to it.
+echo
+echo "label smp round index seconds calib_before calib_after (recorded samples; calibration median per label and hart count first)"
+for spec in "$@"; do
+    label="${spec%%=*}"
+    for smp in 1 4; do
+        grep "^$label,.*P17_CALIB,smp=$smp,phase=recorded" "$samples" | sed 's/.*before=//; s/,after=/ /' \
+            | tr ' ' '\n' | sort -n | awk -v l="$label" -v s="$smp" '
+                { v[NR] = $1 }
+                END { if (NR) printf "%s %d calibration median %.3f s, max %.3f s\n", l, s, (NR % 2) ? v[(NR + 1) / 2] : (v[NR / 2] + v[NR / 2 + 1]) / 2, v[NR] }'
+        paste -d' ' \
+            <(grep "^$label,.*P17_SAMPLE,smp=$smp,phase=recorded" "$samples" | sed 's/^[^,]*,round=\([0-9]*\),.*index=\([0-9]*\),seconds=/\1 \2 /') \
+            <(grep "^$label,.*P17_CALIB,smp=$smp,phase=recorded" "$samples" | sed 's/.*before=//; s/,after=/ /') \
+            | awk -v l="$label" -v s="$smp" '{ printf "%s %d %s %s %.3f %.3f %.3f\n", l, s, $1, $2, $3, $4, $5 }'
     done
 done

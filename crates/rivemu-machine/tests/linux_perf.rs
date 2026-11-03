@@ -103,6 +103,38 @@ fn boot_to_shell_once(files: &Artifacts, smp: u32, timeout: Duration) -> Duratio
     );
 }
 
+/// Times a fixed amount of host work that does not involve the emulator: a
+/// chain of dependent integer operations on one thread, like the
+/// interpreter's own work. It runs right before and right after every boot,
+/// so that a sample taken while the runner was slow (another VM on the host,
+/// the thread on a slower core) shows as a slow calibration next to it.
+fn calibrate() -> f64 {
+    let start = Instant::now();
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut acc: u64 = 0;
+    for i in 0..60_000_000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        acc = acc.wrapping_add(x.rotate_left((i & 63) as u32));
+    }
+    std::hint::black_box(acc);
+    start.elapsed().as_secs_f64()
+}
+
+/// One boot with the calibration before and after it, printed as a
+/// `P17_CALIB` line next to the `P17_SAMPLE` line.
+fn timed_boot(files: &Artifacts, smp: u32, timeout: Duration, phase: &str, index: usize) -> f64 {
+    let before = calibrate();
+    let seconds = boot_to_shell_once(files, smp, timeout).as_secs_f64();
+    let after = calibrate();
+    eprintln!("P17_SAMPLE,smp={smp},phase={phase},index={index},seconds={seconds:.6}");
+    eprintln!(
+        "P17_CALIB,smp={smp},phase={phase},index={index},before={before:.6},after={after:.6}"
+    );
+    seconds
+}
+
 fn median(sorted: &[f64]) -> f64 {
     let mid = sorted.len() / 2;
     if sorted.len() % 2 == 0 {
@@ -147,18 +179,12 @@ fn p17_linux_to_shell_benchmark() {
 
     for smp in selected_hart_counts() {
         for index in 0..warmups {
-            let elapsed = boot_to_shell_once(&files, smp, timeout);
-            eprintln!(
-                "P17_SAMPLE,smp={smp},phase=warmup,index={index},seconds={:.6}",
-                elapsed.as_secs_f64()
-            );
+            timed_boot(&files, smp, timeout, "warmup", index);
         }
 
         let mut samples = Vec::with_capacity(repetitions);
         for index in 0..repetitions {
-            let seconds = boot_to_shell_once(&files, smp, timeout).as_secs_f64();
-            eprintln!("P17_SAMPLE,smp={smp},phase=recorded,index={index},seconds={seconds:.6}");
-            samples.push(seconds);
+            samples.push(timed_boot(&files, smp, timeout, "recorded", index));
         }
 
         let mut sorted = samples.clone();
