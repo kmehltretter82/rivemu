@@ -6,6 +6,24 @@ This file records observed exit evidence separately from the implementation
 checkboxes in [`PLAN.md`](PLAN.md). A checked milestone means that its code was
 implemented; it does not by itself prove every stated exit criterion.
 
+## 2026-11-02 cloud validation (branch `claude/trusting-bell-xvhb0r`)
+
+These results come from a Claude Code cloud container (Linux 6.18, x86_64,
+4 vCPUs). They supersede the "Partial or missing" rows below where they
+overlap. Findings, causes and fixes are in
+[`REVIEW-20261102.md`](REVIEW-20261102.md). Every row links its log.
+
+| Area | Evidence | Result |
+|---|---|---|
+| `riscv-arch-test` privileged subset | `tests/arch-test/README.md`; `evidence/2026-11-02/arch-test/` | **418/418** in 15 privileged suites (Sail 0.16 reference). Before the three fixes it found (`mcycle`, `mtime`→`time`, CBO PMA), 411/418. |
+| Official `riscv-tests`, fresh build | `RIVEMU_REQUIRE_RISCV_TESTS=1 cargo test --release -p rivemu-cpu-riscv` | 244/244 from a from-scratch build. Before `b8045b9`, a fresh build failed 22 `-v` tests, and CI passed only from a cache. |
+| Linux device E2E: reboot, NVMe, virtio-gpu/input, vsock, SBI PMU/perf, Snapshot v2 | `RIVEMU_LINUX_DEVICES_TEST=1 cargo test --release -p rivemu-machine --test linux_devices`; `evidence/2026-11-02/linux-devices-e2e.log` | 6/6 with Linux 6.12 + OpenSBI v1.7. Snapshot v2 does not contain disk contents (the test shares the backend). |
+| P27–P32 per-suite differential campaigns | `rivemu-lockstep/docs/evidence/2026-11-02-campaigns/summary.txt` | 18 suites × {QEMU 11.1.3 `--step-check`, Sail 0.16}: 36/36 PASS. |
+| Expanded `Suite::Vector` (random LMUL/SEW/mask, segments, indexed, reserved encodings) | `rivemu-lockstep` `3c57b83` | 256 blocks pass against Sail and QEMU after three RVV fixes. |
+| Boot lockstep P16/P26 (OpenSBI v1.7 + Linux 6.12 vs QEMU 11.1.3) | `rivemu-lockstep/docs/evidence/2026-11-02-boot-lockstep/run10-pass-3M-steps.log` | **3,000,000 instructions, 0 divergences** with `--check-csrs`. The 9 earlier runs each stopped at a harness configuration difference or a rivemu bug (`mstateen` reset); all are fixed. |
+| Sail multi-worker startup | `rivemu-lockstep/docs/evidence/2026-11-02-sail-startup/` | 25/25 clean 6-worker campaigns without the startup lock (was 17/24). |
+| CI hygiene | GitHub Actions on both PRs | `cargo fmt --check`, `clippy -D warnings`, MSRV 1.85, and `cargo deny` (rivemu) pass. rivemu-lockstep now has CI, including the differential suites. |
+
 ## Validation target
 
 - `qemu_rust` base: `f0471ad989d202c9b13341ab9325d1f2fdb2fe40`
@@ -61,15 +79,15 @@ built-in-SBI Linux test both pass with the fix.
 |---|---|---|
 | User-network breadth | Partial | Static ICMP, DHCP DISCOVER/REQUEST/ACK, external A-record resolution, outbound TCP/TLS package download, and TCP/UDP `hostfwd` pass guest E2E. Arbitrary outbound UDP NAT is not separately exercised, and the DNS proxy is synchronous and A-only. |
 | Default Debian 9p coverage | Partial | The downloaded default kernel printed `RUST_9P_MOUNT_ERR=No such device`. The test now reports optional coverage explicitly; `RIVEMU_REQUIRE_9P=1` makes mount/read/write mandatory and passed with the alternate kernel above. |
-| GPU and input guest operation | Partial | PCI enumeration and device unit tests pass; Linux scanout/input behavior is not asserted. |
-| P19 NVMe, vsock, Snapshot v2 exits | Partial | Device-level queue/stream/snapshot tests exist. No retained Linux mount, `AF_VSOCK`, or PCI/QCOW2 restore result proves the stated end-to-end exits. |
-| Poweroff and reboot | Partial | Clean poweroff is asserted. No current guest reboot integration result was retained. |
+| GPU and input guest operation | Verified 2026-11-02 | Linux could not use virtio-gpu at all (wrong command codes, SHM registers); fixed in `2f10801`. `linux_devices` now asserts `/dev/dri/card0`, `/dev/fb0`, the evdev devices, and pixels reaching the scanout. |
+| P19 NVMe, vsock, Snapshot v2 exits | Verified 2026-11-02, except disk state | `linux_devices`: Linux reads and writes NVMe, connects `AF_VSOCK` to CID 2, and NVMe and virtio-pci keep working after save/restore into a fresh machine. Snapshots do not contain disk contents, so no QCOW2 restore is claimed. |
+| Poweroff and reboot | Verified 2026-11-02 | `linux_devices`: `reboot -f` reaches `PowerEvent::Reset`, twice. |
 | SMP4 stability | Partial | The functional SMP4 boots pass and the isolated P17 campaign completed 20/20 SMP4 shell boots, but there is no repeated full device-smoke campaign. |
 | P17 `< 8 s` single-hart / `< 10 s` SMP4 | Failed | An isolated exact-boundary campaign (post-`Machine::new()` to first `~ # `, 2 warmups + 20 recorded samples each) measured SMP1 median/p95 18.905/19.929 s and SMP4 21.103/22.175 s. |
-| `riscv-arch-test` privileged subset | Not verified | No runner result or signature artifact was found. The 244 official `riscv-tests` are a different suite. |
-| Guest PMU/perf | Not verified | Directed PMU semantics pass, but no guest `perf stat` or PMU-overflow integration result was retained. |
-| Boot lockstep P16/P26 | Not verified | The implementation and directed unit tests exist; no retained zero-divergence boot-v3 run was found. |
-| P27-P32 Sail/QEMU differential claims | Partial | Directed CPU tests and the generic `suite=all` campaigns pass, but those campaigns do not prove every explicit per-suite exit. QEMU's ordinary-suite checkpoint comparison can also miss a transient difference overwritten before the checkpoint. |
+| `riscv-arch-test` privileged subset | Verified 2026-11-02 | 418/418 (`tests/arch-test/README.md`). |
+| Guest PMU/perf | Verified 2026-11-02 (counting) | `linux_devices`: `riscv-pmu-sbi` probes 16 firmware and 31 hardware counters, and `perf_event_open` counts instructions. PMU overflow interrupts are not asserted. |
+| Boot lockstep P16/P26 | Partial (first 3M instructions), 2026-11-02 | 3,000,000 instructions of OpenSBI + early Linux with 0 divergences against QEMU 11.1.3. A boot to the shell is about 10⁹ instructions and needs checkpointed windows. |
+| P27-P32 Sail/QEMU differential claims | Verified per suite 2026-11-02 | All 18 suites pass against Sail and against QEMU with `--step-check`. The Vector suite needed rework first; it had ignored its RNG. |
 | Benchmarks | Partial | The repeated exact-boundary P17 boot benchmark is retained. No CoreMark, Dhrystone, or criterion history was found. |
 | CI hygiene | Partial | `git diff --check` passes, and the changed lockstep Sail file passes targeted `rustfmt --check`. Repo-wide formatting checks fail on broad existing drift, while `clippy -D warnings` stops on five untouched `qemu_rust` vector warnings and three unchanged lockstep QEMU-test warnings. `cargo-deny` is not installed. No broad unrelated rewrite was made. |
 
@@ -137,15 +155,17 @@ kernel bug was fixed.
 
 ## Remaining validation work
 
-1. Optimize or revise P17: the exact repeated benchmark now proves that the
-   `< 8 s` SMP1 and `< 10 s` SMP4 targets are not met.
-2. Decide whether CI should supply the 9p-capable kernel and enable
-   `RIVEMU_REQUIRE_9P=1`; local strict mount/read/write evidence is now green.
-3. Add retained guest E2E results for reboot, NVMe, vsock, GPU/input, PMU/perf,
-   and Snapshot v2.
-4. Add an explicit arbitrary outbound-UDP NAT guest test; DHCP/DNS, outbound
-   TCP/TLS, and both TCP/UDP `hostfwd` directions are already covered.
-5. Run the privileged `riscv-arch-test` subset and retain its signatures.
-6. Run final workspace formatting, lint, dependency-policy, and CI checks after
-   the current source changes are settled.
+Ranked; details in [`REVIEW-20261102.md`](REVIEW-20261102.md) §6.
 
+1. Optimize or revise P17. The repeated benchmark shows that the `< 8 s`
+   SMP1 and `< 10 s` SMP4 targets are not met.
+2. Extend boot lockstep past the first 3M instructions (checkpointed
+   windows) and add the 3M-step run to CI as a scheduled job.
+3. Resolve the RVA23 claim: implement Zama16b and H, or narrow the README.
+4. Run the unprivileged `riscv-arch-test` suites (`rv64i`, about 1,000
+   tests) and add an ACT job to CI.
+5. Decide whether CI should build `images/linux-src` (about 25 min, cached)
+   so that `linux_devices` runs there; it runs locally today.
+6. Decide whether CI should supply the 9p-capable kernel and enable
+   `RIVEMU_REQUIRE_9P=1`.
+7. Add an explicit arbitrary outbound-UDP NAT guest test.
