@@ -17,6 +17,7 @@
 # 8247296   41623958358    8.794 (10.729)      9.313 (11.680)     23.952 / 27.209
 # 21acfa8   41636562098    6.224 ( 7.670)      7.026 (11.401)     25.361 / 29.304
 # 4bbacc7   41640005441    6.940 (10.527)      6.593 ( 9.376)     22.045 / 25.250
+# 23d425f   41642509507    5.923 ( 6.456)      7.145 (10.545)     23.834 / 28.110
 #   (21acfa8: superblocks, fetch fast TLB; see p17-superblocks.txt. Its SMP4 p95
 #   is the round-1 samples, 10.0 to 11.4 s, in a slow period of the runner that
 #   shows in base too.)

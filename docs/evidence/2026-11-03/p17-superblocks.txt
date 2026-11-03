@@ -89,3 +89,15 @@
 #    samples under 8 s (the two others in round 1 of this run), 15 of 18 SMP4
 #    samples under 10 s (the three others in round 1 of 41636562098);
 #    medians 6.22 / 7.03 s and 6.94 / 6.59 s.
+#
+# 7. CI run 41642509507 (23d425f: the same code plus documentation), a third
+#    macos-latest runner:
+#      head SMP1 median 5.923 s, p95 6.456; samples 5.963 5.796 5.923 /
+#        6.107 6.225 6.456 / 5.892 5.463 5.431 (all under 8 s)
+#      head SMP4 median 7.145 s, p95 10.545; samples 6.334 7.145 8.128 /
+#        10.545 9.800 7.998 / 5.990 5.605 6.763
+#      base SMP1 23.834 s, SMP4 28.110 s (round 2 SMP4: 30.855 28.725 24.221)
+#    Over the three runs: SMP1 medians 6.22 / 6.94 / 5.92 s, 25 of 27 samples
+#    under 8 s; SMP4 medians 7.03 / 6.59 / 7.15 s, 23 of 27 samples under
+#    10 s. Every sample above target falls in one round of a job whose base
+#    samples are slow at the same time.
