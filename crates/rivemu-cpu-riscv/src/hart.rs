@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rivemu_core::{AccessSize, Timebase};
 use rivemu_mem::{AddressSpace, RegionKind};
 
-use crate::csr::{self, Csrs, envcfg, irq, status};
+use crate::csr::{self, Csrs, envcfg, hstatus, irq, status};
 use crate::decode::{Insn, Op, amo, decode, decode_compressed};
 use crate::log::{LogFlags, Logger};
 use crate::mmu::{Access, PmpCache, Tlb};
@@ -30,6 +30,12 @@ pub mod cause {
     pub const STORE_PAGE_FAULT: u64 = 15;
     pub const DOUBLE_TRAP: u64 = 16;
     pub const SW_CHECK: u64 = 18;
+    /// H extension.
+    pub const ECALL_VS: u64 = 10;
+    pub const INSN_GUEST_PAGE_FAULT: u64 = 20;
+    pub const LOAD_GUEST_PAGE_FAULT: u64 = 21;
+    pub const VIRTUAL_INSN: u64 = 22;
+    pub const STORE_GUEST_PAGE_FAULT: u64 = 23;
 }
 
 /// A synchronous exception raised by an instruction.
@@ -39,13 +45,30 @@ pub struct Exception {
     pub cause: u64,
     /// Value for `xtval`.
     pub tval: u64,
+    /// H extension: the guest physical address shifted right by 2, for
+    /// `htval`/`mtval2` (guest-page faults; 0 otherwise).
+    pub tval2: u64,
+    /// H extension: `tval` is a guest virtual address (`hstatus.GVA`,
+    /// `mstatus.GVA`).
+    pub gva: bool,
 }
 
 impl Exception {
     /// Creates an exception.
     #[inline]
     pub const fn new(cause: u64, tval: u64) -> Self {
-        Self { cause, tval }
+        Self {
+            cause,
+            tval,
+            tval2: 0,
+            gva: false,
+        }
+    }
+
+    /// The same exception with another `tval`.
+    #[inline]
+    pub const fn with_tval(self, tval: u64) -> Self {
+        Self { tval, ..self }
     }
 }
 
@@ -150,6 +173,8 @@ const fn bb_op_kind(op: Op) -> BbOpKind {
         | Op::WrsSto
         | Op::SfenceVma
         | Op::SinvalVma
+        | Op::HfenceVvma
+        | Op::HfenceGvma
         | Op::SfenceWInval
         | Op::SfenceInvalIr
         | Op::CboInval => BbOpKind::Abort,
@@ -284,7 +309,7 @@ pub struct Hart {
     pub irqs: Arc<HartIrqs>,
     /// Waiting for an interrupt (`wfi`).
     pub wfi: bool,
-    timebase: Arc<dyn Timebase>,
+    pub(crate) timebase: Arc<dyn Timebase>,
     /// Active 64-byte cache-line `LR` reservation.
     reservation: Option<Reservation>,
     pub(crate) tlb: Tlb,
@@ -337,6 +362,12 @@ pub struct Hart {
     /// as riscv-tests, takes M-mode traps before clearing the MDT bit that
     /// Smdbltrp sets at reset. When off, `mstatus.MDT` is read-only zero.
     pub smdbltrp: bool,
+    /// Implement the H extension (`-cpu rv64,h=on`). Off by default.
+    pub h_ext: bool,
+    /// Virtualization mode V (H extension): `true` in VS- and VU-mode.
+    /// While it is set, the S-level CSRs hold the VS copies (see
+    /// [`csr::SBank`] and [`Hart::set_virt`]).
+    pub virt: bool,
     /// Smdbltrp critical-error state: a trap to M-mode arrived while
     /// `mstatus.MDT` was 1. The hart stops without updating any architectural
     /// state (there is no Smrnmi to take the trap instead).
@@ -432,6 +463,8 @@ impl Hart {
             semihosting: false,
             hsm_stopped: false,
             smdbltrp: false,
+            h_ext: false,
+            virt: false,
             critical_error: false,
             nondeterministic_read: false,
             fwft_locks: 0,
@@ -468,6 +501,7 @@ impl Hart {
         self.v = [[0; 32]; 32];
         self.prv = Priv::Machine;
         self.csr = Csrs::default();
+        self.virt = false;
         // Smdbltrp: "Upon reset, the MDT field is set to 1."
         if self.smdbltrp {
             self.csr.mstatus |= status::MDT;
@@ -559,7 +593,7 @@ impl Hart {
     }
 
     #[inline]
-    fn flush_tlb(&mut self) {
+    pub(crate) fn flush_tlb(&mut self) {
         self.tlb.flush();
         self.fetch_vpn = 0;
     }
@@ -688,7 +722,7 @@ impl Hart {
     #[inline]
     fn bump_counters(&mut self, delta: u64) {
         // Common case: neither counter inhibited or filtered by mode.
-        const MODE_INH: u64 = csr::hpmevent::MINH | csr::hpmevent::SINH | csr::hpmevent::UINH;
+        const MODE_INH: u64 = csr::hpmevent::FILTER_MASK_H;
         if self.csr.mcountinhibit & 5 == 0
             && (self.csr.minstretcfg | self.csr.mcyclecfg) & MODE_INH == 0
         {
@@ -747,7 +781,9 @@ impl Hart {
         // CSR writes, traps and xRET, and those end a block. `run` already
         // excluded triggers, watchpoints, logging and sub-page PMP.
         let mem_ctx = (!self.strict_align
-            && (self.csr.menvcfg | self.csr.senvcfg | self.csr.mseccfg) & envcfg::PMM_MASK == 0)
+            && (self.csr.menvcfg | self.csr.senvcfg | self.csr.mseccfg | self.csr.h.henvcfg)
+                & envcfg::PMM_MASK
+                == 0)
             .then(|| self.fast_tlb_ctx());
         // The arena moves out of `self` while the block runs, so that the
         // loop walks a plain slice. Nothing a block can contain touches the
@@ -857,7 +893,7 @@ impl Hart {
                     self.instret_written = false;
                     self.cycle_written = false;
                     self.hpm_written_mask = 0;
-                    self.trap(e.cause, false, e.tval);
+                    self.trap_exception(e);
                     return (retired + 1, false);
                 }
             }
@@ -1293,7 +1329,7 @@ impl Hart {
                 self.cycle_written = false;
                 self.icount_written = false;
                 self.hpm_written_mask = 0;
-                self.trap(e.cause, false, e.tval);
+                self.trap_exception(e);
             }
         }
     }
@@ -1340,10 +1376,12 @@ impl Hart {
 
     #[cold]
     fn step_icount_triggers(&mut self, prv: Priv) {
-        let mode_bit = match prv {
-            Priv::Machine => csr::trig::ICOUNT_M,
-            Priv::Supervisor => csr::trig::ICOUNT_S,
-            Priv::User => csr::trig::ICOUNT_U,
+        let mode_bit = match (prv, self.virt) {
+            (Priv::Machine, _) => csr::trig::ICOUNT_M,
+            (Priv::Supervisor, false) => csr::trig::ICOUNT_S,
+            (Priv::User, false) => csr::trig::ICOUNT_U,
+            (Priv::Supervisor, true) => csr::trig::ICOUNT_VS,
+            (Priv::User, true) => csr::trig::ICOUNT_VU,
         };
         for i in 0..csr::TRIGGER_COUNT {
             let t1 = self.csr.tdata1[i];
@@ -1393,10 +1431,14 @@ impl Hart {
 
     #[inline]
     fn trigger_mode_and_context_match(&self, t1: u64, t3: u64, prv: Priv) -> bool {
-        let mode_bit = match prv {
-            Priv::Machine => csr::trig::M,
-            Priv::Supervisor => csr::trig::S,
-            Priv::User => csr::trig::U,
+        // With V = 1 only mcontrol6 matches, by its vs/vu bits (as QEMU).
+        let mode_bit = match (prv, self.virt) {
+            (Priv::Machine, _) => csr::trig::M,
+            (Priv::Supervisor, false) => csr::trig::S,
+            (Priv::User, false) => csr::trig::U,
+            _ if t1 >> csr::trig::TYPE_SHIFT != csr::trig::TYPE_MCONTROL6 => return false,
+            (Priv::Supervisor, true) => csr::trig::VS6,
+            (Priv::User, true) => csr::trig::VU6,
         };
         (t1 & mode_bit) != 0 && self.trigger_context_match(t3)
     }
@@ -1514,14 +1556,28 @@ impl Hart {
         }
     }
 
+    /// Whether the Sscofpmf/Smcntrpmf filter `cfg` stops counting in the
+    /// current mode (VS/VU-mode use VSINH/VUINH).
     #[inline]
     fn mode_inhibited(&self, cfg: u64) -> bool {
-        let bit = match self.prv {
-            Priv::Machine => csr::hpmevent::MINH,
-            Priv::Supervisor => csr::hpmevent::SINH,
-            Priv::User => csr::hpmevent::UINH,
+        let bit = match (self.prv, self.virt) {
+            (Priv::Machine, _) => csr::hpmevent::MINH,
+            (Priv::Supervisor, false) => csr::hpmevent::SINH,
+            (Priv::User, false) => csr::hpmevent::UINH,
+            (Priv::Supervisor, true) => csr::hpmevent::VSINH,
+            (Priv::User, true) => csr::hpmevent::VUINH,
         };
         cfg & bit != 0
+    }
+
+    /// The writable mode filters of `mhpmevent`, `mcyclecfg` and
+    /// `minstretcfg`.
+    fn hpm_filter_mask(&self) -> u64 {
+        if self.h_ext {
+            csr::hpmevent::FILTER_MASK_H
+        } else {
+            csr::hpmevent::FILTER_MASK
+        }
     }
 
     #[cold]
@@ -1561,6 +1617,9 @@ impl Hart {
     }
 
     fn select_interrupt(&self, pending: u64) -> Option<u64> {
+        if self.h_ext {
+            return self.h_select_interrupt(pending);
+        }
         let mstatus = self.csr.mstatus;
         let m_enabled = self.prv < Priv::Machine || mstatus & status::MIE != 0;
         let s_enabled = self.prv < Priv::Supervisor
@@ -1585,23 +1644,56 @@ impl Hart {
                 v |= irq::STIP;
             }
         }
+        if self.vstimer_pending() {
+            v |= irq::VSTIP;
+        }
         v
     }
 
     /// Enters a trap handler.
     pub fn trap(&mut self, code: u64, interrupt: bool, tval: u64) {
+        self.trap_full(code, interrupt, tval, 0, false);
+    }
+
+    /// Takes the trap for exception `e`, with its H-extension values.
+    #[inline]
+    pub(crate) fn trap_exception(&mut self, e: Exception) {
+        self.trap_full(e.cause, false, e.tval, e.tval2, e.gva);
+    }
+
+    /// Enters a trap handler. `tval2` (`htval`/`mtval2`) and `gva`
+    /// (`hstatus.GVA`/`mstatus.GVA`) matter only with the H extension.
+    fn trap_full(&mut self, code: u64, interrupt: bool, tval: u64, tval2: u64, gva: bool) {
         let old_pc = self.pc;
         let old_prv = self.prv;
+        let old_virt = self.virt;
         self.reservation = None;
         self.wfi = false;
         let deleg = if interrupt {
-            self.csr.mideleg
+            self.mideleg_eff()
         } else {
             self.csr.medeleg
         };
         let delegated_to_s = self.prv <= Priv::Supervisor && (deleg >> code) & 1 != 0;
-        let dte = self.csr.menvcfg & envcfg::DTE != 0;
-        let s_double_trap = delegated_to_s && dte && (self.csr.mstatus & status::SDT) != 0;
+        let hdeleg = if interrupt {
+            self.csr.h.hideleg
+        } else {
+            self.csr.h.hedeleg
+        };
+        let to_vs = delegated_to_s && old_virt && (hdeleg >> code) & 1 != 0;
+        // Ssdbltrp: VS-mode uses henvcfg.DTE and vsstatus.SDT; a trap from
+        // V = 1 into HS-mode uses HS-mode's SDT, which is in the bank.
+        let dte = if to_vs {
+            self.csr.h.henvcfg & envcfg::DTE != 0
+        } else {
+            self.csr.menvcfg & envcfg::DTE != 0
+        };
+        let sdt = if old_virt && !to_vs {
+            self.csr.h.bank.status & status::SDT != 0
+        } else {
+            self.csr.mstatus & status::SDT != 0
+        };
+        let s_double_trap = delegated_to_s && dte && sdt;
         let (code, interrupt, tval, to_s) = if s_double_trap {
             (
                 cause::DOUBLE_TRAP,
@@ -1612,12 +1704,48 @@ impl Hart {
         } else {
             (code, interrupt, tval, delegated_to_s)
         };
+        let to_vs = to_vs && to_s;
         // Smdbltrp: a trap into M-mode while MDT = 1 is an unexpected trap.
         // Without Smrnmi "the hart enters a critical-error state without
         // updating any architectural state, including the pc".
         if self.smdbltrp && !to_s && self.csr.mstatus & status::MDT != 0 {
             self.critical_error = true;
             return;
+        }
+        // VS-mode sees its interrupts as the S-level ones (VSSI -> SSI, ...).
+        let code = if to_vs && interrupt && matches!(code, irq::VSSI | irq::VSTI | irq::VSEI) {
+            code - 1
+        } else {
+            code
+        };
+        if self.h_ext && !to_vs {
+            // Leaving V = 1 restores HS-mode's S-level CSRs first.
+            self.set_virt(false);
+            let h = &mut self.csr.h;
+            if to_s {
+                h.hstatus &= !(hstatus::SPV | hstatus::SPVP | hstatus::GVA);
+                if old_virt {
+                    h.hstatus |= hstatus::SPV;
+                    if old_prv == Priv::Supervisor {
+                        h.hstatus |= hstatus::SPVP;
+                    }
+                }
+                if gva {
+                    h.hstatus |= hstatus::GVA;
+                }
+                h.htval = tval2;
+                h.htinst = 0;
+            } else {
+                self.csr.mstatus &= !(status::MPV | status::GVA);
+                if old_virt {
+                    self.csr.mstatus |= status::MPV;
+                }
+                if gva {
+                    self.csr.mstatus |= status::GVA;
+                }
+                h.mtval2 = tval2;
+                h.mtinst = 0;
+            }
         }
         let cause = code | (u64::from(interrupt) << 63);
         let save_elp = self.elp && self.csr.landing_pad_enabled(old_prv);
@@ -1914,6 +2042,29 @@ impl Hart {
         Exception::new(cause::ILLEGAL_INSN, u64::from(insn.raw))
     }
 
+    /// Whether a Zicbom/Zicboz instruction is enabled by the `envcfg` field
+    /// `bits` (`CBIE`, `CBCFE` or `CBZE`), in QEMU's order: `menvcfg`
+    /// (illegal instruction), then with V = 1 `henvcfg` and, in VU-mode,
+    /// `senvcfg` (virtual instruction), then `senvcfg` in U-mode (illegal).
+    fn cbo_enabled(&self, bits: u64, insn: &Insn) -> Result<(), Exception> {
+        if self.prv == Priv::Machine {
+            return Ok(());
+        }
+        let c = &self.csr;
+        if c.menvcfg & bits == 0 {
+            return Err(Self::illegal(insn));
+        }
+        if self.virt
+            && (c.h.henvcfg & bits == 0 || (self.prv == Priv::User && c.senvcfg & bits == 0))
+        {
+            return Err(Exception::new(cause::VIRTUAL_INSN, u64::from(insn.raw)));
+        }
+        if self.prv == Priv::User && c.senvcfg & bits == 0 {
+            return Err(Self::illegal(insn));
+        }
+        Ok(())
+    }
+
     fn execute(&mut self, bus: &AddressSpace, insn: &Insn) -> Result<(), Exception> {
         let pc = self.pc;
         if self.elp {
@@ -2029,6 +2180,7 @@ impl Hart {
                 } else {
                     let c = match self.prv {
                         Priv::User => cause::ECALL_U,
+                        Priv::Supervisor if self.virt => cause::ECALL_VS,
                         Priv::Supervisor => cause::ECALL_S,
                         Priv::Machine => cause::ECALL_M,
                     };
@@ -2334,7 +2486,9 @@ impl Hart {
                 let s = self.csr.mstatus;
                 let mpp = Priv::from_bits(s >> status::MPP_SHIFT);
                 let mpelp = s & status::MPELP != 0;
-                let mut n = s & !(status::MIE | status::MPP | status::MPELP | status::MDT);
+                let to_virt = self.h_ext && s & status::MPV != 0 && mpp != Priv::Machine;
+                let mut n =
+                    s & !(status::MIE | status::MPP | status::MPELP | status::MDT | status::MPV);
                 if s & status::MPIE != 0 {
                     n |= status::MIE;
                 }
@@ -2346,6 +2500,9 @@ impl Hart {
                     }
                 }
                 self.csr.mstatus = n;
+                if to_virt {
+                    self.set_virt(true);
+                }
                 self.prv = mpp;
                 self.elp = mpelp && self.csr.landing_pad_enabled(mpp);
                 self.reservation = None;
@@ -2355,6 +2512,11 @@ impl Hart {
             }
             Op::Sret => {
                 let s = self.csr.mstatus;
+                if self.virt
+                    && (self.prv < Priv::Supervisor || self.csr.h.hstatus & hstatus::VTSR != 0)
+                {
+                    return Err(Exception::new(cause::VIRTUAL_INSN, u64::from(insn.raw)));
+                }
                 if self.prv < Priv::Supervisor
                     || (self.prv == Priv::Supervisor && s & status::TSR != 0)
                 {
@@ -2373,17 +2535,33 @@ impl Hart {
                 }
                 n |= status::SPIE;
                 self.csr.mstatus = n;
+                // The return address is the current mode's sepc: read it
+                // before a switch to V = 1 swaps in the VS copy.
+                new_pc = self.csr.sepc;
+                // From HS-mode, sret returns to hstatus.SPV's mode and clears
+                // SPV (as QEMU does); from VS-mode it stays in V = 1.
+                if self.h_ext && !self.virt {
+                    let spv = self.csr.h.hstatus & hstatus::SPV != 0;
+                    self.csr.h.hstatus &= !hstatus::SPV;
+                    if spv {
+                        self.set_virt(true);
+                    }
+                }
                 self.prv = spp;
                 self.elp = spelp && self.csr.landing_pad_enabled(spp);
                 self.reservation = None;
                 self.fetch_vpn = 0;
                 self.check_irq = true;
-                new_pc = self.csr.sepc;
             }
             Op::Wfi => {
                 let s = self.csr.mstatus;
-                if self.prv == Priv::User || (self.prv == Priv::Supervisor && s & status::TW != 0) {
+                if (self.prv == Priv::User && !self.virt)
+                    || (self.prv == Priv::Supervisor && s & status::TW != 0)
+                {
                     return Err(Self::illegal(insn));
+                }
+                if self.virt && (self.prv == Priv::User || self.csr.h.hstatus & hstatus::VTW != 0) {
+                    return Err(Exception::new(cause::VIRTUAL_INSN, u64::from(insn.raw)));
                 }
                 if self.mip() & self.csr.mie == 0 {
                     self.wfi = true;
@@ -2393,6 +2571,14 @@ impl Hart {
                 }
             }
             Op::WrsNto => {
+                // Zawrs: with V = 1, hstatus.VTW (and TW = 0) makes it a
+                // virtual instruction (QEMU raises it at once).
+                if self.virt
+                    && self.csr.h.hstatus & hstatus::VTW != 0
+                    && self.csr.mstatus & status::TW == 0
+                {
+                    return Err(Exception::new(cause::VIRTUAL_INSN, u64::from(insn.raw)));
+                }
                 if self.prv != Priv::Machine && self.csr.mstatus & status::TW != 0 {
                     return Err(Self::illegal(insn));
                 }
@@ -2404,76 +2590,86 @@ impl Hart {
                 self.yield_slice = true;
             }
             Op::SfenceVma | Op::SinvalVma => {
-                if self.prv == Priv::User
+                // mstatus.TVM governs HS-mode, hstatus.VTVM VS-mode; from
+                // VU-mode it is a virtual instruction.
+                if self.virt {
+                    if self.prv == Priv::User || self.csr.h.hstatus & hstatus::VTVM != 0 {
+                        return Err(Exception::new(cause::VIRTUAL_INSN, u64::from(insn.raw)));
+                    }
+                } else if self.prv == Priv::User
                     || (self.prv == Priv::Supervisor && self.csr.mstatus & status::TVM != 0)
                 {
                     return Err(Self::illegal(insn));
                 }
-                self.sfence_vma(insn.rs1, insn.rs2, rs1, rs2);
+                if self.virt {
+                    // VS-stage entries are not tagged by VMID or VS-ASID.
+                    self.flush_tlb();
+                } else {
+                    self.sfence_vma(insn.rs1, insn.rs2, rs1, rs2);
+                }
             }
             Op::SfenceWInval | Op::SfenceInvalIr => {
                 if self.prv == Priv::User {
-                    return Err(Self::illegal(insn));
+                    return Err(if self.virt {
+                        Exception::new(cause::VIRTUAL_INSN, u64::from(insn.raw))
+                    } else {
+                        Self::illegal(insn)
+                    });
                 }
                 self.fetch_vpn = 0;
+            }
+            Op::HfenceVvma | Op::HfenceGvma => {
+                self.h_insn_check(insn.raw, true)?;
+                if insn.op == Op::HfenceGvma
+                    && self.prv == Priv::Supervisor
+                    && self.csr.mstatus & status::TVM != 0
+                {
+                    return Err(Self::illegal(insn));
+                }
+                self.flush_tlb();
+            }
+            Op::Hlv => {
+                self.h_insn_check(insn.raw, false)?;
+                let v = self.hyp_load(bus, rs1, insn.funct)?;
+                self.set_x(rd, v);
+            }
+            Op::Hsv => {
+                self.h_insn_check(insn.raw, false)?;
+                self.hyp_store(bus, rs1, insn.funct, rs2)?;
             }
 
             // Zicbom / Zicboz (64-byte cache-block operations).
             Op::CboInval => {
-                let ok = match self.prv {
-                    Priv::Machine => true,
-                    Priv::Supervisor => self.csr.menvcfg & envcfg::CBIE_MASK != 0,
-                    Priv::User => {
-                        (self.csr.menvcfg & envcfg::CBIE_MASK) != 0
-                            && (self.csr.senvcfg & envcfg::CBIE_MASK) != 0
-                    }
-                };
-                if !ok {
-                    return Err(Self::illegal(insn));
-                }
+                self.cbo_enabled(envcfg::CBIE_MASK, insn)?;
                 let va = self.mask_data_addr(rs1);
                 let base_va = va & !63;
                 let pa = self
                     .translate(bus, base_va, Access::CacheBom)
-                    .map_err(|e| Exception::new(e.cause, va))?;
+                    .map_err(|e| Exception { tval: va, ..e })?;
                 self.check_pmp_access(va, pa, 64, Access::CacheBom)?;
                 Self::cbo_pma_check(bus, pa, va, false)?;
                 self.invalidate_reservation(pa);
                 bus.invalidate_cache_line(pa, AccessSize::Double);
             }
             Op::CboClean | Op::CboFlush => {
-                let ok = match self.prv {
-                    Priv::Machine => true,
-                    Priv::Supervisor => self.csr.menvcfg & envcfg::CBCFE != 0,
-                    Priv::User => (self.csr.menvcfg & self.csr.senvcfg & envcfg::CBCFE) != 0,
-                };
-                if !ok {
-                    return Err(Self::illegal(insn));
-                }
+                self.cbo_enabled(envcfg::CBCFE, insn)?;
                 let va = self.mask_data_addr(rs1);
                 let base_va = va & !63;
                 let pa = self
                     .translate(bus, base_va, Access::CacheBom)
-                    .map_err(|e| Exception::new(e.cause, va))?;
+                    .map_err(|e| Exception { tval: va, ..e })?;
                 self.check_pmp_access(va, pa, 64, Access::CacheBom)?;
                 Self::cbo_pma_check(bus, pa, va, false)?;
                 self.invalidate_reservation(pa);
                 bus.invalidate_cache_line(pa, AccessSize::Double);
             }
             Op::CboZero => {
-                let ok = match self.prv {
-                    Priv::Machine => true,
-                    Priv::Supervisor => self.csr.menvcfg & envcfg::CBZE != 0,
-                    Priv::User => (self.csr.menvcfg & self.csr.senvcfg & envcfg::CBZE) != 0,
-                };
-                if !ok {
-                    return Err(Self::illegal(insn));
-                }
+                self.cbo_enabled(envcfg::CBZE, insn)?;
                 let va = self.mask_data_addr(rs1);
                 let base_va = va & !63;
                 let pa = self
                     .translate(bus, base_va, Access::Store)
-                    .map_err(|e| Exception::new(e.cause, va))?;
+                    .map_err(|e| Exception { tval: va, ..e })?;
                 self.check_pmp_access(va, pa, 64, Access::Store)?;
                 Self::cbo_pma_check(bus, pa, va, true)?;
                 self.invalidate_reservation(pa);
@@ -2764,11 +2960,15 @@ impl Hart {
             _ => (u64::from(insn.rs1), insn.rs1 != 0),
         };
         // Privilege and read-only checks.
-        if (self.prv as u16) < (num >> 8) & 3 {
-            return Err(illegal());
-        }
-        if writes && num >> 10 == 3 {
-            return Err(illegal());
+        if self.h_ext {
+            self.h_csr_check(num, writes, insn.raw)?;
+        } else {
+            if (self.prv as u16) < (num >> 8) & 3 {
+                return Err(illegal());
+            }
+            if writes && num >> 10 == 3 {
+                return Err(illegal());
+            }
         }
         if num == csr::SEED && !writes {
             return Err(illegal());
@@ -2809,12 +3009,36 @@ impl Hart {
         Ok(())
     }
 
-    fn fs_enabled(&self) -> bool {
+    /// Floating-point state is on: `mstatus.FS`, and with V = 1 also the
+    /// HS-level `sstatus.FS` (kept in the bank while V = 1).
+    pub(crate) fn fs_enabled(&self) -> bool {
         self.csr.mstatus & status::FS != 0
+            && (!self.virt || self.csr.h.bank.status & status::FS != 0)
     }
 
-    fn vs_enabled(&self) -> bool {
+    /// Vector state is on (as [`Self::fs_enabled`], for `VS`).
+    pub(crate) fn vs_enabled(&self) -> bool {
         self.csr.mstatus & status::VS != 0
+            && (!self.virt || self.csr.h.bank.status & status::VS != 0)
+    }
+
+    /// Marks the floating-point state dirty, in both `vsstatus` and the
+    /// HS-level `sstatus` while V = 1.
+    #[inline]
+    pub(crate) fn mark_fs_dirty(&mut self) {
+        self.csr.mstatus |= status::FS;
+        if self.virt {
+            self.csr.h.bank.status |= status::FS;
+        }
+    }
+
+    /// Marks the vector state dirty (as [`Self::mark_fs_dirty`]).
+    #[inline]
+    pub(crate) fn mark_vs_dirty(&mut self) {
+        self.csr.mstatus |= status::VS;
+        if self.virt {
+            self.csr.h.bank.status |= status::VS;
+        }
     }
 
     /// Whether counter `idx` (0 = cycle, 1 = time, 2 = instret, ...) is
@@ -2830,6 +3054,11 @@ impl Hart {
 
     /// Reads a CSR; `None` if it does not exist or is inaccessible.
     pub fn csr_read(&self, num: u16) -> Option<u64> {
+        if self.h_ext {
+            if let Some(v) = self.h_csr_read(num) {
+                return v;
+            }
+        }
         let c = &self.csr;
         Some(match num {
             csr::FFLAGS | csr::FRM | csr::FCSR if !self.fs_enabled() => return None,
@@ -2880,14 +3109,18 @@ impl Hart {
                 match num {
                     csr::CYCLE => c.mcycle,
                     csr::INSTRET => c.minstret,
+                    csr::TIME if self.virt => self.timebase.now().wrapping_add(c.h.htimedelta),
                     csr::TIME => self.timebase.now(),
                     _ => c.mhpmcounter[(num - csr::HPMCOUNTER3) as usize],
                 }
             }
             csr::SCOUNTOVF => {
                 let mut ovf = 0u64;
+                // In VS-mode hcounteren masks the bits too (as QEMU).
                 let en = if self.prv == Priv::Machine {
                     u64::MAX
+                } else if self.virt {
+                    c.mcounteren & c.h.hcounteren
                 } else {
                     c.mcounteren
                 };
@@ -2932,7 +3165,8 @@ impl Hart {
                 c.stimecmp
             }
             csr::SATP => {
-                if self.prv == Priv::Supervisor && c.mstatus & status::TVM != 0 {
+                // mstatus.TVM traps HS-mode only (VS-mode has hstatus.VTVM).
+                if self.prv == Priv::Supervisor && !self.virt && c.mstatus & status::TVM != 0 {
                     return None;
                 }
                 c.satp
@@ -2952,7 +3186,7 @@ impl Hart {
             csr::MVENDORID | csr::MARCHID | csr::MIMPID | csr::MCONFIGPTR => 0,
             csr::MHARTID => self.id,
             csr::MSTATUS => self.read_mstatus(),
-            csr::MISA => csr::MISA_VALUE,
+            csr::MISA => csr::MISA_VALUE | if self.h_ext { 1 << 7 } else { 0 },
             csr::MEDELEG => c.medeleg,
             csr::MIDELEG => c.mideleg,
             csr::MIE => c.mie,
@@ -3024,38 +3258,43 @@ impl Hart {
 
     /// Writes a CSR; `None` if it does not exist or is inaccessible.
     pub fn csr_write(&mut self, num: u16, v: u64) -> Option<()> {
+        if self.h_ext {
+            if let Some(r) = self.h_csr_write(num, v) {
+                return r;
+            }
+        }
         match num {
             csr::FFLAGS | csr::FRM | csr::FCSR if !self.fs_enabled() => return None,
             csr::FFLAGS => {
                 self.csr.fflags = v & 0x1f;
-                self.csr.mstatus |= status::FS;
+                self.mark_fs_dirty();
             }
             csr::FRM => {
                 self.csr.frm = v & 7;
-                self.csr.mstatus |= status::FS;
+                self.mark_fs_dirty();
             }
             csr::FCSR => {
                 self.csr.fflags = v & 0x1f;
                 self.csr.frm = (v >> 5) & 7;
-                self.csr.mstatus |= status::FS;
+                self.mark_fs_dirty();
             }
             csr::VSTART | csr::VXSAT | csr::VXRM | csr::VCSR if !self.vs_enabled() => return None,
             csr::VSTART => {
                 self.csr.vstart = v & ((csr::VLEN as u64) - 1);
-                self.csr.mstatus |= status::VS;
+                self.mark_vs_dirty();
             }
             csr::VXSAT => {
                 self.csr.vxsat = v & 1;
-                self.csr.mstatus |= status::VS;
+                self.mark_vs_dirty();
             }
             csr::VXRM => {
                 self.csr.vxrm = v & 3;
-                self.csr.mstatus |= status::VS;
+                self.mark_vs_dirty();
             }
             csr::VCSR => {
                 self.csr.vxsat = v & 1;
                 self.csr.vxrm = (v >> 1) & 3;
-                self.csr.mstatus |= status::VS;
+                self.mark_vs_dirty();
             }
             csr::SSP => {
                 if self.prv != Priv::Machine && !self.csr.shadow_stack_enabled(self.prv) {
@@ -3075,7 +3314,13 @@ impl Hart {
             }
             csr::SSTATUS => {
                 let mut m = status::S_WRITABLE;
-                if self.csr.menvcfg & envcfg::DTE == 0 {
+                // VS-mode's sstatus is vsstatus: its SDT needs henvcfg.DTE.
+                let dte = if self.virt {
+                    self.csr.henvcfg_eff()
+                } else {
+                    self.csr.menvcfg
+                };
+                if dte & envcfg::DTE == 0 {
                     m &= !status::SDT;
                 }
                 let mut n = (self.csr.mstatus & !m) | (v & m);
@@ -3099,7 +3344,11 @@ impl Hart {
                     return None;
                 }
                 let mut mask = envcfg::S_MASK;
-                if self.csr.menvcfg & envcfg::SSE == 0 {
+                // senvcfg.SSE needs menvcfg.SSE, and from VS-mode also
+                // henvcfg.SSE (as QEMU).
+                if self.csr.menvcfg & envcfg::SSE == 0
+                    || (self.virt && self.csr.h.henvcfg & envcfg::SSE == 0)
+                {
                     mask &= !envcfg::SSE;
                 }
                 self.csr.senvcfg = envcfg::sanitize(v, self.csr.senvcfg, mask);
@@ -3127,7 +3376,8 @@ impl Hart {
                 self.csr.stimecmp = v;
             }
             csr::SATP => {
-                if self.prv == Priv::Supervisor && self.csr.mstatus & status::TVM != 0 {
+                if self.prv == Priv::Supervisor && !self.virt && self.csr.mstatus & status::TVM != 0
+                {
                     return None;
                 }
                 let mode = v >> 60;
@@ -3162,6 +3412,9 @@ impl Hart {
             }
             csr::MSTATUS => {
                 let mut m = status::M_WRITABLE;
+                if self.h_ext {
+                    m |= status::MPV | status::GVA;
+                }
                 if self.csr.menvcfg & envcfg::DTE == 0 {
                     m &= !status::SDT;
                 }
@@ -3182,9 +3435,23 @@ impl Hart {
                 self.csr.mstatus = n;
             }
             csr::MISA => {}
-            csr::MEDELEG => self.csr.medeleg = v & csr::MEDELEG_MASK,
+            csr::MEDELEG => {
+                let mask = if self.h_ext {
+                    csr::MEDELEG_MASK_H
+                } else {
+                    csr::MEDELEG_MASK
+                };
+                self.csr.medeleg = v & mask;
+            }
             csr::MIDELEG => self.csr.mideleg = v & irq::S_MASK,
-            csr::MIE => self.csr.mie = v & irq::ALL,
+            csr::MIE => {
+                let mask = if self.h_ext {
+                    irq::ALL | irq::HS_FORCED
+                } else {
+                    irq::ALL
+                };
+                self.csr.mie = v & mask;
+            }
             csr::MTVEC => {
                 if v & 2 == 0 {
                     self.csr.mtvec = v;
@@ -3217,11 +3484,12 @@ impl Hart {
                 self.csr.mcountinhibit = v & 0xffff_fffd;
                 self.csr.update_active_hpm_mask();
             }
-            csr::MCYCLECFG => self.csr.mcyclecfg = v & csr::hpmevent::FILTER_MASK,
-            csr::MINSTRETCFG => self.csr.minstretcfg = v & csr::hpmevent::FILTER_MASK,
+            csr::MCYCLECFG => self.csr.mcyclecfg = v & self.hpm_filter_mask(),
+            csr::MINSTRETCFG => self.csr.minstretcfg = v & self.hpm_filter_mask(),
             csr::MHPMEVENT3..=csr::MHPMEVENT31 => {
                 let i = (num - csr::MHPMEVENT3) as usize;
-                self.csr.mhpmevent[i] = v & csr::hpmevent::MHPMEVENT_MASK;
+                self.csr.mhpmevent[i] =
+                    v & (csr::hpmevent::MHPMEVENT_MASK | self.hpm_filter_mask());
                 self.csr.update_active_hpm_mask();
             }
             csr::MSCRATCH => self.csr.mscratch = v,
@@ -3232,6 +3500,12 @@ impl Hart {
                 let mut m = irq::SSIP | irq::SEIP | irq::LCOFIP;
                 if self.csr.menvcfg & envcfg::STCE == 0 {
                     m |= irq::STIP;
+                }
+                if self.h_ext {
+                    m |= irq::VSSIP | irq::VSEIP;
+                    if self.csr.menvcfg & self.csr.h.henvcfg & envcfg::STCE == 0 {
+                        m |= irq::VSTIP;
+                    }
                 }
                 self.csr.mip = (self.csr.mip & !m) | (v & m);
             }
@@ -3311,7 +3585,7 @@ impl Hart {
                         self.csr.tdata1[idx] = prev_ty << csr::trig::TYPE_SHIFT;
                     }
                     csr::trig::TYPE_MCONTROL | csr::trig::TYPE_MCONTROL6 => {
-                        let rw_mask = csr::trig::LOAD
+                        let mut rw_mask = csr::trig::LOAD
                             | csr::trig::STORE
                             | csr::trig::EXECUTE
                             | csr::trig::U
@@ -3320,15 +3594,21 @@ impl Hart {
                             | csr::trig::MATCH_MASK
                             | csr::trig::CHAIN
                             | csr::trig::SIZE_MASK;
+                        if self.h_ext && ty == csr::trig::TYPE_MCONTROL6 {
+                            rw_mask |= csr::trig::VS6 | csr::trig::VU6;
+                        }
                         self.csr.tdata1[idx] = (ty << csr::trig::TYPE_SHIFT) | (v & rw_mask);
                     }
                     csr::trig::TYPE_ICOUNT => {
-                        let rw_mask = csr::trig::ICOUNT_U
+                        let mut rw_mask = csr::trig::ICOUNT_U
                             | csr::trig::ICOUNT_S
                             | csr::trig::ICOUNT_PENDING
                             | csr::trig::ICOUNT_M
                             | csr::trig::ICOUNT_COUNT_MASK
                             | csr::trig::ICOUNT_HIT;
+                        if self.h_ext {
+                            rw_mask |= csr::trig::ICOUNT_VS | csr::trig::ICOUNT_VU;
+                        }
                         self.csr.tdata1[idx] = (ty << csr::trig::TYPE_SHIFT) | (v & rw_mask);
                         self.icount_written = true;
                     }

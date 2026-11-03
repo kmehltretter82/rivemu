@@ -175,6 +175,8 @@ pub struct MachineConfig {
     pub semihosting: bool,
     /// Implement Smdbltrp (`-cpu rv64,smdbltrp=on`); off by default, as in QEMU and Sail.
     pub smdbltrp: bool,
+    /// Implement the H extension (`-cpu rv64,h=on`); off by default.
+    pub hypervisor: bool,
 }
 
 impl Default for MachineConfig {
@@ -197,6 +199,7 @@ impl Default for MachineConfig {
             strict_pmp: true,
             semihosting: false,
             smdbltrp: false,
+            hypervisor: false,
         }
     }
 }
@@ -429,6 +432,7 @@ impl Machine {
                 h.strict_pmp = config.strict_pmp;
                 h.semihosting = config.semihosting;
                 h.smdbltrp = config.smdbltrp;
+                h.set_hypervisor(config.hypervisor);
                 h.update_pmp_state();
                 h
             })
@@ -673,6 +677,7 @@ impl Machine {
                 virtio: virtio_fdt,
                 svade: config.svade,
                 smdbltrp: config.smdbltrp,
+                hypervisor: config.hypervisor,
             }),
         };
         let fdt_top = ram_end.min(3072 * MIB);
@@ -1408,6 +1413,49 @@ mod tests {
         let ev = m.run_slice();
         assert_eq!(ev, Some(PowerEvent::Poweroff(0)));
         assert_eq!(m.uart.take_output(), b"SEMI_OK");
+    }
+
+    #[test]
+    fn snapshot_keeps_the_h_extension_state() {
+        use rivemu_cpu_riscv::csr;
+        let code = memmap::DRAM_BASE + 0x2000;
+        let h_machine = || {
+            Machine::new(MachineConfig {
+                hypervisor: true,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let mut m1 = h_machine();
+        let h = &mut m1.harts[0];
+        h.csr_write(csr::HGATP, (8 << 60) | 0x8_0010).unwrap();
+        h.csr_write(csr::HSTATUS, csr::hstatus::VTW).unwrap();
+        h.csr_write(csr::SSCRATCH, 0x5678).unwrap();
+        h.csr_write(csr::VSSCRATCH, 0x1234).unwrap();
+        // mret into VS-mode: the active S-level CSRs are now the VS ones.
+        h.csr_write(csr::MSTATUS, (1 << 39) | (1 << 11)).unwrap();
+        h.csr_write(csr::MEPC, code + 4).unwrap();
+        m1.bus.write(code, AccessSize::Word, 0x3020_0073).unwrap();
+        h.pc = code;
+        h.step(&m1.bus);
+        assert!(h.virt);
+        let snap = TempFile::new("hsnap", &[]);
+        m1.save_snapshot(&snap.0).unwrap();
+
+        let mut m2 = h_machine();
+        m2.load_snapshot(&snap.0).unwrap();
+        let h = &m2.harts[0];
+        assert!(h.virt && h.csr.h.virt);
+        assert_eq!(h.pc, code + 4);
+        assert_eq!(h.csr.sscratch, 0x1234, "active bank: VS");
+        assert_eq!(h.csr.h.bank.sscratch, 0x5678, "inactive bank: HS");
+        assert_eq!(h.csr_read(csr::HGATP), Some((8 << 60) | 0x8_0010));
+        assert_eq!(h.csr.h.hstatus & csr::hstatus::VTW, csr::hstatus::VTW);
+
+        // A guest (V = 1) cannot be restored on a hart without H.
+        let mut m3 = Machine::new(MachineConfig::default()).unwrap();
+        let err = m3.load_snapshot(&snap.0).unwrap_err();
+        assert!(err.to_string().contains("no H extension"), "{err}");
     }
 
     #[test]

@@ -6,7 +6,6 @@ use rivemu_softfloat::{
     self as sf, BF16_CANONICAL_NAN, F16_CANONICAL_NAN, F32_CANONICAL_NAN, Flags, RoundingMode,
 };
 
-use crate::csr::status;
 use crate::decode::{Insn, Op};
 use crate::hart::{Exception, Hart, cause};
 
@@ -42,7 +41,7 @@ impl Hart {
     #[inline]
     pub(crate) fn set_f16(&mut self, r: u8, v: u16) {
         self.f[r as usize] = BOX16 | u64::from(v);
-        self.csr.mstatus |= status::FS;
+        self.mark_fs_dirty();
     }
 
     /// Reads an f register as a single, unboxing (improperly boxed → canonical NaN).
@@ -59,26 +58,26 @@ impl Hart {
     #[inline]
     pub(crate) fn set_f32(&mut self, r: u8, v: u32) {
         self.f[r as usize] = BOX | u64::from(v);
-        self.csr.mstatus |= status::FS;
+        self.mark_fs_dirty();
     }
 
     #[inline]
     pub(crate) fn set_f64(&mut self, r: u8, v: u64) {
         self.f[r as usize] = v;
-        self.csr.mstatus |= status::FS;
+        self.mark_fs_dirty();
     }
 
     #[inline]
     pub(crate) fn accrue(&mut self, fl: Flags) {
         if fl.0 != 0 {
             self.csr.fflags |= u64::from(fl.0);
-            self.csr.mstatus |= status::FS;
+            self.mark_fs_dirty();
         }
     }
 
     pub(crate) fn exec_fp(&mut self, bus: &AddressSpace, insn: &Insn) -> Result<(), Exception> {
         let illegal = Exception::new(cause::ILLEGAL_INSN, u64::from(insn.raw));
-        if self.csr.mstatus & status::FS == 0 {
+        if !self.fs_enabled() {
             return Err(illegal);
         }
         let rm_bits = if insn.funct == 7 {

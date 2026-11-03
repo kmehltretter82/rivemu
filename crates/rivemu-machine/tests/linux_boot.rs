@@ -455,6 +455,7 @@ fn main() {
         strict_pmp: true,
         semihosting: false,
         smdbltrp: false,
+        hypervisor: false,
     })
     .expect("machine init");
 

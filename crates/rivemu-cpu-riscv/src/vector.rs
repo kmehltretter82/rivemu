@@ -6,7 +6,6 @@ use rivemu_softfloat::{
     self as sf, F16_CANONICAL_NAN, F32_CANONICAL_NAN, F64_CANONICAL_NAN, Flags, RoundingMode,
 };
 
-use crate::csr::status;
 use crate::decode::{Insn, Op};
 use crate::hart::{Exception, Hart, cause};
 
@@ -330,7 +329,7 @@ impl Hart {
 
     pub(crate) fn exec_vector(&mut self, bus: &AddressSpace, insn: &Insn) -> Result<(), Exception> {
         let illegal = || Exception::new(cause::ILLEGAL_INSN, u64::from(insn.raw));
-        if (self.csr.mstatus & status::VS) == 0 {
+        if !self.vs_enabled() {
             return Err(illegal());
         }
         match insn.op {
@@ -381,7 +380,7 @@ impl Hart {
                 self.set_v_elem(vd, eew_bytes, i, val);
             }
             self.csr.vstart = 0;
-            self.csr.mstatus |= status::VS;
+            self.mark_vs_dirty();
             return Ok(());
         }
 
@@ -403,7 +402,7 @@ impl Hart {
                 self.set_v_elem(vd, 1, i, val);
             }
             self.csr.vstart = 0;
-            self.csr.mstatus |= status::VS;
+            self.mark_vs_dirty();
             return Ok(());
         }
 
@@ -474,7 +473,7 @@ impl Hart {
                         if is_ff && i > 0 {
                             self.csr.vl = i as u64;
                             self.csr.vstart = 0;
-                            self.csr.mstatus |= status::VS;
+                            self.mark_vs_dirty();
                             return Ok(());
                         }
                         self.vector_trap_at(start, i);
@@ -484,7 +483,7 @@ impl Hart {
             }
         }
         self.csr.vstart = 0;
-        self.csr.mstatus |= status::VS;
+        self.mark_vs_dirty();
         Ok(())
     }
 
@@ -495,7 +494,7 @@ impl Hart {
     fn vector_trap_at(&mut self, start: usize, i: usize) {
         self.csr.vstart = i as u64;
         if i > start {
-            self.csr.mstatus |= status::VS;
+            self.mark_vs_dirty();
         }
     }
 
@@ -673,7 +672,7 @@ impl Hart {
                 self.csr.vl = 0;
                 self.csr.vstart = 0;
                 self.set_x(insn.rd, 0);
-                self.csr.mstatus |= status::VS;
+                self.mark_vs_dirty();
                 return Ok(());
             };
             let avl = if (raw >> 30) == 0b11 {
@@ -690,7 +689,7 @@ impl Hart {
             self.csr.vl = new_vl;
             self.csr.vstart = 0;
             self.set_x(insn.rd, new_vl);
-            self.csr.mstatus |= status::VS;
+            self.mark_vs_dirty();
             return Ok(());
         }
 
@@ -707,7 +706,7 @@ impl Hart {
                 self.v[vd + r] = self.v[rs2 + r];
             }
             self.csr.vstart = 0;
-            self.csr.mstatus |= status::VS;
+            self.mark_vs_dirty();
             return Ok(());
         }
 
@@ -834,7 +833,7 @@ impl Hart {
                 }
                 self.set_v_elem(vd, wide_bytes, 0, acc);
             }
-            self.csr.mstatus |= status::VS;
+            self.mark_vs_dirty();
             return Ok(());
         }
 
@@ -1227,7 +1226,7 @@ impl Hart {
                 _ => return Err(illegal()),
             }
         }
-        self.csr.mstatus |= status::VS;
+        self.mark_vs_dirty();
         Ok(())
     }
 
@@ -1276,7 +1275,7 @@ impl Hart {
                 }
                 self.set_v_elem(vd, sew_bytes, 0, acc);
             }
-            self.csr.mstatus |= status::VS;
+            self.mark_vs_dirty();
             return Ok(());
         }
 
@@ -1322,7 +1321,7 @@ impl Hart {
             if vl > 0 {
                 self.set_v_elem(vd, sew_bytes, 0, self.x[rs1]);
             }
-            self.csr.mstatus |= status::VS;
+            self.mark_vs_dirty();
             return Ok(());
         }
 
@@ -1366,7 +1365,7 @@ impl Hart {
                     self.set_v_elem(vd, sew_bytes, i, val);
                 }
             }
-            self.csr.mstatus |= status::VS;
+            self.mark_vs_dirty();
             return Ok(());
         }
 
@@ -1440,7 +1439,7 @@ impl Hart {
                 }
                 _ => return Err(illegal()),
             }
-            self.csr.mstatus |= status::VS;
+            self.mark_vs_dirty();
             return Ok(());
         }
 
@@ -1478,7 +1477,7 @@ impl Hart {
                     dst_idx += 1;
                 }
             }
-            self.csr.mstatus |= status::VS;
+            self.mark_vs_dirty();
             return Ok(());
         }
 
@@ -1500,7 +1499,7 @@ impl Hart {
                 };
                 self.set_v_reg_mask_bit(vd, i, out);
             }
-            self.csr.mstatus |= status::VS;
+            self.mark_vs_dirty();
             return Ok(());
         }
 
@@ -1713,7 +1712,7 @@ impl Hart {
                 _ => return Err(illegal()),
             }
         }
-        self.csr.mstatus |= status::VS;
+        self.mark_vs_dirty();
         Ok(())
     }
 
@@ -1730,7 +1729,7 @@ impl Hart {
         sew_bytes: usize,
     ) -> Result<(), Exception> {
         let illegal = || Exception::new(cause::ILLEGAL_INSN, u64::from(insn.raw));
-        if (self.csr.mstatus & status::FS) == 0 || !matches!(sew_bytes, 2 | 4 | 8) {
+        if !self.fs_enabled() || !matches!(sew_bytes, 2 | 4 | 8) {
             return Err(illegal());
         }
         let Some(rm) = RoundingMode::from_bits(self.csr.frm) else {
@@ -1758,7 +1757,7 @@ impl Hart {
                     };
                     self.set_v_elem(vd, sew_bytes, 0, fval);
                 }
-                self.csr.mstatus |= status::VS;
+                self.mark_vs_dirty();
                 return Ok(());
             }
             return Err(illegal());
@@ -1791,7 +1790,7 @@ impl Hart {
                 self.set_v_elem(vd, sew_bytes, 0, acc);
             }
             self.accrue(fl);
-            self.csr.mstatus |= status::VS;
+            self.mark_vs_dirty();
             return Ok(());
         }
 
@@ -2065,7 +2064,7 @@ impl Hart {
             }
         }
         self.accrue(fl);
-        self.csr.mstatus |= status::VS;
+        self.mark_vs_dirty();
         Ok(())
     }
 }

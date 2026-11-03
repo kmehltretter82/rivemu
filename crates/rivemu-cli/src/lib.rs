@@ -240,6 +240,8 @@ pub struct Options {
     pub semihosting: bool,
     /// `-cpu rv64,smdbltrp=on`: implement Smdbltrp.
     pub smdbltrp: bool,
+    /// `-cpu rv64,h=on`: implement the H extension.
+    pub hypervisor: bool,
 }
 
 impl Default for Options {
@@ -285,6 +287,7 @@ impl Default for Options {
             strict_pmp: true,
             semihosting: false,
             smdbltrp: false,
+            hypervisor: false,
         }
     }
 }
@@ -392,6 +395,7 @@ where
                                 "strict-align" | "strict_align" => o.strict_align = flag(val),
                                 "svade" => o.svade = flag(val),
                                 "smdbltrp" => o.smdbltrp = flag(val),
+                                "h" => o.hypervisor = flag(val),
                                 "pmp" | "strict-pmp" => o.strict_pmp = flag(val),
                                 "strict" => {
                                     let on = flag(val);
@@ -908,6 +912,7 @@ pub fn machine_config(o: &Options) -> Result<MachineConfig, String> {
         strict_pmp: o.strict_pmp,
         semihosting: o.semihosting,
         smdbltrp: o.smdbltrp,
+        hypervisor: o.hypervisor,
     })
 }
 

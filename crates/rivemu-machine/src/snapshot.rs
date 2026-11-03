@@ -13,9 +13,12 @@ use rivemu_virtio::{NvmeCq, NvmeSnapshot, NvmeSq, VirtQueue, VirtioPciSnapshot};
 
 use crate::virt::{Machine, memmap};
 
-/// Current format. RIVSNAP3 added `mcycle` after the PMP state of each hart.
-const SNAPSHOT_MAGIC: &[u8; 8] = b"RIVSNAP3";
-/// Previous format, still accepted: `mcycle` was not separate from `minstret`.
+/// Current format. RIVSNAP4 added the H-extension state
+/// ([`rivemu_cpu_riscv::Hart::h_snapshot`]) after `mcycle` of each hart.
+const SNAPSHOT_MAGIC: &[u8; 8] = b"RIVSNAP4";
+/// Still accepted: RIVSNAP3 added `mcycle` after the PMP state of each hart.
+const SNAPSHOT_MAGIC_V3: &[u8; 8] = b"RIVSNAP3";
+/// Still accepted: `mcycle` was not separate from `minstret`.
 const SNAPSHOT_MAGIC_V2: &[u8; 8] = b"RIVSNAP2";
 
 impl Machine {
@@ -111,6 +114,9 @@ impl Machine {
                 write_u64(&mut w, addr)?;
             }
             write_u64(&mut w, h.csr.mcycle)?;
+            for v in h.h_snapshot() {
+                write_u64(&mut w, v)?;
+            }
         }
 
         // CLINT
@@ -215,7 +221,8 @@ impl Machine {
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
         let v2 = &magic == SNAPSHOT_MAGIC_V2;
-        if &magic != SNAPSHOT_MAGIC && !v2 {
+        let v3 = &magic == SNAPSHOT_MAGIC_V3;
+        if &magic != SNAPSHOT_MAGIC && !v2 && !v3 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid rivemu snapshot magic",
@@ -340,6 +347,14 @@ impl Machine {
             } else {
                 read_u64(&mut r)?
             };
+            if !v2 && !v3 {
+                let mut words = [0u64; rivemu_cpu_riscv::H_SNAPSHOT_WORDS];
+                for w in &mut words {
+                    *w = read_u64(&mut r)?;
+                }
+                h.restore_h_snapshot(&words)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            }
             h.update_pmp_state();
             h.pending_sbi = false;
             h.pending_semihost = false;
