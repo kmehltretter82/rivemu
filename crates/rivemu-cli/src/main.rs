@@ -264,10 +264,11 @@ fn run() -> Result<ExitCode> {
     }
     if std::env::var_os("RIVEMU_STATS").is_some() {
         let secs = started.elapsed().as_secs_f64();
-        let n = machine.instret();
+        let n = machine.executed;
         eprintln!(
-            "{PROG}: {n} instructions in {secs:.2}s ({:.1} MIPS)",
-            n as f64 / secs / 1e6
+            "{PROG}: {n} instructions in {secs:.2}s ({:.1} MIPS; minstret {})",
+            n as f64 / secs / 1e6,
+            machine.instret()
         );
     }
     Ok(ExitCode::from(exit.clamp(0, 255) as u8))

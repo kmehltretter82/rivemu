@@ -295,6 +295,9 @@ pub struct Machine {
     /// of instructions a hart ran to the entry for the PC it stopped at, so
     /// the totals approximate where guest instructions are spent.
     pub pc_samples: Option<std::collections::HashMap<u64, u64>>,
+    /// Instructions the harts attempted since construction (including ones
+    /// that trapped). Unlike `minstret`, the guest cannot inhibit or write it.
+    pub executed: u64,
     /// Console UART.
     pub uart: Arc<Uart16550>,
     /// Timer / software interrupt controller.
@@ -725,6 +728,7 @@ impl Machine {
             fdt_addr,
             harts,
             pc_samples: None,
+            executed: 0,
             uart,
             clint,
             plic,
@@ -772,6 +776,7 @@ impl Machine {
                 if let Some(ic) = &self.icount {
                     ic.advance(ran);
                 }
+                self.executed += ran;
                 if ran > 0 {
                     if let Some(samples) = &mut self.pc_samples {
                         *samples.entry(self.harts[i].pc).or_insert(0) += ran;

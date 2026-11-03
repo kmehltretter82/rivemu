@@ -3799,3 +3799,69 @@ fn block_arena_overflow_keeps_executing_correctly() {
         assert_eq!(h.pc, CODE + 8 * BLOCKS + 4, "pass {pass}");
     }
 }
+
+/// Blocks run M-extension instructions inline. For edge-case operands
+/// (zero divisors, `i64::MIN / -1`, 32-bit overflow) every result must match
+/// single-stepping through `execute`, and the architectural values.
+#[test]
+fn block_m_extension_matches_single_stepping() {
+    const CODE: u64 = 0x8000_0000;
+    const PROGRAM: &[u32] = &[
+        0x02b5_0633, // mul    a2, a0, a1
+        0x02b5_16b3, // mulh   a3, a0, a1
+        0x02b5_2733, // mulhsu a4, a0, a1
+        0x02b5_37b3, // mulhu  a5, a0, a1
+        0x02b5_083b, // mulw   a6, a0, a1
+        0x02b5_48b3, // div    a7, a0, a1
+        0x02b5_5933, // divu   s2, a0, a1
+        0x02b5_69b3, // rem    s3, a0, a1
+        0x02b5_7a33, // remu   s4, a0, a1
+        0x02b5_4abb, // divw   s5, a0, a1
+        0x02b5_5b3b, // divuw  s6, a0, a1
+        0x02b5_6bbb, // remw   s7, a0, a1
+        0x02b5_7c3b, // remuw  s8, a0, a1
+        0x1050_0073, // wfi
+    ];
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    for (i, &w) in PROGRAM.iter().enumerate() {
+        bus.write(CODE + 4 * i as u64, AccessSize::Word, u64::from(w))
+            .unwrap();
+    }
+    let cases: &[(u64, u64)] = &[
+        (7, 0),
+        (i64::MIN as u64, -1i64 as u64),
+        (0xffff_ffff_8000_0000, -1i64 as u64), // i32::MIN / -1 in the W forms
+        (u64::MAX, u64::MAX),
+        (0x1234_5678_9abc_def0, 0xfedc_ba98_7654_3210),
+        (-17i64 as u64, 5),
+        (17, -5i64 as u64),
+    ];
+    for &(a, b) in cases {
+        let run = |blocks: bool| {
+            let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+            h.reset(CODE);
+            h.x[10] = a;
+            h.x[11] = b;
+            while !h.wfi {
+                if blocks {
+                    h.run(&bus, 100);
+                } else {
+                    h.step(&bus);
+                }
+            }
+            h.x
+        };
+        let (block, stepped) = (run(true), run(false));
+        assert_eq!(block, stepped, "a={a:#x} b={b:#x}");
+        if b == 0 {
+            assert_eq!(block[17], u64::MAX, "div by zero");
+            assert_eq!(block[19], a, "rem by zero");
+        }
+        if a == i64::MIN as u64 && b == u64::MAX {
+            assert_eq!(block[17], a, "div overflow");
+            assert_eq!(block[19], 0, "rem overflow");
+        }
+    }
+}

@@ -762,6 +762,11 @@ impl Hart {
     /// and returns the number attempted, including one that trapped.
     #[inline(always)]
     fn run_block(&mut self, bus: &AddressSpace, insns: &[Insn], mem_ctx: Option<u64>) -> u64 {
+        // The PC stays in a local while inline instructions run and is
+        // written back before anything that reads it. This removes a
+        // store-to-load dependency through `self.pc` between consecutive
+        // instructions.
+        let mut pc = self.pc;
         for (i, insn) in insns.iter().enumerate() {
             // Integer ALU, Lui/Auipc, Jal/Jalr and branches cannot trap,
             // touch memory or set check_irq/wfi/yield_slice, so they skip the
@@ -770,11 +775,14 @@ impl Hart {
             // with landing pads disabled and `elp` clear (see `run`), and
             // nothing in a block sets `elp`.
             debug_assert!(!self.elp);
-            if self.exec_inline(bus, insn, mem_ctx) {
+            if let Some(next) = self.exec_inline(bus, insn, mem_ctx, pc) {
+                pc = next;
                 continue;
             }
+            self.pc = pc;
             match self.execute(bus, insn) {
                 Ok(()) => {
+                    pc = self.pc;
                     if self.check_irq || self.wfi || self.yield_slice {
                         let done = (i + 1) as u64;
                         self.bump_counters(done);
@@ -797,6 +805,7 @@ impl Hart {
                 }
             }
         }
+        self.pc = pc;
         let done = insns.len() as u64;
         self.bump_counters(done);
         done
@@ -808,8 +817,14 @@ impl Hart {
     /// arm of [`Self::execute`]; returns `false` (and does nothing) for
     /// every other instruction. One `match` dispatches both kinds.
     #[inline(always)]
-    fn exec_inline(&mut self, bus: &AddressSpace, insn: &Insn, mem_ctx: Option<u64>) -> bool {
-        let pc = self.pc;
+    fn exec_inline(
+        &mut self,
+        bus: &AddressSpace,
+        insn: &Insn,
+        mem_ctx: Option<u64>,
+        pc: u64,
+    ) -> Option<u64> {
+        let next = pc.wrapping_add(u64::from(insn.len));
         let rs1 = self.x[usize::from(insn.rs1 & 31)];
         let rs2 = self.x[usize::from(insn.rs2 & 31)];
         let imm = insn.imm as u64;
@@ -845,6 +860,46 @@ impl Hart {
             Op::Sllw => sext32(rs1 << (rs2 & 31)),
             Op::Srlw => sext32(u64::from((rs1 as u32) >> (rs2 & 31))),
             Op::Sraw => ((rs1 as i32) >> (rs2 & 31)) as i64 as u64,
+            // M: multiplication and division never trap (division by zero
+            // and overflow have defined results). Bignum code (RSA and ECC
+            // signature checks while Linux loads modules) is full of these.
+            Op::Mul => rs1.wrapping_mul(rs2),
+            Op::Mulh => ((i128::from(rs1 as i64) * i128::from(rs2 as i64)) >> 64) as u64,
+            Op::Mulhsu => ((i128::from(rs1 as i64) * i128::from(rs2)) >> 64) as u64,
+            Op::Mulhu => ((u128::from(rs1) * u128::from(rs2)) >> 64) as u64,
+            Op::Mulw => sext32(rs1.wrapping_mul(rs2)),
+            Op::Div => {
+                let (a, b) = (rs1 as i64, rs2 as i64);
+                (if b == 0 { -1 } else { a.wrapping_div(b) }) as u64
+            }
+            Op::Divu => rs1.checked_div(rs2).unwrap_or(u64::MAX),
+            Op::Rem => {
+                let (a, b) = (rs1 as i64, rs2 as i64);
+                (if b == 0 { a } else { a.wrapping_rem(b) }) as u64
+            }
+            Op::Remu => {
+                if rs2 == 0 {
+                    rs1
+                } else {
+                    rs1 % rs2
+                }
+            }
+            Op::Divw => {
+                let (a, b) = (rs1 as i32, rs2 as i32);
+                (if b == 0 { -1 } else { a.wrapping_div(b) }) as i64 as u64
+            }
+            Op::Divuw => {
+                let (a, b) = (rs1 as u32, rs2 as u32);
+                sext32(u64::from(a.checked_div(b).unwrap_or(u32::MAX)))
+            }
+            Op::Remw => {
+                let (a, b) = (rs1 as i32, rs2 as i32);
+                (if b == 0 { a } else { a.wrapping_rem(b) }) as i64 as u64
+            }
+            Op::Remuw => {
+                let (a, b) = (rs1 as u32, rs2 as u32);
+                sext32(u64::from(if b == 0 { a } else { a % b }))
+            }
             Op::Beq | Op::Bne | Op::Blt | Op::Bge | Op::Bltu | Op::Bgeu => {
                 let taken = match insn.op {
                     Op::Beq => rs1 == rs2,
@@ -854,52 +909,71 @@ impl Hart {
                     Op::Bltu => rs1 < rs2,
                     _ => rs1 >= rs2,
                 };
-                self.pc = if taken {
-                    pc.wrapping_add(imm)
-                } else {
-                    pc.wrapping_add(u64::from(insn.len))
-                };
-                return true;
+                return Some(if taken { pc.wrapping_add(imm) } else { next });
             }
             Op::Jal => {
-                self.set_x(rd, pc.wrapping_add(u64::from(insn.len)));
-                self.pc = pc.wrapping_add(imm);
-                return true;
+                self.set_x(rd, next);
+                return Some(pc.wrapping_add(imm));
             }
             // Blocks run only with landing pads disabled (see `run`), so
             // Jalr never sets `elp` here.
             Op::Jalr => {
-                self.set_x(rd, pc.wrapping_add(u64::from(insn.len)));
-                self.pc = rs1.wrapping_add(imm) & !1;
-                return true;
+                self.set_x(rd, next);
+                return Some(rs1.wrapping_add(imm) & !1);
             }
             // One arm per opcode, so that each inlined access has a
             // constant size.
-            Op::Ld => return self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Double, |v| v),
+            Op::Ld => {
+                let ok = self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Double, |v| v);
+                return ok.then_some(next);
+            }
             Op::Lw => {
-                return self
+                let ok = self
                     .exec_load_inline(bus, insn, mem_ctx, AccessSize::Word, |v| v as i32 as u64);
+                return ok.then_some(next);
             }
-            Op::Lwu => return self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Word, |v| v),
-            Op::Lbu => return self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Byte, |v| v),
+            Op::Lwu => {
+                let ok = self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Word, |v| v);
+                return ok.then_some(next);
+            }
+            Op::Lbu => {
+                let ok = self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Byte, |v| v);
+                return ok.then_some(next);
+            }
             Op::Lb => {
-                return self
-                    .exec_load_inline(bus, insn, mem_ctx, AccessSize::Byte, |v| v as i8 as u64);
+                let ok =
+                    self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Byte, |v| v as i8 as u64);
+                return ok.then_some(next);
             }
-            Op::Lhu => return self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Half, |v| v),
+            Op::Lhu => {
+                let ok = self.exec_load_inline(bus, insn, mem_ctx, AccessSize::Half, |v| v);
+                return ok.then_some(next);
+            }
             Op::Lh => {
-                return self
+                let ok = self
                     .exec_load_inline(bus, insn, mem_ctx, AccessSize::Half, |v| v as i16 as u64);
+                return ok.then_some(next);
             }
-            Op::Sd => return self.exec_store_inline(bus, insn, mem_ctx, AccessSize::Double),
-            Op::Sw => return self.exec_store_inline(bus, insn, mem_ctx, AccessSize::Word),
-            Op::Sb => return self.exec_store_inline(bus, insn, mem_ctx, AccessSize::Byte),
-            Op::Sh => return self.exec_store_inline(bus, insn, mem_ctx, AccessSize::Half),
-            _ => return false,
+            Op::Sd => {
+                let ok = self.exec_store_inline(bus, insn, mem_ctx, AccessSize::Double);
+                return ok.then_some(next);
+            }
+            Op::Sw => {
+                let ok = self.exec_store_inline(bus, insn, mem_ctx, AccessSize::Word);
+                return ok.then_some(next);
+            }
+            Op::Sb => {
+                let ok = self.exec_store_inline(bus, insn, mem_ctx, AccessSize::Byte);
+                return ok.then_some(next);
+            }
+            Op::Sh => {
+                let ok = self.exec_store_inline(bus, insn, mem_ctx, AccessSize::Half);
+                return ok.then_some(next);
+            }
+            _ => return None,
         };
         self.set_x(rd, v);
-        self.pc = pc.wrapping_add(u64::from(insn.len));
-        true
+        Some(next)
     }
 
     /// An integer load in a block that stays within one page and hits the
@@ -931,7 +1005,6 @@ impl Hart {
             return false;
         };
         self.set_x(insn.rd, ext(v));
-        self.pc = self.pc.wrapping_add(u64::from(insn.len));
         true
     }
 
@@ -961,7 +1034,6 @@ impl Hart {
         {
             return false;
         }
-        self.pc = self.pc.wrapping_add(u64::from(insn.len));
         true
     }
 
