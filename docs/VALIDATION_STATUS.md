@@ -84,7 +84,7 @@ built-in-SBI Linux test both pass with the fix.
 | P19 NVMe, vsock, Snapshot v2 exits | Verified 2026-11-02, except disk state | `linux_devices`: Linux reads and writes NVMe, connects `AF_VSOCK` to CID 2, and NVMe and virtio-pci keep working after save/restore into a fresh machine. Snapshots do not contain disk contents, so no QCOW2 restore is claimed. |
 | Poweroff and reboot | Verified 2026-11-02 | `linux_devices`: `reboot -f` reaches `PowerEvent::Reset`, twice. |
 | SMP4 stability | Partial | The functional SMP4 boots pass and the isolated P17 campaign completed 20/20 SMP4 shell boots, but there is no repeated full device-smoke campaign. |
-| P17 `< 8 s` single-hart / `< 10 s` SMP4 | Failed | An isolated exact-boundary campaign (post-`Machine::new()` to first `~ # `, 2 warmups + 20 recorded samples each) measured SMP1 median/p95 18.905/19.929 s and SMP4 21.103/22.175 s. |
+| P17 `< 8 s` single-hart / `< 10 s` SMP4 | Failed (not re-run since the 2026-11-02 optimizations) | An isolated exact-boundary campaign (post-`Machine::new()` to first `~ # `, 2 warmups + 20 recorded samples each) measured SMP1 median/p95 18.905/19.929 s and SMP4 21.103/22.175 s on an M-series host. Since then the PMP page cache and the interpreter changes (`02d1f3c`, `207c7dc`) cut a from-source Linux 6.12 boot-to-poweroff on a 4-vCPU x86 container from 11.48/16.79 s (SMP1/SMP4 medians) to 7.50/9.57 s (`evidence/2026-11-02/boot-bench-interpreter.txt`). That is a different workload, so the P17 benchmark must be re-run before this row changes. |
 | `riscv-arch-test` privileged subset | Verified 2026-11-02 | 418/418 (`tests/arch-test/README.md`). |
 | Guest PMU/perf | Verified 2026-11-02 (counting) | `linux_devices`: `riscv-pmu-sbi` probes 16 firmware and 31 hardware counters, and `perf_event_open` counts instructions. PMU overflow interrupts are not asserted. |
 | Boot lockstep P16/P26 | Partial (first 3M instructions), 2026-11-02 | 3,000,000 instructions of OpenSBI + early Linux with 0 divergences against QEMU 11.1.3. A boot to the shell is about 10⁹ instructions and needs checkpointed windows. |
@@ -158,8 +158,9 @@ kernel bug was fixed.
 
 Ranked; details in [`REVIEW-20261102.md`](REVIEW-20261102.md) §6.
 
-1. Optimize or revise P17. The repeated benchmark shows that the `< 8 s`
-   SMP1 and `< 10 s` SMP4 targets are not met.
+1. Re-run the exact P17 benchmark (Debian kernel and initramfs) with
+   `207c7dc` or later. The same-machine from-source boot is now 7.50 s
+   (SMP1) and 9.57 s (SMP4), down from 11.48/16.79 s.
 2. Extend boot lockstep past the first 3M instructions (checkpointed
    windows) and add the 3M-step run to CI as a scheduled job.
 3. Resolve the RVA23 claim: implement Zama16b and H, or narrow the README.

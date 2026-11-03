@@ -94,6 +94,31 @@ jobs:
         env:
           RIVEMU_REQUIRE_LINUX_DEVICES: 1
 
+  p17-bench:
+    # P17 Linux-to-shell benchmark (tests/linux_perf.rs, Debian inputs) for the
+    # PR head and its base, alternating on the same runner so that both see
+    # the same machine. Informational: it reports medians and never fails on
+    # timing.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: images/linux-test
+          key: linux-test-${{ hashFiles('scripts/fetch-linux-test.sh') }}
+      - run: scripts/fetch-linux-test.sh
+      - run: mkdir -p base/images && cp -r images/linux-test base/images/
+      - run: scripts/p17-compare.sh 3 head=. base=base | tee p17-compare.txt
+      - run: tail -6 p17-compare.txt >> "$GITHUB_STEP_SUMMARY"
+
   msrv:
     name: msrv (1.85)
     runs-on: ubuntu-latest
