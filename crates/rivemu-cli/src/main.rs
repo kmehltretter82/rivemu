@@ -134,6 +134,12 @@ fn run() -> Result<ExitCode> {
         SerialBackend::Null => Box::new(std::io::sink()),
     };
 
+    // RIVEMU_PC_PROFILE=<file>: write "<instructions> <pc> <host ns>" lines,
+    // most frequent first, at exit (scripts/pc-profile.py symbolizes them).
+    let pc_profile = std::env::var_os("RIVEMU_PC_PROFILE").map(std::path::PathBuf::from);
+    if pc_profile.is_some() {
+        machine.pc_samples = Some(Default::default());
+    }
     let started = Instant::now();
     let exit = 'main: loop {
         for qmp in &mut qmp_servers {
@@ -246,12 +252,24 @@ fn run() -> Result<ExitCode> {
             .screendump(dump)
             .with_context(|| format!("failed to write screendump {}", dump.display()))?;
     }
+    if let (Some(path), Some(samples)) = (&pc_profile, &machine.pc_samples) {
+        let mut rows: Vec<(u64, u64, u64)> =
+            samples.iter().map(|(&pc, &(n, ns))| (n, pc, ns)).collect();
+        rows.sort_unstable_by(|a, b| b.cmp(a));
+        let text: String = rows
+            .iter()
+            .map(|(n, pc, ns)| format!("{n} {pc:#x} {ns}\n"))
+            .collect();
+        std::fs::write(path, text)
+            .with_context(|| format!("cannot write PC profile {}", path.display()))?;
+    }
     if std::env::var_os("RIVEMU_STATS").is_some() {
         let secs = started.elapsed().as_secs_f64();
-        let n = machine.instret();
+        let n = machine.executed;
         eprintln!(
-            "{PROG}: {n} instructions in {secs:.2}s ({:.1} MIPS)",
-            n as f64 / secs / 1e6
+            "{PROG}: {n} instructions in {secs:.2}s ({:.1} MIPS; minstret {})",
+            n as f64 / secs / 1e6,
+            machine.instret()
         );
     }
     Ok(ExitCode::from(exit.clamp(0, 255) as u8))

@@ -17,15 +17,16 @@ pub const DEFAULT_GPU_HEIGHT: u32 = 480;
 /// VirtIO GPU feature bit: EDID blob query (`VIRTIO_GPU_CMD_GET_EDID`).
 pub const VIRTIO_GPU_F_EDID: u64 = 1 << 1;
 
-// 2D Controlq commands (`enum virtio_gpu_ctrl_type`).
-const VIRTIO_GPU_CMD_GET_DISPLAY_INFO: u32 = 0x0101;
-const VIRTIO_GPU_CMD_RESOURCE_CREATE_2D: u32 = 0x0102;
-const VIRTIO_GPU_CMD_RESOURCE_UNREF: u32 = 0x0103;
-const VIRTIO_GPU_CMD_SET_SCANOUT: u32 = 0x0104;
-const VIRTIO_GPU_CMD_RESOURCE_FLUSH: u32 = 0x0105;
-const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: u32 = 0x0106;
-const VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0107;
-const VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING: u32 = 0x0108;
+// 2D Controlq commands (`enum virtio_gpu_ctrl_type`, VirtIO 1.2 section
+// 5.7.6.7 and Linux `include/uapi/linux/virtio_gpu.h`).
+const VIRTIO_GPU_CMD_GET_DISPLAY_INFO: u32 = 0x0100;
+const VIRTIO_GPU_CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
+const VIRTIO_GPU_CMD_RESOURCE_UNREF: u32 = 0x0102;
+const VIRTIO_GPU_CMD_SET_SCANOUT: u32 = 0x0103;
+const VIRTIO_GPU_CMD_RESOURCE_FLUSH: u32 = 0x0104;
+const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
+const VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
+const VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING: u32 = 0x0107;
 const VIRTIO_GPU_CMD_GET_EDID: u32 = 0x010a;
 
 // Cursorq commands.
@@ -37,8 +38,9 @@ const VIRTIO_GPU_RESP_OK_NODATA: u32 = 0x1100;
 const VIRTIO_GPU_RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 const VIRTIO_GPU_RESP_OK_EDID: u32 = 0x1104;
 const VIRTIO_GPU_RESP_ERR_UNSPEC: u32 = 0x1200;
-const VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID: u32 = 0x1202;
-const VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER: u32 = 0x1203;
+const VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID: u32 = 0x1202;
+const VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID: u32 = 0x1203;
+const VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER: u32 = 0x1205;
 
 const VIRTIO_GPU_FLAG_FENCE: u32 = 1 << 0;
 const VIRTIO_GPU_MAX_SCANOUTS: usize = 16;
@@ -410,8 +412,12 @@ impl VirtioGpu {
                 let scanout_id = u32::from_le_bytes(req[40..44].try_into().unwrap());
                 let res_id = u32::from_le_bytes(req[44..48].try_into().unwrap());
                 if scanout_id != 0 {
-                    return Self::build_hdr(VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER, flags, fence_id)
-                        .to_vec();
+                    return Self::build_hdr(
+                        VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID,
+                        flags,
+                        fence_id,
+                    )
+                    .to_vec();
                 }
                 if res_id != 0 && !self.resources.contains_key(&res_id) {
                     return Self::build_hdr(

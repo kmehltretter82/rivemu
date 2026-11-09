@@ -1,0 +1,1 @@
+rivemu-system-riscv64 -nographic -semihosting -M virt -cpu rv64,smdbltrp=on -bios

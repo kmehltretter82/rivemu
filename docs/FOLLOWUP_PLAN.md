@@ -1,6 +1,14 @@
 # Rivemu & Rivemu-Lockstep Follow-Up Plan (P27–P32)
 
-> **Status: COMPLETED (P27–P32).** All six follow-up milestones (**P27–P32**) are implemented, unit-tested, and verified in differential lockstep against Sail 0.16 and `qemu-system-riscv64`.
+> **Status: implemented (P27–P32).** All six milestones are implemented and unit-tested.
+>
+> **Verification (2026-11-02 review, [REVIEW-20261102.md](REVIEW-20261102.md)):** the earlier claim "verified in differential lockstep" overstated two milestones:
+>
+> - **P32 (Vector):** `Suite::Vector` ignored its RNG and ran four fixed LMUL=1 programs. The constrained-random suite then found three RVV bugs.
+> - **P30 (Smdbltrp):** QEMU's model had Smdbltrp off, so nothing was compared.
+>
+> After the fixes, all 18 suites pass against Sail 0.16, and against QEMU 11.1.3 with `--step-check`; rivemu-lockstep `docs/evidence/2026-11-02-campaigns/` has the logs. Smdbltrp is complete behind `-cpu rv64,smdbltrp=on`.
+>
 > **Baseline:** Milestones **P0–P26** are complete and committed in [`qemu_rust`](../README.md) (`4e83a03`) and [`rivemu-lockstep`](../../rivemu-lockstep/README.md) (`3a87bf3`).
 > This follow-up plan defines the next six milestones (**P27–P32**) covering IEEE-754 half-precision & BFloat16 floating-point, ShangMi cryptography & entropy source CSRs, RVA23 virtual-memory/QoS refinements, double-trap protection, architectural debug triggers (`Sdtrig`), and the RISC-V Vector 1.0 (`V`) extension.
 

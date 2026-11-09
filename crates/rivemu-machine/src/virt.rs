@@ -76,8 +76,12 @@ pub const VIRTIO_IRQ: u32 = 1;
 pub const PCIE_IRQ: u32 = 32;
 /// Number of PLIC sources (including the reserved source 0).
 pub const PLIC_NUM_SOURCES: usize = 96;
-/// Instructions each hart executes per scheduling slice.
-pub const QUANTUM: u64 = 10_000;
+/// Instructions each hart executes per scheduling slice. The harts take
+/// turns on one host thread; each turn reloads that hart's block cache and
+/// TLB tables into the host caches, so a short turn costs host time. At
+/// 50,000 a turn is about 0.2 ms of guest time on a 250 MIPS host, still far
+/// below QEMU's round-robin slice and a Linux timer tick.
+pub const QUANTUM: u64 = 50_000;
 /// Longest time the machine loop sleeps while all harts are idle.
 pub const MAX_IDLE: Duration = Duration::from_millis(10);
 
@@ -167,8 +171,16 @@ pub struct MachineConfig {
     pub strict_align: bool,
     /// Enforce `Svade` page-table rules (page fault when `pte.A == 0` or `pte.D == 0` on store).
     pub svade: bool,
-    /// Enforce strict PMP rules (deny S/U-mode access even when all PMP entries are `OFF`).
+    /// Spec PMP rule (default): with PMP implemented, an S/U-mode access that
+    /// matches no active entry fails. `false` allows such accesses, for
+    /// bare-metal images that never program PMP (`-cpu rv64,pmp=off`).
     pub strict_pmp: bool,
+    /// Service RISC-V Semihosting calls (`-semihosting`); off by default, as in QEMU.
+    pub semihosting: bool,
+    /// Implement Smdbltrp (`-cpu rv64,smdbltrp=on`); off by default, as in QEMU and Sail.
+    pub smdbltrp: bool,
+    /// Implement the H extension (`-cpu rv64,h=on`); off by default.
+    pub hypervisor: bool,
 }
 
 impl Default for MachineConfig {
@@ -188,7 +200,10 @@ impl Default for MachineConfig {
             icount: None,
             strict_align: false,
             svade: false,
-            strict_pmp: false,
+            strict_pmp: true,
+            semihosting: false,
+            smdbltrp: false,
+            hypervisor: false,
         }
     }
 }
@@ -264,6 +279,10 @@ pub struct BootInfo {
     pub dtb: Option<Vec<u8>>,
 }
 
+/// Exit status reported when a hart enters the Smdbltrp critical-error state
+/// (`EX_SOFTWARE`).
+pub const CRITICAL_ERROR_EXIT_STATUS: i32 = 70;
+
 /// An assembled `virt` machine.
 #[derive(Debug)]
 pub struct Machine {
@@ -279,6 +298,14 @@ pub struct Machine {
     pub fdt_addr: GuestAddr,
     /// The harts.
     pub harts: Vec<Hart>,
+    /// Guest PC profile: when `Some`, every scheduling slice adds the number
+    /// of instructions a hart ran and the host time it took (nanoseconds) to
+    /// the entry for the PC it stopped at, so the totals approximate where
+    /// guest instructions and host time are spent.
+    pub pc_samples: Option<std::collections::HashMap<u64, (u64, u64)>>,
+    /// Instructions the harts attempted since construction (including ones
+    /// that trapped). Unlike `minstret`, the guest cannot inhibit or write it.
+    pub executed: u64,
     /// Console UART.
     pub uart: Arc<Uart16550>,
     /// Timer / software interrupt controller.
@@ -299,6 +326,9 @@ pub struct Machine {
     pub framebuffer: Arc<Framebuffer>,
     /// Shared host `evdev` input event hub (used by `virtio-input`, HMP `sendkey`, and VNC).
     pub input: Arc<InputHub>,
+    /// Host side (CID 2) of every `virtio-vsock` device: inspect what the guest
+    /// sent and inject packets.
+    pub vsock: Arc<VsockHostEndpoint>,
     /// Host monotonic timebase.
     pub timebase: Arc<HostTimebase>,
     /// Instruction-counted timebase when `-icount` is enabled.
@@ -403,8 +433,11 @@ impl Machine {
             .map(|i| {
                 let mut h = Hart::new(u64::from(i), tb.clone());
                 h.strict_align = config.strict_align;
-                h.svade = config.svade;
+                h.set_svade(config.svade);
                 h.strict_pmp = config.strict_pmp;
+                h.semihosting = config.semihosting;
+                h.smdbltrp = config.smdbltrp;
+                h.set_hypervisor(config.hypervisor);
                 h.update_pmp_state();
                 h
             })
@@ -647,6 +680,9 @@ impl Machine {
                 initrd: boot.initrd,
                 plic_ndev: PLIC_NUM_SOURCES as u32 - 1,
                 virtio: virtio_fdt,
+                svade: config.svade,
+                smdbltrp: config.smdbltrp,
+                hypervisor: config.hypervisor,
             }),
         };
         let fdt_top = ram_end.min(3072 * MIB);
@@ -701,6 +737,8 @@ impl Machine {
             boot,
             fdt_addr,
             harts,
+            pc_samples: None,
+            executed: 0,
             uart,
             clint,
             plic,
@@ -711,6 +749,7 @@ impl Machine {
             pflash: [pflash0, pflash1],
             framebuffer,
             input,
+            vsock: vsock_endpoint,
             timebase,
             icount,
         })
@@ -732,9 +771,29 @@ impl Machine {
         for i in 0..self.harts.len() {
             let mut rem = QUANTUM;
             while rem > 0 {
+                let started = self.pc_samples.is_some().then(std::time::Instant::now);
                 let ran = self.harts[i].run(&self.bus, rem);
+                if self.harts[i].critical_error {
+                    eprintln!(
+                        "rivemu: hart {i} entered the critical-error state (a trap to M-mode \
+                         with mstatus.MDT = 1, pc = {:#x})",
+                        self.harts[i].pc
+                    );
+                    self.harts[i].critical_error = false;
+                    self.harts[i].hsm_stopped = true;
+                    self.power
+                        .request(PowerEvent::Poweroff(CRITICAL_ERROR_EXIT_STATUS));
+                }
                 if let Some(ic) = &self.icount {
                     ic.advance(ran);
+                }
+                self.executed += ran;
+                if ran > 0 {
+                    if let (Some(samples), Some(started)) = (&mut self.pc_samples, started) {
+                        let e = samples.entry(self.harts[i].pc).or_insert((0, 0));
+                        e.0 += ran;
+                        e.1 += started.elapsed().as_nanos() as u64;
+                    }
                 }
                 rem = rem.saturating_sub(ran);
                 if self.harts[i].pending_sbi {
@@ -1355,12 +1414,56 @@ mod tests {
         let kernel = TempFile::new("semihost", &raw);
         let mut m = Machine::new(MachineConfig {
             kernel: Some(kernel.0.clone()),
+            semihosting: true,
             ..Default::default()
         })
         .unwrap();
         let ev = m.run_slice();
         assert_eq!(ev, Some(PowerEvent::Poweroff(0)));
         assert_eq!(m.uart.take_output(), b"SEMI_OK");
+    }
+
+    #[test]
+    fn snapshot_keeps_the_h_extension_state() {
+        use rivemu_cpu_riscv::csr;
+        let code = memmap::DRAM_BASE + 0x2000;
+        let h_machine = || {
+            Machine::new(MachineConfig {
+                hypervisor: true,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let mut m1 = h_machine();
+        let h = &mut m1.harts[0];
+        h.csr_write(csr::HGATP, (8 << 60) | 0x8_0010).unwrap();
+        h.csr_write(csr::HSTATUS, csr::hstatus::VTW).unwrap();
+        h.csr_write(csr::SSCRATCH, 0x5678).unwrap();
+        h.csr_write(csr::VSSCRATCH, 0x1234).unwrap();
+        // mret into VS-mode: the active S-level CSRs are now the VS ones.
+        h.csr_write(csr::MSTATUS, (1 << 39) | (1 << 11)).unwrap();
+        h.csr_write(csr::MEPC, code + 4).unwrap();
+        m1.bus.write(code, AccessSize::Word, 0x3020_0073).unwrap();
+        h.pc = code;
+        h.step(&m1.bus);
+        assert!(h.virt);
+        let snap = TempFile::new("hsnap", &[]);
+        m1.save_snapshot(&snap.0).unwrap();
+
+        let mut m2 = h_machine();
+        m2.load_snapshot(&snap.0).unwrap();
+        let h = &m2.harts[0];
+        assert!(h.virt && h.csr.h.virt);
+        assert_eq!(h.pc, code + 4);
+        assert_eq!(h.csr.sscratch, 0x1234, "active bank: VS");
+        assert_eq!(h.csr.h.bank.sscratch, 0x5678, "inactive bank: HS");
+        assert_eq!(h.csr_read(csr::HGATP), Some((8 << 60) | 0x8_0010));
+        assert_eq!(h.csr.h.hstatus & csr::hstatus::VTW, csr::hstatus::VTW);
+
+        // A guest (V = 1) cannot be restored on a hart without H.
+        let mut m3 = Machine::new(MachineConfig::default()).unwrap();
+        let err = m3.load_snapshot(&snap.0).unwrap_err();
+        assert!(err.to_string().contains("no H extension"), "{err}");
     }
 
     #[test]

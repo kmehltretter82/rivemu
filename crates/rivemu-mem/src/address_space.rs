@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rivemu_core::{AccessSize, GuestAddr};
 use thiserror::Error;
 
-use crate::{MmioDevice, Ram};
+use crate::{MmioDevice, Ram, RamView};
 
 /// Number of 64-byte cache-line buckets in the reservation directory.
 const RESERVATION_BUCKETS: usize = 4096;
@@ -39,7 +39,22 @@ impl ReservationInvalidator {
     }
 }
 
+#[inline(always)]
 fn invalidate_reservation_range(line_seq: &[AtomicU64], addr: GuestAddr, len: u64) {
+    // Fast path for the common case, an access within one 64-byte line.
+    if len != 0 && (addr & 63) + len <= 64 {
+        let idx = ((addr >> 6) as usize) & (RESERVATION_BUCKETS - 1);
+        let seq = line_seq[idx].load(Ordering::Relaxed);
+        if seq & 1 != 0 {
+            invalidate_bucket_slow(line_seq, idx, seq);
+        }
+        return;
+    }
+    invalidate_reservation_range_lines(line_seq, addr, len);
+}
+
+#[cold]
+fn invalidate_reservation_range_lines(line_seq: &[AtomicU64], addr: GuestAddr, len: u64) {
     if len == 0 {
         return;
     }
@@ -238,7 +253,7 @@ impl AddressSpace {
 
     /// Invalidates any active `LR` reservation on the 64-byte cache line(s)
     /// touched by a write of `size` bytes at `addr`.
-    #[inline]
+    #[inline(always)]
     pub fn invalidate_cache_line(&self, addr: GuestAddr, size: AccessSize) {
         invalidate_reservation_range(&self.line_seq, addr, size.bytes());
     }
@@ -346,9 +361,16 @@ impl AddressSpace {
         (off.saturating_add(0x1000) <= *len).then_some(off)
     }
 
+    /// A [`RamView`] of the primary `fast_ram` region (offsets as from
+    /// [`Self::fast_ram_page_offset`]).
+    #[inline]
+    pub fn fast_ram_view(&self) -> Option<RamView<'_>> {
+        self.fast_ram.as_ref().map(|(_, _, ram)| ram.view())
+    }
+
     /// Reads directly from the primary `fast_ram` region using a pre-validated
     /// byte offset from [`Self::fast_ram_page_offset`].
-    #[inline]
+    #[inline(always)]
     pub fn read_fast_ram(&self, ram_off: u64, size: AccessSize) -> Option<u64> {
         let (_, _, ram) = self.fast_ram.as_ref()?;
         ram.read(ram_off, size)
@@ -356,7 +378,7 @@ impl AddressSpace {
 
     /// Writes directly to the primary `fast_ram` region using a pre-validated
     /// byte offset from [`Self::fast_ram_page_offset`] and updates reservation tracking.
-    #[inline]
+    #[inline(always)]
     pub fn write_fast_ram(
         &self,
         addr: GuestAddr,
@@ -548,6 +570,33 @@ impl AddressSpace {
                         addr,
                         size: size.bytes(),
                     })?;
+                self.invalidate_cache_line(addr, size);
+                Ok(old)
+            }
+            RegionKind::Rom(_) => Err(BusError::ReadOnly { addr }),
+            RegionKind::Mmio(_) => Err(BusError::NotMemory { addr }),
+        }
+    }
+
+    /// Atomic read-modify-write of a misaligned field inside one 16-byte
+    /// granule of guest RAM (Zama16b misaligned AMOs).
+    pub fn atomic_rmw_granule(
+        &self,
+        addr: GuestAddr,
+        size: AccessSize,
+        f: impl FnMut(u64) -> u64,
+    ) -> Result<u64, BusError> {
+        let r = self.find_access(addr, size)?;
+        let off = addr - r.base;
+        match &r.kind {
+            RegionKind::Ram(m) => {
+                let old = m
+                    .atomic_rmw_granule(off, size, f)
+                    .ok_or(BusError::CrossesBoundary {
+                        addr,
+                        size: size.bytes(),
+                    })?;
+                // A 16-byte granule never crosses a reservation line.
                 self.invalidate_cache_line(addr, size);
                 Ok(old)
             }

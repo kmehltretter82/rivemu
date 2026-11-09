@@ -1,0 +1,129 @@
+# Superblocks, fetch fast TLB, cheaper chains (2026-11-03)
+#
+# Why: CI run 41623958358 (8247296) measured the P17 single-hart median on
+# macos-latest at 8.794 s (p95 10.729; base 23.952 s on the same runner):
+# above the < 8 s target. The head/base ratio on macOS had stayed at about
+# 0.37 since aedb252 while on the x86 Ubuntu runner it fell to 0.28.
+#
+# 1. Apple numbers (CI job p17-variants, since removed; same binary, an
+#    environment variable selecting the variant, alternating):
+#    scripts/interp-microbench.py, guest MIPS (median of 3):
+#                          run 41629502068     run 41631138989 (slower runner)
+#      dependent adds       488 -> 662 fwd      346 -> 498 fwd
+#      independent adds     718 -> 617 fwd      494 -> 480 fwd
+#      addmul_1 loop        410 -> 435 fwd      342 -> 323 fwd
+#    P17 SMP1 median (9 samples each): 7.480 s vs 7.432 s with forwarding;
+#    9.843 s vs 9.939 s on the slower runner (samples 8.7 to 13.3 s there).
+#    A dependency through Hart::x costs about a third on Apple, and keeping
+#    the last result in a host register (RIVEMU_BLOCK_FWD) removes that,
+#    but the P17 boot does not change: few kernel instructions depend on
+#    the one before. The experiment is removed.
+#
+# 2. Where the P17 boot's time goes: scripts/p17-callgrind.sh (the Debian
+#    boot to /init's poweroff under callgrind, -icount shift=3) in CI run
+#    41631138989: 93.6 G host instructions for about 1.9 G guest
+#    instructions. The dispatch line 13.2 G, the block loop 9.9 G, register
+#    reads 9.4 G; the step between chained blocks about 11.6 G over a dozen
+#    lines (blocks averaged about four guest instructions: every
+#    conditional branch ended one); translate_with_ram_off 2.5 G (block
+#    chains into another page took the full translation); sfence_vma 1.2 G.
+#    RIVEMU_PC_PROFILE now records host time per guest function too
+#    (scripts/pc-profile.py prints MIPS per function): on the from-source
+#    Linux boot, crypto and RAID loops run at 200 to 350 MIPS, generic
+#    kernel code (spinlocks, rwsems, kernfs, vsnprintf) at 65 to 90 MIPS.
+#
+# 3. Changes (21acfa8):
+#    - Superblocks: a conditional branch no longer ends a block; a taken
+#      branch leaves it (exec_inline returns Next / Jump / Slow).
+#    - A fetch table in each fast-TLB slot for chains into another page.
+#    - The fetch page cache holds only pages the decode caches can tag, so
+#      the chain lookup drops two checks.
+#    - Op::Illegal moved behind the inline operations: the jump table
+#      needs no offset.
+#    Host instructions, deterministic from-source boot (OpenSBI + Linux 6.12
+#    to RIVEMU_SMOKE_OK, -icount shift=3, callgrind, local):
+#      22,996 M  before
+#      22,502 M  fetch table
+#      21,671 M  + chain checks, experiment removed
+#      21,382 M  + jump table from 0
+#      20,341 M  + superblocks                       (-11.5% in total)
+#    The P17 Debian boot itself (CI job p17-callgrind, same -icount):
+#      93,576 M  4ac6530 (run 41631138989)
+#      79,529 M  21acfa8 (run 41636562098)            (-15.0%)
+#    Tried and reverted: an iterator instead of the index in the block loop
+#    (21,717 M, +0.2%); an exhaustive match in exec_inline (21,161 M, +4.0%,
+#    as before).
+#
+# 4. Checks: all workspace tests; new blocks_with_inner_branches_match_
+#    single_stepping (catches a wrong count on a taken exit and a taken
+#    branch that stays in the block) and block_chains_across_pages_follow_
+#    remaps_and_privilege (catches a fetch lookup that ignores the epoch and
+#    a fill that leaks into another context's slot); riscv-tests 244/244;
+#    riscv-arch-test 1251/1251; Linux device E2E 6/6 (local, 28 s).
+#
+# 5. CI run 41636562098 (21acfa8), p17-bench, 9 samples each, head vs base
+#    (main) on the same runner:
+#    macos-latest (the slowest macOS runner so far):
+#      head SMP1 median 6.224 s, p95 7.670; samples 7.670 7.478 7.081 /
+#        6.224 6.937 5.762 / 6.153 6.083 6.097 (rounds 1 / 2 / 3)
+#      head SMP4 median 7.026 s, p95 11.401; samples 10.014 11.289 11.401 /
+#        6.756 6.424 6.524 / 6.973 7.026 7.622
+#      base SMP1 25.361 s (p95 34.458; round 1: 30.865 34.458 23.845),
+#        SMP4 29.304 s (p95 35.012)
+#      head/base 0.245 / 0.240 (0.367 at 8247296)
+#    ubuntu-latest: head 4.960 / 5.466 s, base 20.684 / 23.917 s
+#      (head/base 0.240; 0.278 at 8247296)
+#    Round 1 on macOS was slow for both builds (base SMP1 up to 34.5 s
+#    against 24 to 25 s in rounds 2 and 3); the SMP4 p95 above 10 s is those
+#    three samples.
+#
+# 6. CI run 41640005441 (4bbacc7: 21acfa8 plus documentation only), a second
+#    macos-latest runner:
+#      head SMP1 median 6.940 s, p95 10.527; samples 7.867 9.089 10.527 /
+#        5.668 6.940 7.021 / 5.413 5.799 5.739
+#      head SMP4 median 6.593 s, p95 9.376; samples 9.376 7.573 7.924 /
+#        6.018 6.339 6.593 / 6.317 6.354 7.175
+#      base SMP1 22.045 s (round 1: 24.425 21.757 29.285), SMP4 25.250 s
+#      head/base 0.315 / 0.261
+#    Again round 1 was slow for both builds. Over both runs: 16 of 18 SMP1
+#    samples under 8 s (the two others in round 1 of this run), 15 of 18 SMP4
+#    samples under 10 s (the three others in round 1 of 41636562098);
+#    medians 6.22 / 7.03 s and 6.94 / 6.59 s.
+#
+# 7. CI run 41642509507 (23d425f: the same code plus documentation), a third
+#    macos-latest runner:
+#      head SMP1 median 5.923 s, p95 6.456; samples 5.963 5.796 5.923 /
+#        6.107 6.225 6.456 / 5.892 5.463 5.431 (all under 8 s)
+#      head SMP4 median 7.145 s, p95 10.545; samples 6.334 7.145 8.128 /
+#        10.545 9.800 7.998 / 5.990 5.605 6.763
+#      base SMP1 23.834 s, SMP4 28.110 s (round 2 SMP4: 30.855 28.725 24.221)
+#    Over the three runs: SMP1 medians 6.22 / 6.94 / 5.92 s, 25 of 27 samples
+#    under 8 s; SMP4 medians 7.03 / 6.59 / 7.15 s, 23 of 27 samples under
+#    10 s. Every sample above target falls in one round of a job whose base
+#    samples are slow at the same time.
+#
+# 8. After this: typed register fields in block instructions (07fa5fe, -5.1%
+#    host instructions on the from-source boot) and the 20-sample threshold
+#    test as tests/linux_perf.rs defines it, run in CI on macOS with guest
+#    instruction counts, idle time and a calibration loop per boot. Medians
+#    stayed under target in all four runs; the median-and-p95 rule passed for
+#    both hart counts in 1 of 4. The over-target samples above (sections 5
+#    to 7) were called slow periods of the runner; the per-boot controls
+#    added since then do not confirm that: see p17-threshold.txt.
+#
+# 9. 64173c6 (2026-11-09): a hart turn of 50,000 instructions instead of
+#    10,000. The harts take turns on one host thread. From-source boot,
+#    local x86 host:
+#      callgrind, -icount shift=3: -smp 1 19.71 G host instructions for
+#        366 M guest; -smp 4 22.68 G for 397 M (+6% per guest instruction)
+#      wall time: -smp 4 ran at about 180 MIPS against 225 MIPS at -smp 1,
+#        so most of the -smp 4 gap is host cache behavior, not work
+#      interleaved A/B, -smp 4, 8 rounds: 10,000 median 2.615 s (188 MIPS,
+#        499.7 M guest instructions); 50,000 median 2.480 s (201 MIPS,
+#        497.9 M), faster in 7 of 8 pairs; 200,000 no faster, +2.6% guest
+#        instructions; -smp 1 2.10 s vs 2.06 s
+#    Workspace tests and Linux device E2E 6/6 pass.
+#    macOS CI, at the same time on two runners: run 63 (0fddeb1, 10,000)
+#    SMP4 threshold-test median 5.749 s, run 64 (64173c6, 50,000) 5.786 s:
+#    no measurable effect on Apple Silicon. Both runs passed the
+#    median-and-p95 rule (p17-threshold.txt).

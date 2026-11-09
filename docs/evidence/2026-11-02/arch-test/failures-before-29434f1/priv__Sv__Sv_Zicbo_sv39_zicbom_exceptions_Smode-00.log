@@ -1,0 +1,22 @@
+
+RVCP-SUMMARY: TEST FAILED - Test File "Sv_Zicbo_sv39_zicbom_exceptions_Smode-00.S"
+
+RVCP: DEBUG INFORMATION FOLLOWS
+RVCP: Test Info: "Mismatch in scause value! Trap was being handled in S-Mode."
+RVCP: ===== TRAP FAILURE DIAGNOSTICS =====
+RVCP: Failure: "Mismatch in scause value! Trap was being handled in S-Mode."
+RVCP: Trap handler mode: S-mode
+RVCP: Mismatching field: XCAUSE (trap signature word 1)
+RVCP: Expected value: 0x0000000000000007
+RVCP: Actual value:   0x000000000000000f
+RVCP: Expected cause: Store/AMO access fault
+RVCP: Actual cause:   Store/AMO page fault
+RVCP: XEPC:    0x0000000080001ef0
+RVCP: XCAUSE:  0x000000000000000f
+RVCP: XTVAL:   0x000000014080d000
+RVCP: XSTATUS: 0x8000000200006700
+RVCP: HINT: XCAUSE mismatch means a different exception or interrupt type was
+RVCP:       observed. Check: instruction encoding correctness, CSR accessibility
+RVCP:       at current privilege, PMP/page table configuration, extension support.
+RVCP: END OF DEBUG INFORMATION
+

@@ -9,7 +9,12 @@ use crate::rvc;
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
-    Illegal,
+    // The operations `Hart::exec_inline` runs come first, from 0, so that its
+    // jump table needs no offset.
+    /// No effect. Never decoded: the block cache stores an integer operation
+    /// that writes x0 (a hint) as `Nop`, so that its fast path can write
+    /// `rd` without testing for x0.
+    Nop,
     // RV64I
     Lui,
     Auipc,
@@ -78,6 +83,7 @@ pub enum Op {
     Divuw,
     Remw,
     Remuw,
+    Illegal,
     // A / Zacas / Zabha / Zalasr (`imm` holds funct3 width 0..=4; `funct` holds funct5)
     Lr,
     Sc,
@@ -97,6 +103,15 @@ pub enum Op {
     Sret,
     Wfi,
     SfenceVma,
+    /// H: `hfence.vvma` / `hinval.vvma`.
+    HfenceVvma,
+    /// H: `hfence.gvma` / `hinval.gvma`.
+    HfenceGvma,
+    /// H: `hlv.*` / `hlvx.*`; `funct` = size code (0 = byte .. 3 = double)
+    /// | kind << 2 (0 signed, 1 unsigned, 3 `hlvx`).
+    Hlv,
+    /// H: `hsv.*`; `funct` = size code.
+    Hsv,
     // Svinval (fine-grained TLB invalidation)
     SinvalVma,
     SfenceWInval,
@@ -586,7 +601,28 @@ pub fn decode(raw: u32) -> Insn {
                     0x1810_0073 => Op::SfenceInvalIr,
                     _ if f7 == 0x09 && rd == 0 => Op::SfenceVma,
                     _ if f7 == 0x0b && rd == 0 => Op::SinvalVma,
+                    _ if matches!(f7, 0x11 | 0x13) && rd == 0 => Op::HfenceVvma,
+                    _ if matches!(f7, 0x31 | 0x33) && rd == 0 => Op::HfenceGvma,
                     _ => Op::Illegal,
+                };
+                (op, 0)
+            }
+            4 if (0x30..=0x37).contains(&f7) => {
+                // H: hlv/hlvx (even funct7) and hsv (odd funct7, rd = 0).
+                let size = ((f7 >> 1) & 3) as u8;
+                let op = if f7 & 1 == 0 {
+                    match (size, rs2) {
+                        (_, 0) | (0..=2, 1) | (1 | 2, 3) => {
+                            insn.funct = size | (rs2 << 2);
+                            Op::Hlv
+                        }
+                        _ => Op::Illegal,
+                    }
+                } else if rd == 0 {
+                    insn.funct = size;
+                    Op::Hsv
+                } else {
+                    Op::Illegal
                 };
                 (op, 0)
             }

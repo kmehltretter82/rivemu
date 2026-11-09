@@ -30,6 +30,8 @@ fn run_test(path: &Path) -> Result<u64, String> {
     let mut hart = Hart::new(0, Arc::new(FrozenTimebase(0)));
     hart.reset(elf.entry);
     let mut executed = 0;
+    // Console output from the "v" environment (assertion messages, for example).
+    let mut console = String::new();
     while executed < MAX_INSNS {
         executed += hart.run(&bus, 1000).max(1);
         let v = bus.read(tohost, AccessSize::Double).unwrap();
@@ -37,20 +39,36 @@ fn run_test(path: &Path) -> Result<u64, String> {
             continue;
         }
         if v >> 48 == 0x0101 {
-            // Character output from the "v" environment.
+            console.push(char::from(v as u8));
             bus.write(tohost, AccessSize::Double, 0).unwrap();
             continue;
         }
         return if v == 1 {
             Ok(executed)
         } else {
-            Err(format!("failed test case #{} (pc={:#x})", v >> 1, hart.pc))
+            Err(format!(
+                "failed test case #{} (pc={:#x}){}",
+                v >> 1,
+                hart.pc,
+                console_suffix(&console)
+            ))
         };
     }
     Err(format!(
-        "timeout after {MAX_INSNS} instructions (pc={:#x})",
-        hart.pc
+        "timeout after {MAX_INSNS} instructions (pc={:#x}){}",
+        hart.pc,
+        console_suffix(&console)
     ))
+}
+
+/// Formats captured "v" environment console output for a failure message.
+fn console_suffix(console: &str) -> String {
+    let console = console.trim();
+    if console.is_empty() {
+        String::new()
+    } else {
+        format!("; console: {console:?}")
+    }
 }
 
 #[test]
@@ -1702,6 +1720,8 @@ fn svukte_zjpm_and_zicfilp_semantics() {
         .unwrap();
     let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
     h.reset(0x8002_1000);
+    // Firmware enables the stateen-gated S-mode state (mstateen resets to 0).
+    h.csr_write(csr::MSTATEEN0, csr::stateen::M0_MASK).unwrap();
     h.csr.mtvec = 0x8000_0800;
     const PT_ROOT: u64 = 0x8002_0000;
     const CODE_PA: u64 = 0x8002_1000;
@@ -2014,6 +2034,321 @@ fn svnapot_sv57_and_zawrs_semantics() {
     assert_eq!(h.csr.mtval, 0x00d0_0073);
 }
 
+/// Zama16b (RVA23U64): a misaligned AMO that stays inside a naturally aligned
+/// 16-byte granule executes; one that crosses the granule, and any misaligned
+/// LR/SC, raises address-misaligned.
+#[test]
+fn zama16b_misaligned_amos_inside_a_granule_execute() {
+    use rivemu_cpu_riscv::{cause, csr};
+
+    const CODE: u64 = 0x8000_0000;
+    const MTVEC: u64 = 0x8000_0800;
+    const DATA: u64 = 0x8001_0000;
+    const AMOADD_W: u64 = 0x00c5_25af; // amoadd.w x11, x12, (x10)
+    const AMOADD_D: u64 = 0x00c5_35af; // amoadd.d x11, x12, (x10)
+    const AMOCAS_W: u64 = 0x28c5_25af; // amocas.w x11, x12, (x10)
+    const LR_W: u64 = 0x1005_25af; // lr.w x11, (x10)
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    for (i, w) in [AMOADD_W, AMOADD_D, AMOCAS_W, LR_W].into_iter().enumerate() {
+        bus.write(CODE + 4 * i as u64, AccessSize::Word, w).unwrap();
+    }
+    let bytes: Vec<u8> = (0u8..16).collect();
+    bus.load_bytes(DATA, &bytes).unwrap();
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mtvec = MTVEC;
+    let run = |h: &mut Hart, insn: u64, addr: u64, rs2: u64, rd_in: u64| {
+        h.pc = CODE + 4 * insn;
+        h.x[10] = addr;
+        h.x[11] = rd_in;
+        h.x[12] = rs2;
+        h.step(&bus);
+    };
+    let read = |addr: u64, size: AccessSize| bus.read(addr, size).unwrap();
+
+    // Word at offset 2: inside one doubleword.
+    run(&mut h, 0, DATA + 2, 0x0101_0101, 0);
+    assert_eq!(h.pc, CODE + 4);
+    assert_eq!(h.x[11], 0x0504_0302);
+    assert_eq!(read(DATA + 2, AccessSize::Word), 0x0605_0403);
+
+    // Doubleword at offset 4: straddles the granule's two doublewords.
+    let before = read(DATA + 4, AccessSize::Double);
+    run(&mut h, 1, DATA + 4, 1, 0);
+    assert_eq!(h.pc, CODE + 8);
+    assert_eq!(h.x[11], before);
+    assert_eq!(read(DATA + 4, AccessSize::Double), before + 1);
+
+    // amocas.w at offset 9: compare matches, so the new value is stored.
+    let cur = read(DATA + 9, AccessSize::Word);
+    run(&mut h, 2, DATA + 9, 0xdead_beef, cur);
+    assert_eq!(h.pc, CODE + 12);
+    assert_eq!(h.x[11], cur as u32 as i32 as i64 as u64);
+    assert_eq!(read(DATA + 9, AccessSize::Word), 0xdead_beef);
+
+    // Doubleword at offset 12 crosses the granule: address-misaligned.
+    run(&mut h, 1, DATA + 12, 1, 0);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE), Some(cause::STORE_MISALIGNED));
+    assert_eq!(h.csr_read(csr::MTVAL), Some(DATA + 12));
+
+    // LR is not covered by Zama16b.
+    run(&mut h, 3, DATA + 2, 0, 0);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE), Some(cause::LOAD_MISALIGNED));
+}
+
+/// The load/store fast TLB must not outlive the context it was filled in:
+/// clearing `mstatus.SUM` and switching `satp` to another ASID whose mapping is
+/// read-only must both take effect on the next access to an already-cached page.
+#[test]
+fn fast_tlb_follows_sum_and_satp_changes() {
+    use rivemu_cpu_riscv::{Priv, cause, csr};
+
+    const CODE: u64 = 0x8000_0000;
+    const MTVEC: u64 = 0x8000_0800;
+    const ROOT_A: u64 = 0x8002_0000;
+    const ROOT_B: u64 = 0x8003_0000;
+    const DATA_OFF: u64 = 0x1_0000;
+    const DATA_VA: u64 = 0x4000_0000 + DATA_OFF; // gigapage 1 -> PA 0x8000_0000
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    bus.write(CODE, AccessSize::Word, 0x0005_3583).unwrap(); // ld x11, 0(x10)
+    bus.write(CODE + 4, AccessSize::Word, 0x00c5_3023).unwrap(); // sd x12, 0(x10)
+    let giga = 0x8_0000u64 << 10; // PPN of 0x8000_0000
+    // Code: gigapage 2, identity, S-only RWX. Data: gigapage 1, U.
+    for root in [ROOT_A, ROOT_B] {
+        bus.write(root + 2 * 8, AccessSize::Double, giga | 0xcf)
+            .unwrap();
+    }
+    bus.write(ROOT_A + 8, AccessSize::Double, giga | 0xd7)
+        .unwrap(); // U|R|W|A|D
+    bus.write(ROOT_B + 8, AccessSize::Double, giga | 0x53)
+        .unwrap(); // U|R|A
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mtvec = MTVEC;
+    let satp = |root: u64, asid: u64| (8u64 << 60) | (asid << 44) | (root >> 12);
+    let m_write = |h: &mut Hart, num: u16, v: u64| {
+        h.prv = Priv::Machine;
+        h.csr_write(num, v).unwrap();
+    };
+    let run_s = |h: &mut Hart, pc: u64, value: u64| {
+        h.prv = Priv::Supervisor;
+        h.pc = pc;
+        h.x[10] = DATA_VA;
+        h.x[12] = value;
+        h.step(&bus);
+    };
+    let sum = csr::status::SUM;
+
+    // Root A, SUM = 1: store and load twice each. The first access walks the
+    // page table; the second hits the TLB and fills the fast path.
+    m_write(&mut h, csr::SATP, satp(ROOT_A, 1));
+    m_write(&mut h, csr::MSTATUS, sum);
+    for _ in 0..2 {
+        run_s(&mut h, CODE + 4, 0x1111);
+        assert_eq!(h.pc, CODE + 8);
+        run_s(&mut h, CODE, 0);
+        assert_eq!(h.x[11], 0x1111);
+    }
+
+    // SUM = 0: S-mode may no longer touch the U page.
+    m_write(&mut h, csr::MSTATUS, 0);
+    run_s(&mut h, CODE + 4, 0x9999);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE), Some(cause::STORE_PAGE_FAULT));
+    m_write(&mut h, csr::MSTATUS, 0);
+    run_s(&mut h, CODE, 0);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE), Some(cause::LOAD_PAGE_FAULT));
+
+    // Root B (ASID 2), SUM = 1: the page is read-only, so the cached store
+    // permission must be gone.
+    m_write(&mut h, csr::MSTATUS, sum);
+    m_write(&mut h, csr::SATP, satp(ROOT_B, 2));
+    run_s(&mut h, CODE + 4, 0x2222);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE), Some(cause::STORE_PAGE_FAULT));
+    run_s(&mut h, CODE, 0);
+    assert_eq!(h.x[11], 0x1111);
+
+    // Back to root A: writable again.
+    m_write(&mut h, csr::SATP, satp(ROOT_A, 1));
+    run_s(&mut h, CODE + 4, 0x3333);
+    assert_eq!(h.pc, CODE + 8);
+    assert_eq!(
+        bus.read(CODE + DATA_OFF, AccessSize::Double).unwrap(),
+        0x3333
+    );
+}
+
+/// PMP verdicts are cached per 4 KiB page while all PMP boundaries are
+/// page-aligned. A PMP write must invalidate them, and M-mode and S/U-mode
+/// verdicts must not share a cache slot.
+#[test]
+fn pmp_page_cache_follows_pmp_writes_and_privilege() {
+    use rivemu_cpu_riscv::{Priv, cause, csr};
+
+    const CODE: u64 = 0x8000_0000;
+    const DATA: u64 = 0x8001_0000;
+    const MTVEC: u64 = 0x8000_0800;
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    bus.write(CODE, AccessSize::Word, 0x0005_3583).unwrap(); // ld x11, 0(x10)
+    bus.write(CODE + 4, AccessSize::Word, 0x00c5_3023).unwrap(); // sd x12, 0(x10)
+    bus.write(DATA, AccessSize::Double, 0x1122_3344_5566_7788)
+        .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mtvec = MTVEC;
+    // Entry 0: NAPOT 64 KiB of code, RWX. Entry 1: NAPOT 4 KiB at DATA.
+    h.csr_write(csr::PMPADDR0, (CODE | 0x7fff) >> 2).unwrap();
+    h.csr_write(csr::PMPADDR0 + 1, (DATA | 0x7ff) >> 2).unwrap();
+    let set_data_perms = |h: &mut Hart, rwx: u64| {
+        h.prv = Priv::Machine;
+        h.csr_write(csr::PMPCFG0, ((0x18 | rwx) << 8) | 0x1f)
+            .unwrap();
+    };
+    let run_s = |h: &mut Hart, pc: u64| {
+        h.prv = Priv::Supervisor;
+        h.pc = pc;
+        h.x[10] = DATA;
+        h.x[12] = 0xabcd;
+        h.step(&bus);
+    };
+
+    // R only: S-mode load succeeds (and caches the verdict), store faults.
+    set_data_perms(&mut h, 0b001);
+    run_s(&mut h, CODE);
+    assert_eq!(h.x[11], 0x1122_3344_5566_7788);
+    run_s(&mut h, CODE + 4);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE), Some(cause::STORE_ACCESS));
+
+    // RW: the cached "store denied" must not survive the PMP write.
+    set_data_perms(&mut h, 0b011);
+    run_s(&mut h, CODE + 4);
+    assert_eq!(h.pc, CODE + 8);
+    assert_eq!(bus.read(DATA, AccessSize::Double).unwrap(), 0xabcd);
+
+    // No permissions: S-mode load faults, while M-mode (entry not locked)
+    // still loads from the same page.
+    set_data_perms(&mut h, 0b000);
+    run_s(&mut h, CODE);
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr_read(csr::MCAUSE), Some(cause::LOAD_ACCESS));
+    h.prv = Priv::Machine;
+    h.pc = CODE;
+    h.x[11] = 0;
+    h.step(&bus);
+    assert_eq!(h.x[11], 0xabcd);
+    assert_eq!(h.pc, CODE + 4);
+}
+
+/// Zicbom/Zicboz: a cache-block operation on physical memory with no PMA
+/// region raises a store/AMO access fault (Sail `phys_access_check`). Found by
+/// riscv-arch-test Sv_Zicbo_*_zicbom_exceptions (cp_leaf_PTE_to_nonexistent_pa):
+/// rivemu checked PMP only, so cbo.clean/flush/inval silently succeeded.
+#[test]
+fn cbo_to_unmapped_physical_memory_raises_store_access_fault() {
+    use rivemu_cpu_riscv::{cause, csr};
+
+    const CODE: u64 = 0x8000_0000;
+    const MTVEC: u64 = 0x8000_0800;
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    // cbo.clean, cbo.flush, cbo.inval, cbo.zero (a0)
+    let insns: [u64; 4] = [0x0015_200f, 0x0025_200f, 0x0005_200f, 0x0045_200f];
+    for (i, &w) in insns.iter().enumerate() {
+        bus.write(CODE + i as u64 * 4, AccessSize::Word, w).unwrap();
+    }
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    for i in 0..insns.len() as u64 {
+        let pc = CODE + i * 4;
+        h.reset(pc);
+        h.csr.mtvec = MTVEC;
+        h.x[10] = 0x123;
+        h.step(&bus);
+        assert_eq!(h.pc, MTVEC, "insn {i}");
+        assert_eq!(
+            h.csr_read(csr::MCAUSE),
+            Some(cause::STORE_ACCESS),
+            "insn {i}"
+        );
+        assert_eq!(h.csr_read(csr::MTVAL), Some(0x123), "insn {i}");
+
+        h.reset(pc);
+        h.x[10] = CODE + 0x1000;
+        h.step(&bus);
+        assert_eq!(h.pc, pc + 4, "insn {i}");
+    }
+}
+
+/// `mcycle` and `minstret` are separate counters (privileged spec 3.1.10/3.1.12):
+/// `mcountinhibit.CY` and `.IR` stop one each, Smcntrpmf filters them with
+/// `mcyclecfg` and `minstretcfg`, and writing one leaves the other alone. Found by
+/// riscv-arch-test Sm_mcsr_cntr (cp_inhibit_mcycle): rivemu returned `minstret`
+/// for `mcycle`, so `mcycle` kept counting with CY = 1.
+#[test]
+fn mcycle_and_minstret_are_separate_counters() {
+    use rivemu_cpu_riscv::csr;
+
+    const CODE: u64 = 0x8000_0000;
+    const CSRW_MCYCLE_X5: u64 = 0xb002_9073; // csrrw x0, mcycle, x5
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    for i in 0..64 {
+        bus.write(CODE + i * 4, AccessSize::Word, 0x0000_0013)
+            .unwrap(); // nop
+    }
+    bus.write(CODE + 0x200, AccessSize::Word, CSRW_MCYCLE_X5)
+        .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+
+    // CY = 1 stops mcycle only (single-step path).
+    h.csr_write(csr::MCOUNTINHIBIT, 1).unwrap();
+    for _ in 0..5 {
+        h.step(&bus);
+    }
+    assert_eq!(h.csr_read(csr::MCYCLE), Some(0));
+    assert_eq!(h.csr_read(csr::MINSTRET), Some(5));
+
+    // IR = 1 stops minstret only (basic-block path).
+    h.csr_write(csr::MCOUNTINHIBIT, 4).unwrap();
+    assert_eq!(h.run(&bus, 8), 8);
+    assert_eq!(h.csr_read(csr::MCYCLE), Some(8));
+    assert_eq!(h.csr_read(csr::MINSTRET), Some(5));
+
+    // Writing mcycle leaves minstret alone, and the written value is not
+    // incremented by the writing instruction.
+    h.csr_write(csr::MCOUNTINHIBIT, 0).unwrap();
+    h.pc = CODE + 0x200;
+    h.x[5] = 100;
+    h.step(&bus);
+    assert_eq!(h.csr_read(csr::MCYCLE), Some(100));
+    assert_eq!(h.csr_read(csr::MINSTRET), Some(6));
+
+    // Smcntrpmf: mcyclecfg.MINH stops mcycle in M-mode while minstret counts.
+    h.csr_write(csr::MCYCLECFG, csr::hpmevent::MINH).unwrap();
+    h.pc = CODE;
+    for _ in 0..3 {
+        h.step(&bus);
+    }
+    assert_eq!(h.csr_read(csr::MCYCLE), Some(100));
+    assert_eq!(h.csr_read(csr::MINSTRET), Some(9));
+}
+
 #[test]
 fn smepmp_and_smstateen_semantics() {
     use rivemu_cpu_riscv::{Priv, cause, csr};
@@ -2034,8 +2369,23 @@ fn smepmp_and_smstateen_semantics() {
     h.csr.mtvec = 0x8000_0100;
 
     // 1. Smstateen / Ssstateen:
-    // By default, mstateen0 has M0_MASK (SE | ENVCFG | CONTEXT | SRMCFG) enabled:
+    // "On reset, all writable mstateen bits are initialized by the hardware
+    // to zeros", so S-mode cannot reach the gated state until M-mode enables
+    // it. All of M0_MASK (SE | ENVCFG | CONTEXT | SRMCFG) is writable.
+    for n in 0..4 {
+        assert_eq!(h.csr_read(csr::MSTATEEN0 + n).unwrap(), 0);
+    }
+    h.prv = Priv::Supervisor;
+    assert!(h.csr_read(csr::SENVCFG).is_none());
+    assert!(h.csr_read(csr::SSTATEEN0).is_none());
+    h.prv = Priv::Machine;
+    h.csr_write(csr::MSTATEEN0, u64::MAX).unwrap();
     assert_eq!(h.csr_read(csr::MSTATEEN0).unwrap(), csr::stateen::M0_MASK);
+    // Direct S-mode boot stands in for firmware and enables them.
+    let mut booted = Hart::new(1, Arc::new(FrozenTimebase(0)));
+    booted.init_smode_boot(CODE, 0);
+    assert_eq!(booted.csr.mstateen[0], csr::stateen::M0_MASK);
+    assert!(booted.csr_read(csr::SENVCFG).is_some());
     h.prv = Priv::Supervisor;
     assert!(h.csr_read(csr::SENVCFG).is_some());
     assert_eq!(h.csr_read(csr::SSTATEEN0).unwrap(), 0);
@@ -2565,6 +2915,8 @@ fn svrsw60t59b_smmpm_ssqosid_and_zicbop_semantics() {
 
     let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
     h.reset(CODE);
+    // Firmware enables the stateen-gated S-mode state (mstateen resets to 0).
+    h.csr_write(csr::MSTATEEN0, csr::stateen::M0_MASK).unwrap();
     h.csr_write(csr::MTVEC, MTVEC).unwrap();
     h.csr_write(csr::SATP, (8u64 << 60) | (PT_ROOT >> 12))
         .unwrap();
@@ -2624,7 +2976,10 @@ fn ssdbltrp_and_smdbltrp_double_trap_semantics() {
     bus.write(STVEC, AccessSize::Word, 0x0010_0073).unwrap();
 
     let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.smdbltrp = true;
     h.reset(CODE);
+    // Smdbltrp sets MDT at reset; this test starts from MDT = 0.
+    h.csr.mstatus &= !status::MDT;
     h.csr_write(csr::STVEC, STVEC).unwrap();
     h.csr_write(csr::MTVEC, MTVEC).unwrap();
     h.csr_write(
@@ -3013,4 +3368,744 @@ fn rvv_vector_configuration_memory_alu_mask_and_fp_semantics() {
         );
         assert_eq!(got, f1[i] + f2[i]);
     }
+}
+
+/// RVV 1.0 7.8: field `f` of a segment access uses the register group at
+/// `vd + f * ceil(EMUL)`. 3.7: a trapping vector memory access leaves the
+/// faulting element index in `vstart`. Reserved register groupings raise an
+/// illegal-instruction exception, as in the Sail model.
+#[test]
+fn rvv_segment_groups_vstart_on_fault_and_reserved_memory_encodings() {
+    use rivemu_cpu_riscv::{cause, csr::status};
+
+    // 1 MiB of RAM: 0x8000_0000..0x8010_0000; accesses beyond it fault.
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    const CODE: u64 = 0x8000_0000;
+    const SRC: u64 = 0x8000_2000;
+    const DST: u64 = 0x8000_3000;
+    const MTVEC: u64 = 0x8000_4000;
+    const RAM_END: u64 = 0x8010_0000;
+
+    // vsetvli t0, a1, e32, m2 (vtype 0x11)
+    const VSETVLI_E32_M2: u32 = (0x11 << 20) | (11 << 15) | (7 << 12) | (5 << 7) | 0x57;
+    // v{l,s}seg2e32.v vreg, (a0) and vle32.v
+    let vlseg2e32 = |vd: u32| (1 << 29) | (1 << 25) | (10 << 15) | (6 << 12) | (vd << 7) | 0x07;
+    let vsseg2e32 = |vs3: u32| (1 << 29) | (1 << 25) | (12 << 15) | (6 << 12) | (vs3 << 7) | 0x27;
+    let vle32 = |vd: u32, vm: u32| (vm << 25) | (10 << 15) | (6 << 12) | (vd << 7) | 0x07;
+    let vlseg8e32 = |vd: u32| (7 << 29) | (1 << 25) | (10 << 15) | (6 << 12) | (vd << 7) | 0x07;
+    let vse32_v0_masked: u32 = (12 << 15) | (6 << 12) | 0x27;
+
+    // Each instruction gets its own slot: rewriting one address would hit
+    // the decoded-instruction cache without a `fence.i`.
+    let slot = std::cell::Cell::new(0u64);
+    let run = |h: &mut Hart, bus: &AddressSpace, insn: u32| {
+        let pc = CODE + 4 * slot.replace(slot.get() + 1);
+        bus.write(pc, AccessSize::Word, u64::from(insn)).unwrap();
+        h.pc = pc;
+        h.step(bus);
+    };
+    let words = |h: &Hart, reg: usize| -> Vec<u32> {
+        h.v[reg]
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mtvec = MTVEC;
+    h.csr.mstatus |= 1 << status::VS_SHIFT;
+    h.x[11] = 16;
+    run(&mut h, &bus, VSETVLI_E32_M2);
+    assert_eq!(h.csr.vl, 16);
+
+    // 1. vlseg2e32.v v4 at LMUL=2: field 0 -> v4..v5, field 1 -> v6..v7.
+    for k in 0..32u64 {
+        bus.write(SRC + 4 * k, AccessSize::Word, k).unwrap();
+    }
+    h.x[10] = SRC;
+    run(&mut h, &bus, vlseg2e32(4));
+    assert_eq!(h.pc, CODE + 8);
+    assert_eq!(words(&h, 4), [0, 2, 4, 6, 8, 10, 12, 14]);
+    assert_eq!(words(&h, 5), [16, 18, 20, 22, 24, 26, 28, 30]);
+    assert_eq!(words(&h, 6), [1, 3, 5, 7, 9, 11, 13, 15]);
+    assert_eq!(words(&h, 7), [17, 19, 21, 23, 25, 27, 29, 31]);
+
+    // 2. vsseg2e32.v v4 interleaves the fields back into memory order.
+    h.x[12] = DST;
+    run(&mut h, &bus, vsseg2e32(4));
+    assert_eq!(h.pc, CODE + 12);
+    for k in 0..32u64 {
+        assert_eq!(bus.read(DST + 4 * k, AccessSize::Word).unwrap(), k);
+    }
+
+    // 3. vle32.v v8 whose element 5 lies past the end of RAM: the load
+    //    faults, vstart = 5, and elements 0..5 have been written.
+    h.v[8] = [0; 32];
+    h.v[9] = [0; 32];
+    for k in 0..5u64 {
+        bus.write(RAM_END - 20 + 4 * k, AccessSize::Word, 0x100 + k)
+            .unwrap();
+    }
+    h.x[10] = RAM_END - 20;
+    run(&mut h, &bus, vle32(8, 1));
+    assert_eq!(h.pc, MTVEC);
+    assert_eq!(h.csr.mcause, cause::LOAD_ACCESS);
+    assert_eq!(h.csr.vstart, 5);
+    assert_eq!(words(&h, 8)[..5], [0x100, 0x101, 0x102, 0x103, 0x104]);
+
+    // 4. Reserved encodings raise ILLEGAL_INSN (Sail `illegal_load`):
+    h.csr.vstart = 0;
+    h.x[10] = SRC;
+    for (what, insn) in [
+        ("vd not aligned to EMUL=2", vlseg2e32(5)),
+        ("nf * EMUL = 16 > 8", vlseg8e32(8)),
+        ("fields run past v31", vlseg2e32(30)),
+        ("masked load into v0", vle32(0, 0)),
+        // v0 would be read both as the mask (EEW=1) and as EEW=32 data.
+        ("masked store of v0", vse32_v0_masked),
+    ] {
+        run(&mut h, &bus, insn);
+        assert_eq!(h.pc, MTVEC, "{what}");
+        assert_eq!(h.csr.mcause, cause::ILLEGAL_INSN, "{what}");
+    }
+
+    // 5. `vsetvli x0, x0, e32, m1` keeps vl only if SEW/LMUL is unchanged.
+    //    From e32/m2 the ratio changes: reserved, so vill is set and vl = 0.
+    const VSETVLI_X0_X0_E32_M1: u32 = (0x10 << 20) | (7 << 12) | 0x57;
+    const VSETVLI_X0_X0_E16_M1: u32 = (0x08 << 20) | (7 << 12) | 0x57;
+    run(&mut h, &bus, VSETVLI_E32_M2);
+    run(&mut h, &bus, VSETVLI_X0_X0_E32_M1);
+    assert_eq!(h.csr.vtype, 1 << 63);
+    assert_eq!(h.csr.vl, 0);
+    // From e32/m2 to e16/m1 the ratio is unchanged: vl is kept.
+    run(&mut h, &bus, VSETVLI_E32_M2);
+    run(&mut h, &bus, VSETVLI_X0_X0_E16_M1);
+    assert_eq!(h.csr.vtype, 0x08);
+    assert_eq!(h.csr.vl, 16);
+}
+
+/// RVV 1.0 11.11: signed division overflow (most-negative / -1) returns the
+/// dividend for `vdiv` and 0 for `vrem`. At SEW = 64 the most-negative value
+/// is i64::MIN, which a naive negation overflows (it panicked in debug
+/// builds).
+#[test]
+fn rvv_signed_division_overflow_at_sew64() {
+    use rivemu_cpu_riscv::csr::status;
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    const CODE: u64 = 0x8000_0000;
+    // vsetvli t0, a1, e64, m1 (vtype 0x18); vdiv.vv v3, v1, v2; vrem.vv v4, v1, v2
+    let prog: [u32; 3] = [
+        (0x18 << 20) | (11 << 15) | (7 << 12) | (5 << 7) | 0x57,
+        (0x21 << 26) | (1 << 25) | (1 << 20) | (2 << 15) | (2 << 12) | (3 << 7) | 0x57,
+        (0x23 << 26) | (1 << 25) | (1 << 20) | (2 << 15) | (2 << 12) | (4 << 7) | 0x57,
+    ];
+    for (i, insn) in prog.iter().enumerate() {
+        bus.write(CODE + 4 * i as u64, AccessSize::Word, u64::from(*insn))
+            .unwrap();
+    }
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mstatus |= 1 << status::VS_SHIFT;
+    h.x[11] = 4;
+    for lane in 0..4 {
+        h.v[1][lane * 8..lane * 8 + 8].copy_from_slice(&i64::MIN.to_le_bytes());
+        h.v[2][lane * 8..lane * 8 + 8].copy_from_slice(&(-1i64).to_le_bytes());
+    }
+    for _ in 0..3 {
+        h.step(&bus);
+    }
+    assert_eq!(h.pc, CODE + 12);
+    for lane in 0..4 {
+        let q = i64::from_le_bytes(h.v[3][lane * 8..lane * 8 + 8].try_into().unwrap());
+        let r = i64::from_le_bytes(h.v[4][lane * 8..lane * 8 + 8].try_into().unwrap());
+        assert_eq!((q, r), (i64::MIN, 0), "lane {lane}");
+    }
+}
+
+/// Privileged spec (Svadu): with `menvcfg.ADUE = 0` "the implementation
+/// behaves as though Svadu were not implemented", so a missing A bit (or a
+/// missing D bit on a store) raises a page fault. A default hart resets with
+/// ADUE = 1 and updates A/D in hardware; clearing ADUE must switch it to
+/// Svade behaviour (Sail 0.16 `hw_updates_pte`).
+#[test]
+fn menvcfg_adue_selects_hardware_ad_updates_or_page_faults() {
+    use rivemu_cpu_riscv::csr::envcfg;
+    use rivemu_cpu_riscv::{Priv, cause};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    // Sv39 1 GiB leaf (VA 0x8000_0000 -> PA 0x8000_0000), V|R|W|X, A = D = 0.
+    let root_pt = 0x8001_0000u64;
+    let pte_addr = root_pt + 2 * 8;
+    let pte_base = (0x80000u64 << 10) | 0x0f;
+    bus.write(pte_addr, AccessSize::Double, pte_base).unwrap();
+    // lw x1, 0(x10)
+    bus.write(0x8000_0000, AccessSize::Word, 0x0005_2083)
+        .unwrap();
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(0x8000_0000);
+    assert_ne!(h.csr.menvcfg & envcfg::ADUE, 0, "ADUE = 1 at reset");
+    let enter_s = |h: &mut Hart| {
+        h.prv = Priv::Supervisor;
+        h.csr.satp = (8u64 << 60) | (root_pt >> 12);
+        h.csr.medeleg = 0xffff;
+        h.csr.stvec = 0x8000_0200;
+        h.x[10] = 0x8000_2000;
+        h.pc = 0x8000_0000;
+        h.invalidate_tlb();
+    };
+
+    // ADUE = 1: the fetch and load succeed and hardware sets A.
+    enter_s(&mut h);
+    h.step(&bus);
+    assert_eq!(h.pc, 0x8000_0004);
+    assert_ne!(
+        bus.read(pte_addr, AccessSize::Double).unwrap() & (1 << 6),
+        0
+    );
+
+    // ADUE = 0: the same access with A = 0 raises an instruction page fault.
+    bus.write(pte_addr, AccessSize::Double, pte_base).unwrap();
+    h.csr.menvcfg &= !envcfg::ADUE;
+    enter_s(&mut h);
+    h.step(&bus);
+    assert_eq!(h.csr.scause, cause::INSN_PAGE_FAULT);
+    assert_eq!(bus.read(pte_addr, AccessSize::Double).unwrap(), pte_base);
+
+    // Selecting Svade (strict mode) makes ADUE = 0 the reset value.
+    h.set_svade(true);
+    h.reset(0x8000_0000);
+    assert_eq!(h.csr.menvcfg & envcfg::ADUE, 0);
+}
+
+/// The RISC-V Semihosting sequence `slli x0, x0, 0x1f; ebreak; srai x0, x0, 7`
+/// is serviced only when semihosting is enabled (`-semihosting`). Otherwise
+/// its `ebreak` raises a breakpoint exception, as on QEMU without
+/// `-semihosting`: OpenSBI probes for semihosting this way and switches its
+/// console away from the UART when the probe does not trap.
+#[test]
+fn semihosting_sequence_traps_unless_enabled() {
+    use rivemu_cpu_riscv::cause;
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    for (i, w) in [0x01f0_1013u64, 0x0010_0073, 0x4070_5013]
+        .into_iter()
+        .enumerate()
+    {
+        bus.write(0x8000_0000 + 4 * i as u64, AccessSize::Word, w)
+            .unwrap();
+    }
+    for enabled in [false, true] {
+        let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+        h.reset(0x8000_0000);
+        h.csr.mtvec = 0x8000_0100;
+        h.semihosting = enabled;
+        h.step(&bus);
+        h.step(&bus);
+        if enabled {
+            assert!(h.pending_semihost);
+            assert_eq!(h.csr.mcause, 0);
+        } else {
+            assert!(!h.pending_semihost);
+            assert_eq!(h.csr.mcause, cause::BREAKPOINT);
+            assert_eq!(h.csr.mepc, 0x8000_0004);
+            assert_eq!(h.pc, 0x8000_0100);
+        }
+    }
+}
+
+/// Smdbltrp (`-cpu rv64,smdbltrp=on`): MDT is 1 at reset, taking a trap into
+/// M-mode sets it, MRET clears it, and a trap into M-mode while MDT = 1 is an
+/// unexpected trap that stops the hart without updating architectural state
+/// (Sail 0.16 `machine_trap_set_mdt`). Without the option MDT is read-only 0.
+#[test]
+fn smdbltrp_reset_value_trap_entry_and_critical_error() {
+    use rivemu_cpu_riscv::csr::{self, status};
+
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", 0x8000_0000, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    // 0x00: ecall; 0x100 (mtvec): ecall again, without clearing MDT.
+    bus.write(0x8000_0000, AccessSize::Word, 0x0000_0073)
+        .unwrap();
+    bus.write(0x8000_0100, AccessSize::Word, 0x0000_0073)
+        .unwrap();
+
+    // Default hart: MDT is read-only zero and traps do not set it.
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(0x8000_0000);
+    assert_eq!(h.csr.mstatus & status::MDT, 0);
+    h.csr_write(csr::MSTATUS, h.csr.mstatus | status::MDT)
+        .unwrap();
+    assert_eq!(h.csr.mstatus & status::MDT, 0, "MDT is read-only 0");
+    h.csr.mtvec = 0x8000_0100;
+    h.step(&bus);
+    assert_eq!(h.pc, 0x8000_0100);
+    h.step(&bus);
+    assert_eq!(h.pc, 0x8000_0100, "nested trap is delivered normally");
+    assert!(!h.critical_error);
+
+    // Smdbltrp hart: MDT = 1 at reset, so the first M-mode trap is unexpected.
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.smdbltrp = true;
+    h.reset(0x8000_0000);
+    assert_ne!(h.csr.mstatus & status::MDT, 0, "MDT = 1 at reset");
+    h.csr.mtvec = 0x8000_0100;
+    h.step(&bus);
+    assert!(h.critical_error);
+    assert_eq!(h.pc, 0x8000_0000, "no architectural state is updated");
+    assert_eq!(h.csr.mcause, 0);
+
+    // After software clears MDT, a trap sets it and the next trap is unexpected.
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.smdbltrp = true;
+    h.reset(0x8000_0000);
+    h.csr.mtvec = 0x8000_0100;
+    h.csr_write(csr::MSTATUS, h.csr.mstatus & !status::MDT)
+        .unwrap();
+    h.step(&bus);
+    assert_eq!(h.pc, 0x8000_0100);
+    assert_ne!(h.csr.mstatus & status::MDT, 0, "trap entry sets MDT");
+    h.step(&bus);
+    assert!(h.critical_error);
+    assert_eq!(h.pc, 0x8000_0100);
+}
+
+/// Block execution runs RAM loads and stores that hit the fast TLB inline
+/// (`exec_mem_fast`). It must give the same registers, memory and retired
+/// count as single-stepping through `execute`: sign and zero extension for
+/// every width, a page-crossing load (which takes the full path), and a store
+/// between LR and SC that clears the reservation.
+#[test]
+fn block_loads_and_stores_match_single_stepping() {
+    const CODE: u64 = 0x8000_0000;
+    const DATA: u64 = 0x8001_0000;
+    const PROGRAM: &[u32] = &[
+        0x0005_3283, // ld   t0, 0(a0)
+        0x0045_2303, // lw   t1, 4(a0)
+        0x0065_1383, // lh   t2, 6(a0)
+        0x0075_0403, // lb   s0, 7(a0)
+        0x0045_6483, // lwu  s1, 4(a0)
+        0x0065_5683, // lhu  a3, 6(a0)
+        0x0075_4703, // lbu  a4, 7(a0)
+        0x0055_3423, // sd   t0, 8(a0)
+        0x0065_2823, // sw   t1, 16(a0)
+        0x0075_1a23, // sh   t2, 20(a0)
+        0x0085_0b23, // sb   s0, 22(a0)
+        0x0005_b783, // ld   a5, 0(a1)       (crosses a page)
+        0x1008_b82f, // lr.d a6, (a7)
+        0x0058_b023, // sd   t0, 0(a7)
+        0x1868_b92f, // sc.d s2, t1, (a7)
+        0x00f8_bc23, // sd   a5, 24(a7)
+        0x0185_0513, // addi a0, a0, 24
+        0x0015_8593, // addi a1, a1, 1
+        0xfff6_0613, // addi a2, a2, -1
+        0xfa06_1ae3, // bnez a2, loop
+        0x1050_0073, // wfi
+    ];
+    let setup = || {
+        let mut bus = AddressSpace::new();
+        bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+            .unwrap();
+        for (i, &w) in PROGRAM.iter().enumerate() {
+            bus.write(CODE + 4 * i as u64, AccessSize::Word, u64::from(w))
+                .unwrap();
+        }
+        for i in 0..0x2000u64 {
+            bus.write(DATA + i, AccessSize::Byte, (i * 37 + 0x80) & 0xff)
+                .unwrap();
+        }
+        let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+        h.reset(CODE);
+        h.x[10] = DATA;
+        h.x[11] = DATA + 0x1000 - 4;
+        h.x[12] = 10;
+        h.x[17] = DATA + 0x1800;
+        (bus, h)
+    };
+
+    let (block_bus, mut block) = setup();
+    let mut attempted = 0;
+    while !block.wfi && attempted < 10_000 {
+        attempted += block.run(&block_bus, 10_000);
+    }
+    let (step_bus, mut stepped) = setup();
+    while !stepped.wfi && stepped.instret() < 10_000 {
+        stepped.step(&step_bus);
+    }
+
+    assert!(block.wfi && stepped.wfi);
+    assert_eq!(block.instret(), 10 * 20 + 1);
+    assert_eq!(block.instret(), stepped.instret());
+    assert_eq!(block.pc, stepped.pc);
+    assert_eq!(block.x, stepped.x);
+    for off in (0..0x2000).step_by(8) {
+        assert_eq!(
+            block_bus.read(DATA + off, AccessSize::Double).unwrap(),
+            step_bus.read(DATA + off, AccessSize::Double).unwrap(),
+            "memory differs at {:#x}",
+            DATA + off
+        );
+    }
+    // The last iteration read bytes 0xd8.. of the pattern: sign extension
+    // differs from zero extension for these values.
+    assert_ne!(block.x[6] >> 32, 0, "lw sign-extends");
+    assert_eq!(block.x[9] >> 32, 0, "lwu zero-extends");
+    assert_eq!(block.x[6] & 0xffff_ffff, block.x[9]);
+}
+
+/// Blocks store integer operations that write x0 as `Nop`, rerun a block
+/// that branches to its own start without a lookup, count retired
+/// instructions once per chain, and send misaligned loads and stores (which
+/// the inline fast path refuses) through the full path: all as single-step.
+#[test]
+fn block_x0_hints_self_loops_and_misaligned_accesses_match_single_stepping() {
+    const CODE: u64 = 0x8000_0000;
+    const DATA: u64 = 0x8001_0000;
+    const PROGRAM: &[u32] = &[
+        0x00c5_8033, // add  zero, a1, a2
+        0x02c5_8033, // mul  zero, a1, a2
+        0x1234_5037, // lui  zero, 0x12345
+        0x0076_8013, // addi zero, a3, 7
+        0x0035_0513, // addi a0, a0, 3      (misaligned from here on)
+        0x00b5_3023, // sd   a1, 0(a0)
+        0x0005_3683, // ld   a3, 0(a0)
+        0x00c5_2223, // sw   a2, 4(a0)
+        0x0065_5783, // lhu  a5, 6(a0)
+        0x00d7_0733, // add  a4, a4, a3
+        0x00f7_0733, // add  a4, a4, a5
+        0xfff6_0613, // addi a2, a2, -1
+        0xfc06_18e3, // bnez a2, loop       (back to its own block)
+        0x1050_0073, // wfi
+    ];
+    let setup = || {
+        let mut bus = AddressSpace::new();
+        bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+            .unwrap();
+        for (i, &w) in PROGRAM.iter().enumerate() {
+            bus.write(CODE + 4 * i as u64, AccessSize::Word, u64::from(w))
+                .unwrap();
+        }
+        let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+        h.reset(CODE);
+        h.x[10] = DATA;
+        h.x[11] = 0x0123_4567_89ab_cdef;
+        h.x[12] = 500;
+        (bus, h)
+    };
+    let (block_bus, mut block) = setup();
+    let mut attempted = 0;
+    while !block.wfi && attempted < 100_000 {
+        attempted += block.run(&block_bus, 100_000);
+    }
+    let (step_bus, mut stepped) = setup();
+    while !stepped.wfi && stepped.instret() < 100_000 {
+        stepped.step(&step_bus);
+    }
+    assert!(block.wfi && stepped.wfi);
+    assert_eq!(block.instret(), 500 * 13 + 1);
+    assert_eq!(block.instret(), stepped.instret());
+    assert_eq!(block.pc, stepped.pc);
+    assert_eq!(block.x, stepped.x);
+    assert_eq!(block.x[0], 0);
+    for off in (0..0x800).step_by(8) {
+        assert_eq!(
+            block_bus.read(DATA + off, AccessSize::Double).unwrap(),
+            step_bus.read(DATA + off, AccessSize::Double).unwrap(),
+            "memory differs at {:#x}",
+            DATA + off
+        );
+    }
+}
+
+/// Blocks go on past conditional branches, and a taken branch leaves the
+/// block early. A loop whose blocks contain branches taken 1 in 4 and 3 in
+/// 8 times, with loads and stores after them, must end exactly as
+/// single-stepping does, for any slice budget (which cuts blocks at odd
+/// points).
+#[test]
+fn blocks_with_inner_branches_match_single_stepping() {
+    const CODE: u64 = 0x8000_0000;
+    const DATA: u64 = 0x8001_0000;
+    const PROGRAM: &[u32] = &[
+        0xfff6_0613, // loop:  addi a2, a2, -1
+        0x0036_7293, //        andi t0, a2, 3
+        0x0002_8a63, //        beqz t0, skip
+        0x0017_0713, //        addi a4, a4, 1
+        0x00e5_3023, //        sd   a4, 0(a0)
+        0x0005_3783, //        ld   a5, 0(a0)
+        0x00f8_0833, //        add  a6, a6, a5
+        0x0076_7313, // skip:  andi t1, a2, 7
+        0x00d3_6a63, //        bltu t1, a3, other
+        0x00c8_c8b3, //        xor  a7, a7, a2
+        0x0115_2423, //        sw   a7, 8(a0)
+        0x0085_6383, //        lwu  t2, 8(a0)
+        0x0078_0833, //        add  a6, a6, t2
+        0x0026_1e13, // other: slli t3, a2, 2
+        0xfc06_14e3, //        bnez a2, loop
+        0x1050_0073, //        wfi
+    ];
+    let setup = || {
+        let mut bus = AddressSpace::new();
+        bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+            .unwrap();
+        for (i, &w) in PROGRAM.iter().enumerate() {
+            bus.write(CODE + 4 * i as u64, AccessSize::Word, u64::from(w))
+                .unwrap();
+        }
+        let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+        h.reset(CODE);
+        h.x[10] = DATA;
+        h.x[12] = 1000;
+        h.x[13] = 3;
+        (bus, h)
+    };
+    let (step_bus, mut stepped) = setup();
+    while !stepped.wfi && stepped.instret() < 100_000 {
+        stepped.step(&step_bus);
+    }
+    assert!(stepped.wfi);
+    for budget in [2, 3, 5, 7, 11, 100_000] {
+        let (bus, mut h) = setup();
+        let mut attempted = 0;
+        while !h.wfi && attempted < 100_000 {
+            attempted += h.run(&bus, budget);
+        }
+        assert!(h.wfi, "budget {budget}");
+        assert_eq!(h.instret(), stepped.instret(), "budget {budget}");
+        assert_eq!(h.pc, stepped.pc, "budget {budget}");
+        assert_eq!(h.x, stepped.x, "budget {budget}");
+        for off in [0, 8] {
+            assert_eq!(
+                bus.read(DATA + off, AccessSize::Double).unwrap(),
+                step_bus.read(DATA + off, AccessSize::Double).unwrap(),
+                "budget {budget}"
+            );
+        }
+    }
+}
+
+/// More distinct blocks than the block arena holds: the arena is cleared
+/// once it is full, and every block must still run (twice, so the second
+/// pass also runs blocks decoded after the clear).
+#[test]
+fn block_arena_overflow_keeps_executing_correctly() {
+    const CODE: u64 = 0x8000_0000;
+    const BLOCKS: u64 = 300_000; // 2 instructions each: more than 2^19 slots
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(4 * MIB).unwrap()))
+        .unwrap();
+    // Block i adds its own immediate, so a block that ran another block's
+    // stale decode would change the sum.
+    let imm = |i: u64| i % 1000 + 1;
+    for i in 0..BLOCKS {
+        let at = CODE + 8 * i;
+        let addi = (imm(i) << 20) | 0x0005_0513; // addi a0, a0, imm
+        bus.write(at, AccessSize::Word, addi).unwrap();
+        bus.write(at + 4, AccessSize::Word, 0x0040_006f).unwrap(); // j .+4
+    }
+    let sum: u64 = (0..BLOCKS).map(imm).sum();
+    bus.write(CODE + 8 * BLOCKS, AccessSize::Word, 0x1050_0073)
+        .unwrap(); // wfi
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    for pass in 1..=2u64 {
+        h.reset(CODE);
+        h.x[10] = 0;
+        let mut attempted = 0;
+        while !h.wfi && attempted < 4 * BLOCKS {
+            attempted += h.run(&bus, 10_000);
+        }
+        assert!(h.wfi, "pass {pass}: did not reach wfi");
+        assert_eq!(h.x[10], sum, "pass {pass}");
+        assert_eq!(h.pc, CODE + 8 * BLOCKS + 4, "pass {pass}");
+    }
+}
+
+/// Blocks run M-extension instructions inline. For edge-case operands
+/// (zero divisors, `i64::MIN / -1`, 32-bit overflow) every result must match
+/// single-stepping through `execute`, and the architectural values.
+#[test]
+fn block_m_extension_matches_single_stepping() {
+    const CODE: u64 = 0x8000_0000;
+    const PROGRAM: &[u32] = &[
+        0x02b5_0633, // mul    a2, a0, a1
+        0x02b5_16b3, // mulh   a3, a0, a1
+        0x02b5_2733, // mulhsu a4, a0, a1
+        0x02b5_37b3, // mulhu  a5, a0, a1
+        0x02b5_083b, // mulw   a6, a0, a1
+        0x02b5_48b3, // div    a7, a0, a1
+        0x02b5_5933, // divu   s2, a0, a1
+        0x02b5_69b3, // rem    s3, a0, a1
+        0x02b5_7a33, // remu   s4, a0, a1
+        0x02b5_4abb, // divw   s5, a0, a1
+        0x02b5_5b3b, // divuw  s6, a0, a1
+        0x02b5_6bbb, // remw   s7, a0, a1
+        0x02b5_7c3b, // remuw  s8, a0, a1
+        0x1050_0073, // wfi
+    ];
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    for (i, &w) in PROGRAM.iter().enumerate() {
+        bus.write(CODE + 4 * i as u64, AccessSize::Word, u64::from(w))
+            .unwrap();
+    }
+    let cases: &[(u64, u64)] = &[
+        (7, 0),
+        (i64::MIN as u64, -1i64 as u64),
+        (0xffff_ffff_8000_0000, -1i64 as u64), // i32::MIN / -1 in the W forms
+        (u64::MAX, u64::MAX),
+        (0x1234_5678_9abc_def0, 0xfedc_ba98_7654_3210),
+        (-17i64 as u64, 5),
+        (17, -5i64 as u64),
+    ];
+    for &(a, b) in cases {
+        let run = |blocks: bool| {
+            let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+            h.reset(CODE);
+            h.x[10] = a;
+            h.x[11] = b;
+            while !h.wfi {
+                if blocks {
+                    h.run(&bus, 100);
+                } else {
+                    h.step(&bus);
+                }
+            }
+            h.x
+        };
+        let (block, stepped) = (run(true), run(false));
+        assert_eq!(block, stepped, "a={a:#x} b={b:#x}");
+        if b == 0 {
+            assert_eq!(block[17], u64::MAX, "div by zero");
+            assert_eq!(block[19], a, "rem by zero");
+        }
+        if a == i64::MIN as u64 && b == u64::MAX {
+            assert_eq!(block[17], a, "div overflow");
+            assert_eq!(block[19], 0, "rem overflow");
+        }
+    }
+}
+
+/// Blocks chain into a block on another page through the fast TLB's fetch
+/// table. After a switch to another address space (another ASID), after a
+/// remap with `sfence.vma`, and from another privilege mode, the chain must
+/// see the new translation, not the cached one.
+#[test]
+fn block_chains_across_pages_follow_remaps_and_privilege() {
+    use rivemu_cpu_riscv::{Priv, cause, csr};
+
+    const CODE: u64 = 0x8000_0000; // VA = PA (gigapage 2), S-only RWX
+    const MTVEC: u64 = 0x8000_0800;
+    const OLD: u64 = CODE + 0x1000; // addi a0, a0, 7
+    const NEW: u64 = CODE + 0x2000; // addi a0, a0, 9
+    const TARGET_VA: u64 = 0x4000_1000; // a 4 KiB page -> OLD or NEW
+    const U_CODE_VA: u64 = 0x0; // gigapage 0 -> CODE, U|RX
+    // Two address spaces: root, level-1 and level-0 tables.
+    const A: [u64; 3] = [0x8002_0000, 0x8002_1000, 0x8002_2000];
+    const B: [u64; 3] = [0x8003_0000, 0x8003_1000, 0x8003_2000];
+    let mut bus = AddressSpace::new();
+    bus.add_ram("ram", CODE, Arc::new(Ram::new(MIB).unwrap()))
+        .unwrap();
+    let w = |bus: &AddressSpace, pa: u64, insn: u32| {
+        bus.write(pa, AccessSize::Word, u64::from(insn)).unwrap();
+    };
+    // CODE: li a0, 0; jalr x0, 0(t0). At CODE + 0x40: sfence.vma; wfi.
+    w(&bus, CODE, 0x0000_0513);
+    w(&bus, CODE + 4, 0x0002_8067);
+    w(&bus, CODE + 0x40, 0x1200_0073);
+    w(&bus, CODE + 0x44, 0x1050_0073);
+    w(&bus, MTVEC, 0x1050_0073); // the trap handler: wfi
+    for (base, add) in [(OLD, 7u32), (NEW, 9u32)] {
+        w(&bus, base, 0x0005_0513 | (add << 20));
+        w(&bus, base + 4, 0x1050_0073); // wfi
+    }
+    let pte = |pa: u64, flags: u64| ((pa >> 12) << 10) | flags;
+    let dw = |bus: &AddressSpace, pa: u64, v: u64| {
+        bus.write(pa, AccessSize::Double, v).unwrap();
+    };
+    for t in [A, B] {
+        dw(&bus, t[0] + 2 * 8, pte(CODE, 0xcf)); // D|A|X|W|R|V
+        dw(&bus, t[0], pte(CODE, 0x5b)); // A|U|X|R|V
+        dw(&bus, t[0] + 8, pte(t[1], 1)); // VA 0x4000_0000: next level
+        dw(&bus, t[1], pte(t[2], 1));
+    }
+    let map_target = |bus: &AddressSpace, t: [u64; 3], pa: u64| {
+        dw(bus, t[2] + 8, pte(pa, 0x4b)); // A|X|R|V
+    };
+    map_target(&bus, A, OLD);
+    map_target(&bus, B, NEW);
+
+    let mut h = Hart::new(0, Arc::new(FrozenTimebase(0)));
+    h.reset(CODE);
+    h.csr.mtvec = MTVEC;
+    let satp = |t: [u64; 3], asid: u64| (8u64 << 60) | (asid << 44) | (t[0] >> 12);
+    let set_satp = |h: &mut Hart, v: u64| {
+        h.prv = Priv::Machine;
+        h.csr_write(csr::SATP, v).unwrap();
+    };
+    let run_to_wfi = |h: &mut Hart, prv: Priv, pc: u64| {
+        h.prv = prv;
+        h.pc = pc;
+        h.wfi = false;
+        h.x[5] = TARGET_VA;
+        let mut n = 0;
+        while !h.wfi && n < 100 {
+            n += h.run(&bus, 100);
+        }
+    };
+    // Several passes each: the first decodes both blocks, later ones chain
+    // through the fetch table (filled, then hit).
+    let expect = |h: &mut Hart, a0: u64, what: &str| {
+        for _ in 0..4 {
+            run_to_wfi(h, Priv::Supervisor, CODE);
+            assert!(h.wfi && h.prv == Priv::Supervisor, "{what}");
+            assert_eq!(h.x[10], a0, "{what}");
+        }
+    };
+    // U-mode runs the same code through gigapage 0 and jumps to the S-only
+    // target page: an instruction page fault. The first runs also give
+    // U-mode a fast-TLB slot of its own, live while S-mode fills its table
+    // below (twice: the slot's context includes mstatus.MPP, which the first
+    // trap changes).
+    let u_faults = |h: &mut Hart, what: &str| {
+        run_to_wfi(h, Priv::User, U_CODE_VA);
+        assert_eq!(h.prv, Priv::Machine, "{what}");
+        assert_eq!(h.x[10], 0, "{what}: U-mode ran the S-only page");
+        assert_eq!(
+            h.csr_read(csr::MCAUSE),
+            Some(cause::INSN_PAGE_FAULT),
+            "{what}"
+        );
+        assert_eq!(h.csr_read(csr::MTVAL), Some(TARGET_VA), "{what}");
+    };
+
+    set_satp(&mut h, satp(A, 1));
+    u_faults(&mut h, "U-mode before S-mode ran");
+    u_faults(&mut h, "U-mode again before S-mode ran");
+    expect(&mut h, 7, "address space A");
+    set_satp(&mut h, satp(B, 2));
+    expect(&mut h, 9, "switched to address space B");
+    set_satp(&mut h, satp(A, 1));
+    expect(&mut h, 7, "back to address space A");
+
+    // Remap A's target page and flush with sfence.vma.
+    map_target(&bus, A, NEW);
+    run_to_wfi(&mut h, Priv::Supervisor, CODE + 0x40);
+    assert!(h.wfi, "sfence.vma; wfi");
+    expect(&mut h, 9, "remapped and flushed with sfence.vma");
+
+    // S-mode filled the fetch table for the target page; U-mode still
+    // faults.
+    u_faults(&mut h, "U-mode after S-mode ran");
 }

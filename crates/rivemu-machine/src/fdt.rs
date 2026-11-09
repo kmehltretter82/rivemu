@@ -14,9 +14,16 @@ pub(crate) struct FdtParams<'a> {
     pub(crate) plic_ndev: u32,
     /// (base, irq) of each virtio-mmio transport to describe.
     pub(crate) virtio: Vec<(u64, u32)>,
+    /// Advertise Svade (missing A/D bits fault) instead of Svadu (hardware
+    /// A/D updating, enabled at reset through `menvcfg.ADUE`).
+    pub(crate) svade: bool,
+    /// Advertise Smdbltrp (only when the harts implement it).
+    pub(crate) smdbltrp: bool,
+    /// Advertise the H extension (only when the harts implement it).
+    pub(crate) hypervisor: bool,
 }
 
-const ISA: &str = "rv64imafdcv_zabha_zacas_zalasr_zawrs_zba_zbb_zbc_zbkb_zbkc_zbkx_zbs_zca_zcb_zcd_zcmop_zfa_zfbfmin_zfh_zfhmin_zicbom_zicbop_zicboz_zicfilp_zicfiss_zicntr_zicond_zicsr_zifencei_zihintpause_zimop_zknd_zkne_zknh_zkr_zksed_zksh_zkt_sdtrig_smcntrpmf_smdbltrp_smepmp_smmpm_smnpm_smstateen_sscofpmf_ssdbltrp_ssnpm_ssqosid_ssstateen_sstc_svinval_svnapot_svpbmt_svrsw60t59b_svukte_svvptc";
+const ISA_TEMPLATE: &str = "rv64imafdcv{H}_zabha_zacas_zalasr_zama16b_zawrs_zba_zbb_zbc_zbkb_zbkc_zbkx_zbs_zca_zcb_zcd_zcmop_zfa_zfbfmin_zfh_zfhmin_zicbom_zicbop_zicboz_zicfilp_zicfiss_zicntr_zicond_zicsr_zifencei_zihintpause_zimop_zknd_zkne_zknh_zkr_zksed_zksh_zkt_sdtrig_smcntrpmf_{DBL}smepmp_smmpm_smnpm_smstateen_sscofpmf_ssdbltrp_ssnpm_ssqosid_ssstateen_sstc_{AD}_svinval_svnapot_svpbmt_svrsw60t59b_svukte_svvptc";
 const ISA_EXTENSIONS: &[&str] = &[
     "i",
     "m",
@@ -28,6 +35,7 @@ const ISA_EXTENSIONS: &[&str] = &[
     "zabha",
     "zacas",
     "zalasr",
+    "zama16b",
     "zawrs",
     "zba",
     "zbb",
@@ -84,6 +92,30 @@ const ISA_EXTENSIONS: &[&str] = &[
 ];
 
 pub(crate) fn build(p: &FdtParams<'_>) -> Vec<u8> {
+    // Exactly one A/D-bit scheme, matching the reset value of menvcfg.ADUE.
+    let ad_scheme = if p.svade { "svade" } else { "svadu" };
+    let isa = ISA_TEMPLATE
+        .replace("{AD}", ad_scheme)
+        .replace("{DBL}", if p.smdbltrp { "smdbltrp_" } else { "" })
+        .replace("{H}", if p.hypervisor { "h" } else { "" });
+    let mut extensions: Vec<&str> = ISA_EXTENSIONS
+        .iter()
+        .copied()
+        .filter(|e| p.smdbltrp || *e != "smdbltrp")
+        .collect();
+    let at = extensions
+        .iter()
+        .position(|e| *e == "svinval")
+        .unwrap_or(extensions.len());
+    extensions.insert(at, ad_scheme);
+    if p.hypervisor {
+        // After the single-letter extensions (i m a f d c v).
+        let at = extensions
+            .iter()
+            .position(|e| *e == "v")
+            .map_or(0, |i| i + 1);
+        extensions.insert(at, "h");
+    }
     let mut f = FdtBuilder::new();
     let intc: Vec<u32> = (0..p.harts).map(|_| f.alloc_phandle()).collect();
     let cpu_ph: Vec<u32> = (0..p.harts).map(|_| f.alloc_phandle()).collect();
@@ -123,9 +155,9 @@ pub(crate) fn build(p: &FdtParams<'_>) -> Vec<u8> {
         f.prop_u32("reg", h as u32);
         f.prop_str("status", "okay");
         f.prop_str("compatible", "riscv");
-        f.prop_str("riscv,isa", ISA);
+        f.prop_str("riscv,isa", &isa);
         f.prop_str("riscv,isa-base", "rv64i");
-        f.prop_strs("riscv,isa-extensions", ISA_EXTENSIONS);
+        f.prop_strs("riscv,isa-extensions", &extensions);
         f.prop_u32("riscv,cbom-block-size", 64);
         f.prop_u32("riscv,cbop-block-size", 64);
         f.prop_u32("riscv,cboz-block-size", 64);

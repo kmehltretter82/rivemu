@@ -1,0 +1,3 @@
+FAIL priv/Sv/Sv_ExceptionsZaamoSm_sv39_exceptions_Zaamo_mprv_S_Mmode-00 exit=1
+FAIL priv/Sv/Sv_ExceptionsZaamo_sv39_exceptions_Zaamo_Smode-00 exit=1
+FAIL priv/Sv/Sv_ExceptionsZaamo_sv39_exceptions_Zaamo_Umode-00 exit=1

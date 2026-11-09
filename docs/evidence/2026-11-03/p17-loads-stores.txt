@@ -1,0 +1,65 @@
+# Faster inline loads/stores and block chaining (2026-11-03)
+#
+# P17 run 41608020067 (27ddcbf) on a slower macOS runner measured 8.96 s
+# single-hart (target < 8 s), so the interpreter needed more margin. The
+# Debian boot is CPU-bound (about 2.0 G guest instructions, 60% RSA/ECC
+# bignum, SHA-256 and SHA-3), and the Debian images cannot be fetched in the
+# cloud session, so benches/guest/crypto_bench.c reproduces those loops
+# (multiply-accumulate over 32 limbs, SHA-256, Keccak-f[1600], rv64gc -O2) in
+# S-mode with Sv39 paging, like the kernel.
+#
+# Host instructions per guest instruction (callgrind, M-mode loops of 30
+# identical instructions plus a loop branch), before:
+#   add 33, ld 68, sd 99
+# The load path did three compares on the fast-TLB entry (tag, epoch,
+# context, two of them loaded from memory), then a RAM presence check, an
+# overflow check, a bounds check against the RAM length, the base pointer
+# load and an alignment branch; a store also tested the dirty bitmap.
+#
+# Changes:
+# 1. Fast TLB: up to four translation contexts at once (slots chosen per
+#    block), each slot's epoch folded into the tag: one compare per hit.
+# 2. RamView (rivemu-mem): a per-block view of guest RAM with aligned-only
+#    accesses checked against the length and alignment in registers; an
+#    aligned access never crosses a page, so the page-cross check goes. A
+#    store entry is filled only after a store set the page's dirty bit, so
+#    the fast path skips the bitmap (dirty bits are reset only on snapshot
+#    restore, which flushes every hart's TLB).
+# 3. Blocks store integer operations that write x0 as Op::Nop, so the inline
+#    ALU arms write rd without testing for x0; the block loop uses an index.
+# 4. Block chains rerun a block that branches to its own start without a
+#    lookup, and count retired instructions once per chain.
+# 5. Zba/Zbb/Zbs/Zicond operations (the kernel's strcmp_zbb and other string
+#    functions) run inline through a separate non-inlined helper reached from
+#    exec_inline's `_` arm: an andn loop 2,586 M -> 1,389 M host instructions
+#    (-46%; 84 -> 46 per instruction). Putting them into the match itself
+#    made them cheaper still but slowed the common path by 3%.
+# (Tried and reverted: an exhaustive match instead of `_` in exec_inline, to
+# drop the jump-table range check: +3.8% host instructions.)
+#
+# Results (host instructions, callgrind):
+#   add loop            1,067,144,890 -> 936,201,881     (-12.3%)
+#   ld loop             2,110,239,815 -> 1,689,278,368   (-20.0%; step 1-2)
+#   sd loop             3,040,240,321 -> 1,989,364,802   (-34.6%; step 1-2)
+#   crypto_bench_10     7,749,429,968 -> 6,425,260,943   (-17.1%)
+#   deterministic boot  26,031,774,030 -> 22,820,524,984 (-12.3%; -icount
+#     shift=3, OpenSBI + Linux 6.12 to RIVEMU_SMOKE_OK; the vector memcpy part
+#     of this boot is unchanged)
+# Wall clock, crypto_bench (1.68 G guest instructions), 3 alternating runs:
+#   before 7.09 / 7.91 / 8.13 s (median 7.91), after 6.01 / 6.10 / 6.66 s
+#   (median 6.10): -23%.
+#
+# CI run 41619541764 (c2ffc78), p17-bench, 9 samples, head vs base (main)
+# on the same runner:
+#   macos-latest   head 7.899 s SMP1 (p95 11.269), 8.860 s SMP4 (p95 10.828);
+#                  base 21.424 / 22.416 s
+#   ubuntu-latest  head 8.412 / 9.007 s; base 30.604 / 36.019 s
+# head/base on macOS is about the same as before (0.369 vs 0.366 at
+# 27ddcbf), on Ubuntu it improved (0.275 vs 0.297): the Apple cores gain
+# less from fewer instructions than the x86 ones.
+#
+# Checks: all workspace tests (with new block_x0_hints_self_loops_and_
+# misaligned_accesses_match_single_stepping and a RamView test),
+# riscv-arch-test 1251/1251, Linux device E2E 6/6, trace lockstep of
+# OpenSBI + Linux to the shell prompt (364,904,448 instructions, 0
+# divergences) and of the H firmware (0 divergences).

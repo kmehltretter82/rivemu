@@ -1,0 +1,42 @@
+== ACT
+binary: /home/user/rivemu/target/release/rivemu-system-riscv64 (rivemu-system-riscv64 version 0.1.0)
+binary sha256: 8c58910cff20a6fc760a0d9d150aa671ff2b5ae2c01f2be60457d5826644d0f1
+elfs: /home/user/act-work/rivemu-rv64/elfs
+args: -nographic -semihosting -M virt -cpu rv64,smdbltrp=on -bios <elf>; timeout 60s
+total: 418
+PASS: 418
+FAIL: 0
+TIMEOUT: 0
+== cpu tests (riscv-tests required)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== workspace
+workspace done
+== lockstep pmp/paging/privileged/csr
+    Finished `release` profile [optimized] target(s) in 5.65s
+sail pmp: PASS: reference=sail suite=pmp blocks=128 requested_insns_per_block=32 requested_insns_total=4096 start_seed=0x7000 step_check=true elapsed=204.70s
+sail sv39: PASS: reference=sail suite=sv39-paging blocks=128 requested_insns_per_block=32 requested_insns_total=4096 start_seed=0x7000 step_check=true elapsed=162.43s
+sail sv48: PASS: reference=sail suite=sv48-paging blocks=128 requested_insns_per_block=32 requested_insns_total=4096 start_seed=0x7000 step_check=true elapsed=156.82s
+sail privileged: PASS: reference=sail suite=privileged-traps blocks=128 requested_insns_per_block=32 requested_insns_total=4096 start_seed=0x7000 step_check=true elapsed=144.23s
+sail csr: PASS: reference=sail suite=csr-trap blocks=128 requested_insns_per_block=32 requested_insns_total=4096 start_seed=0x7000 step_check=true elapsed=43.96s
+sail cfi: PASS: reference=sail suite=cfi blocks=128 requested_insns_per_block=32 requested_insns_total=4096 start_seed=0x7000 step_check=true elapsed=125.67s
+sail mem: PASS: reference=sail suite=sandbox-mem-amo blocks=128 requested_insns_per_block=32 requested_insns_total=4096 start_seed=0x7000 step_check=true elapsed=50.01s
+qemu pmp: PASS: reference=qemu suite=pmp blocks=128 requested_insns_per_block=32 requested_insns_total=4096 start_seed=0x7000 step_check=true elapsed=53.53s
+qemu sv39: PASS: reference=qemu suite=sv39-paging blocks=128 requested_insns_per_block=32 requested_insns_total=4096 start_seed=0x7000 step_check=true elapsed=41.64s
+qemu sv48: PASS: reference=qemu suite=sv48-paging blocks=128 requested_insns_per_block=32 requested_insns_total=4096 start_seed=0x7000 step_check=true elapsed=40.45s
+qemu privileged: PASS: reference=qemu suite=privileged-traps blocks=128 requested_insns_per_block=32 requested_insns_total=4096 start_seed=0x7000 step_check=true elapsed=52.12s
+qemu csr: PASS: reference=qemu suite=csr-trap blocks=128 requested_insns_per_block=32 requested_insns_total=4096 start_seed=0x7000 step_check=true elapsed=11.28s
+qemu cfi: PASS: reference=qemu suite=cfi blocks=128 requested_insns_per_block=32 requested_insns_total=4096 start_seed=0x7000 step_check=true elapsed=32.07s
+qemu mem: PASS: reference=qemu suite=sandbox-mem-amo blocks=128 requested_insns_per_block=32 requested_insns_total=4096 start_seed=0x7000 step_check=true elapsed=8.93s
+== linux devices
+test guest_reboot_resets_the_machine_and_boots_again ... ok
+test nvme_namespace_reads_and_writes_from_linux ... ok
+test sbi_pmu_counts_guest_instructions ... ok
+test snapshot_v2_restores_pci_nvme_into_a_fresh_machine ... ok
+test virtio_gpu_scanout_and_input_devices_work_from_linux ... ok
+test virtio_vsock_guest_connects_to_host_cid ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 71.45s
+done

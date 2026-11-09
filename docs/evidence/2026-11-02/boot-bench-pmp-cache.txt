@@ -1,0 +1,44 @@
+# scripts/bench-boot.sh 5 {1,4} base=... head=... pmpcache=...
+# Linux 6.12 (images/linux-src/Image sha256 3994b77e...) + BusyBox initramfs, OpenSBI v1.7 fw_dynamic.bin (sha256 4be29236...),
+# -m 512M, append 'console=ttyS0 rivemu.poweroff': wall time from process start to exit after RIVEMU_SMOKE_OK + poweroff.
+# base     = 0946319 (branch base)                       sha256 fbc3f694e17b3737...
+# head     = b0af485 (before the PMP page cache)         sha256 4bf9341a97c04d13...
+# pmpcache = b0af485 + PMP page cache (next commit)      sha256 8c58910cff20a6fc...
+# Runs interleaved base/head/pmpcache; nothing else running on the host.
+# host: 4 vCPU, 6.18.44-fc-v185; Tue Nov  3 00:19:03 UTC 2026
+run 1 base smp=1 11.056019838s
+run 1 head smp=1 10.740076899s
+run 1 pmpcache smp=1 9.463493151s
+run 2 base smp=1 10.892668522s
+run 2 head smp=1 11.107646436s
+run 2 pmpcache smp=1 9.076245614s
+run 3 base smp=1 11.447211769s
+run 3 head smp=1 10.868448916s
+run 3 pmpcache smp=1 10.764887647s
+run 4 base smp=1 11.611243632s
+run 4 head smp=1 12.011240095s
+run 4 pmpcache smp=1 9.761337235s
+run 5 base smp=1 11.162759144s
+run 5 head smp=1 10.825661111s
+run 5 pmpcache smp=1 8.421138750s
+base smp=1 n=5 median=11.16s min=10.89s max=11.61s
+head smp=1 n=5 median=10.87s min=10.74s max=12.01s
+pmpcache smp=1 n=5 median=9.46s min=8.42s max=10.76s
+run 1 base smp=4 15.375316954s
+run 1 head smp=4 14.473781370s
+run 1 pmpcache smp=4 12.998339509s
+run 2 base smp=4 16.389527811s
+run 2 head smp=4 17.629403034s
+run 2 pmpcache smp=4 11.888982548s
+run 3 base smp=4 15.298382575s
+run 3 head smp=4 15.535115918s
+run 3 pmpcache smp=4 12.194241085s
+run 4 base smp=4 14.211265993s
+run 4 head smp=4 16.768748934s
+run 4 pmpcache smp=4 14.307812637s
+run 5 base smp=4 15.288237232s
+run 5 head smp=4 16.851733168s
+run 5 pmpcache smp=4 13.475850424s
+base smp=4 n=5 median=15.30s min=14.21s max=16.39s
+head smp=4 n=5 median=16.77s min=14.47s max=17.63s
+pmpcache smp=4 n=5 median=13.00s min=11.89s max=14.31s

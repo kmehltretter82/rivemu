@@ -222,6 +222,12 @@ impl MmioDevice for VirtioMmio {
             0x044 => q.map_or(0, |q| u32::from(q.ready)),
             0x060 => st.interrupt_status,
             0x070 => st.status,
+            // SHMLenLow/High and SHMBaseLow/High: no device implements a
+            // shared memory region, and reading a non-existent region must
+            // return -1 (VirtIO 1.2 section 4.2.2). A length of 0 makes Linux
+            // virtio-gpu try to reserve a zero-length region at address 0 and
+            // fail to probe ("Could not reserve host visible region", -EBUSY).
+            0x0b0 | 0x0b4 | 0x0b8 | 0x0bc => u32::MAX,
             0x0fc => st.config_generation,
             _ => 0,
         };
@@ -375,6 +381,23 @@ mod tests {
         let _ = dma.write_u32(base + 8, len);
         let _ = dma.write_u16(base + 12, flags);
         let _ = dma.write_u16(base + 14, next);
+    }
+
+    #[test]
+    fn shared_memory_registers_report_no_region() {
+        // VirtIO 1.2 section 4.2.2: a non-existent shared memory region reads
+        // back a length (and base) of -1.
+        let dma = test_dma(0x1000);
+        let irq = Arc::new(TestIrq::default());
+        let mmio = VirtioMmio::new(Box::new(VirtioRng::new(1)), dma, irq);
+        mmio.write(0x0ac, AccessSize::Word, 1); // SHMSel = VIRTIO_GPU_SHM_ID_HOST_VISIBLE
+        for offset in [0x0b0, 0x0b4, 0x0b8, 0x0bc] {
+            assert_eq!(
+                mmio.read(offset, AccessSize::Word),
+                0xffff_ffff,
+                "{offset:#x}"
+            );
+        }
     }
 
     #[test]
@@ -640,17 +663,17 @@ mod tests {
             out
         };
 
-        // 1. GET_DISPLAY_INFO (0x0101)
+        // 1. GET_DISPLAY_INFO (0x0100)
         let mut get_info = [0u8; 24];
-        get_info[0..4].copy_from_slice(&0x0101u32.to_le_bytes());
+        get_info[0..4].copy_from_slice(&0x0100u32.to_le_bytes());
         let resp = cmd(&get_info);
         assert_eq!(u32::from_le_bytes(resp[0..4].try_into().unwrap()), 0x1101);
         assert_eq!(u32::from_le_bytes(resp[32..36].try_into().unwrap()), 32);
         assert_eq!(u32::from_le_bytes(resp[36..40].try_into().unwrap()), 16);
 
-        // 2. RESOURCE_CREATE_2D (0x0102): res_id=1, format=1 (B8G8R8A8_UNORM), 32x16
+        // 2. RESOURCE_CREATE_2D (0x0101): res_id=1, format=1 (B8G8R8A8_UNORM), 32x16
         let mut create = [0u8; 40];
-        create[0..4].copy_from_slice(&0x0102u32.to_le_bytes());
+        create[0..4].copy_from_slice(&0x0101u32.to_le_bytes());
         create[24..28].copy_from_slice(&1u32.to_le_bytes());
         create[28..32].copy_from_slice(&1u32.to_le_bytes());
         create[32..36].copy_from_slice(&32u32.to_le_bytes());
@@ -667,9 +690,9 @@ mod tests {
         }
         dma.write_bytes(backing_buf, &raw_pixels).unwrap();
 
-        // 4. RESOURCE_ATTACH_BACKING (0x0107): res_id=1, nr_entries=1
+        // 4. RESOURCE_ATTACH_BACKING (0x0106): res_id=1, nr_entries=1
         let mut attach = [0u8; 48];
-        attach[0..4].copy_from_slice(&0x0107u32.to_le_bytes());
+        attach[0..4].copy_from_slice(&0x0106u32.to_le_bytes());
         attach[24..28].copy_from_slice(&1u32.to_le_bytes());
         attach[28..32].copy_from_slice(&1u32.to_le_bytes());
         attach[32..40].copy_from_slice(&backing_buf.to_le_bytes());
@@ -679,9 +702,9 @@ mod tests {
             0x1100
         );
 
-        // 5. SET_SCANOUT (0x0104): scanout_id=0, res_id=1
+        // 5. SET_SCANOUT (0x0103): scanout_id=0, res_id=1
         let mut scanout = [0u8; 48];
-        scanout[0..4].copy_from_slice(&0x0104u32.to_le_bytes());
+        scanout[0..4].copy_from_slice(&0x0103u32.to_le_bytes());
         scanout[32..36].copy_from_slice(&32u32.to_le_bytes());
         scanout[36..40].copy_from_slice(&16u32.to_le_bytes());
         scanout[44..48].copy_from_slice(&1u32.to_le_bytes());
@@ -690,9 +713,9 @@ mod tests {
             0x1100
         );
 
-        // 6. TRANSFER_TO_HOST_2D (0x0106) + RESOURCE_FLUSH (0x0105)
+        // 6. TRANSFER_TO_HOST_2D (0x0105) + RESOURCE_FLUSH (0x0104)
         let mut xfer = [0u8; 56];
-        xfer[0..4].copy_from_slice(&0x0106u32.to_le_bytes());
+        xfer[0..4].copy_from_slice(&0x0105u32.to_le_bytes());
         xfer[32..36].copy_from_slice(&32u32.to_le_bytes());
         xfer[36..40].copy_from_slice(&16u32.to_le_bytes());
         xfer[48..52].copy_from_slice(&1u32.to_le_bytes());
@@ -702,7 +725,7 @@ mod tests {
         );
 
         let mut flush = [0u8; 48];
-        flush[0..4].copy_from_slice(&0x0105u32.to_le_bytes());
+        flush[0..4].copy_from_slice(&0x0104u32.to_le_bytes());
         flush[32..36].copy_from_slice(&32u32.to_le_bytes());
         flush[36..40].copy_from_slice(&16u32.to_le_bytes());
         flush[40..44].copy_from_slice(&1u32.to_le_bytes());

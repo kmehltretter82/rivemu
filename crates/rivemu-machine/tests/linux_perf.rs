@@ -59,7 +59,65 @@ fn selected_hart_counts() -> Vec<u32> {
     values
 }
 
-fn boot_to_shell_once(files: &Artifacts, smp: u32, timeout: Duration) -> Duration {
+/// One boot to the shell prompt: wall time, guest instructions executed
+/// (all harts), and the wall time the loop slept because every hart was
+/// waiting for an interrupt (guest timer waits cost wall time however fast
+/// the interpreter is).
+struct Boot {
+    elapsed: Duration,
+    instructions: u64,
+    idle: Duration,
+    usage: Usage,
+}
+
+/// Process resource usage over the timed part of one boot. CPU time well
+/// below wall time, or many involuntary context switches, means the boot
+/// thread was not running (another process or VM had the CPU); CPU time
+/// close to wall time means it ran but the CPU did less per second.
+#[derive(Clone, Copy, Default)]
+struct Usage {
+    cpu_seconds: f64,
+    involuntary_switches: i64,
+    voluntary_switches: i64,
+    minor_faults: i64,
+}
+
+#[cfg(unix)]
+// `c_long` is i64 on the CI hosts but narrower on some unix targets.
+#[allow(clippy::unnecessary_cast)]
+fn usage_now() -> Usage {
+    let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage fills the whole struct it is given and returns 0;
+    // RUSAGE_SELF is always a valid target.
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) };
+    assert_eq!(rc, 0, "getrusage failed");
+    // SAFETY: the call succeeded, so every field is initialized.
+    let ru = unsafe { ru.assume_init() };
+    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    Usage {
+        cpu_seconds: secs(ru.ru_utime) + secs(ru.ru_stime),
+        involuntary_switches: ru.ru_nivcsw as i64,
+        voluntary_switches: ru.ru_nvcsw as i64,
+        minor_faults: ru.ru_minflt as i64,
+    }
+}
+
+#[cfg(not(unix))]
+fn usage_now() -> Usage {
+    Usage::default()
+}
+
+fn usage_since(start: Usage) -> Usage {
+    let now = usage_now();
+    Usage {
+        cpu_seconds: now.cpu_seconds - start.cpu_seconds,
+        involuntary_switches: now.involuntary_switches - start.involuntary_switches,
+        voluntary_switches: now.voluntary_switches - start.voluntary_switches,
+        minor_faults: now.minor_faults - start.minor_faults,
+    }
+}
+
+fn boot_to_shell_once(files: &Artifacts, smp: u32, timeout: Duration) -> Boot {
     let mut machine = Machine::new(MachineConfig {
         ram_size: 256 * MIB,
         smp,
@@ -74,7 +132,9 @@ fn boot_to_shell_once(files: &Artifacts, smp: u32, timeout: Duration) -> Duratio
     .expect("machine init");
 
     // P17 deliberately excludes image loading and machine construction.
+    let usage_start = usage_now();
     let start = Instant::now();
+    let mut idle = Duration::ZERO;
     let mut console = String::new();
     while start.elapsed() < timeout {
         if let Some(event) = machine.run_slice() {
@@ -84,7 +144,13 @@ fn boot_to_shell_once(files: &Artifacts, smp: u32, timeout: Duration) -> Duratio
         if !bytes.is_empty() {
             console.push_str(&String::from_utf8_lossy(&bytes));
             if console.contains("~ # ") {
-                return start.elapsed();
+                let elapsed = start.elapsed();
+                return Boot {
+                    elapsed,
+                    instructions: machine.executed,
+                    idle,
+                    usage: usage_since(usage_start),
+                };
             }
             if console.contains("Kernel panic")
                 || console.contains("hard LOCKUP")
@@ -94,13 +160,58 @@ fn boot_to_shell_once(files: &Artifacts, smp: u32, timeout: Duration) -> Duratio
             }
         }
         if machine.all_idle() {
+            let slept = Instant::now();
             std::thread::sleep(machine.idle_timeout().min(Duration::from_millis(2)));
+            idle += slept.elapsed();
         }
     }
     panic!(
         "guest did not reach the shell within {:.2}s:\n{console}",
         timeout.as_secs_f64()
     );
+}
+
+/// Times a fixed amount of host work that does not involve the emulator: a
+/// chain of dependent integer operations on one thread, like the
+/// interpreter's own work. It runs right before and right after every boot,
+/// so that a sample taken while the runner was slow (another VM on the host,
+/// the thread on a slower core) shows as a slow calibration next to it.
+fn calibrate() -> f64 {
+    let start = Instant::now();
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut acc: u64 = 0;
+    for i in 0..60_000_000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        acc = acc.wrapping_add(x.rotate_left((i & 63) as u32));
+    }
+    std::hint::black_box(acc);
+    start.elapsed().as_secs_f64()
+}
+
+/// One boot with the calibration before and after it, printed as a
+/// `P17_CALIB` line next to the `P17_SAMPLE` line.
+fn timed_boot(files: &Artifacts, smp: u32, timeout: Duration, phase: &str, index: usize) -> f64 {
+    let before = calibrate();
+    let boot = boot_to_shell_once(files, smp, timeout);
+    let after = calibrate();
+    let seconds = boot.elapsed.as_secs_f64();
+    // `seconds=` stays the last field: the scripts read it with `.*seconds=`.
+    let u = boot.usage;
+    eprintln!(
+        "P17_SAMPLE,smp={smp},phase={phase},index={index},insns={},idle={:.6},cpu={:.6},ivcsw={},vcsw={},minflt={},seconds={seconds:.6}",
+        boot.instructions,
+        boot.idle.as_secs_f64(),
+        u.cpu_seconds,
+        u.involuntary_switches,
+        u.voluntary_switches,
+        u.minor_faults
+    );
+    eprintln!(
+        "P17_CALIB,smp={smp},phase={phase},index={index},before={before:.6},after={after:.6}"
+    );
+    seconds
 }
 
 fn median(sorted: &[f64]) -> f64 {
@@ -145,20 +256,17 @@ fn p17_linux_to_shell_benchmark() {
     let timeout = Duration::from_secs(env_usize("RIVEMU_LINUX_PERF_TIMEOUT_SECS", 90) as u64);
     let assert_thresholds = std::env::var_os("RIVEMU_LINUX_PERF_ASSERT_THRESHOLDS").is_some();
 
+    // Every hart count runs before any threshold is checked, so a miss on
+    // one still reports the other.
+    let mut misses = Vec::new();
     for smp in selected_hart_counts() {
         for index in 0..warmups {
-            let elapsed = boot_to_shell_once(&files, smp, timeout);
-            eprintln!(
-                "P17_SAMPLE,smp={smp},phase=warmup,index={index},seconds={:.6}",
-                elapsed.as_secs_f64()
-            );
+            timed_boot(&files, smp, timeout, "warmup", index);
         }
 
         let mut samples = Vec::with_capacity(repetitions);
         for index in 0..repetitions {
-            let seconds = boot_to_shell_once(&files, smp, timeout).as_secs_f64();
-            eprintln!("P17_SAMPLE,smp={smp},phase=recorded,index={index},seconds={seconds:.6}");
-            samples.push(seconds);
+            samples.push(timed_boot(&files, smp, timeout, "recorded", index));
         }
 
         let mut sorted = samples.clone();
@@ -169,12 +277,20 @@ fn p17_linux_to_shell_benchmark() {
             "P17_RESULT,smp={smp},samples_seconds={samples:?},median_seconds={median_seconds:.6},p95_seconds={p95_seconds:.6}"
         );
 
-        if assert_thresholds {
-            let threshold = if smp == 1 { 8.0 } else { 10.0 };
-            assert!(
-                median_seconds < threshold && p95_seconds < threshold,
-                "P17 smp={smp} threshold {threshold:.2}s missed: median={median_seconds:.6}s p95={p95_seconds:.6}s"
-            );
+        let threshold = if smp == 1 { 8.0 } else { 10.0 };
+        let met = median_seconds < threshold && p95_seconds < threshold;
+        eprintln!(
+            "P17_THRESHOLD,smp={smp},threshold_seconds={threshold:.2},median_and_p95_below={met}"
+        );
+        if !met {
+            misses.push(format!(
+                "smp={smp} threshold {threshold:.2}s: median={median_seconds:.6}s p95={p95_seconds:.6}s"
+            ));
         }
     }
+    assert!(
+        !assert_thresholds || misses.is_empty(),
+        "P17 thresholds missed: {}",
+        misses.join("; ")
+    );
 }

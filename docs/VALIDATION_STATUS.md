@@ -6,6 +6,28 @@ This file records observed exit evidence separately from the implementation
 checkboxes in [`PLAN.md`](PLAN.md). A checked milestone means that its code was
 implemented; it does not by itself prove every stated exit criterion.
 
+## 2026-11-02 cloud validation (branch `claude/trusting-bell-xvhb0r`)
+
+These results come from a Claude Code cloud container (Linux 6.18, x86_64,
+4 vCPUs). They supersede the "Partial or missing" rows below where they
+overlap. Findings, causes and fixes are in
+[`REVIEW-20261102.md`](REVIEW-20261102.md). Every row links its log.
+
+| Area | Evidence | Result |
+|---|---|---|
+| `riscv-arch-test` privileged subset | `tests/arch-test/README.md`; `evidence/2026-11-02/arch-test/` | **418/418** in 15 privileged suites (Sail 0.16 reference). Before the three fixes it found (`mcycle`, `mtime`→`time`, CBO PMA), 411/418. |
+| `riscv-arch-test` unprivileged suites | `evidence/2026-11-02/arch-test/summary-rv64i.txt` | **833/833** in the 43 `rv64i` suites (I, M, A, F, D, Zfh, Zfa, C, B, scalar crypto, Zicond, Zimop, Zicbo*, counters and others). With Zama16b and the matching reference config, all 1251 pass locally (`summary-zama16b.txt`) and in CI (job `arch-test`). |
+| Official `riscv-tests`, fresh build | `RIVEMU_REQUIRE_RISCV_TESTS=1 cargo test --release -p rivemu-cpu-riscv` | 244/244 from a from-scratch build. Before `b8045b9`, a fresh build failed 22 `-v` tests, and CI passed only from a cache. |
+| Linux device E2E: reboot, NVMe, virtio-gpu/input, vsock, SBI PMU/perf, Snapshot v2 | `RIVEMU_LINUX_DEVICES_TEST=1 cargo test --release -p rivemu-machine --test linux_devices`; `evidence/2026-11-02/linux-devices-e2e.log` | 6/6 with Linux 6.12 + OpenSBI v1.7, locally and in CI (job `linux-devices`, required mode). Snapshot v2 does not contain disk contents (the test shares the backend). |
+| P27–P32 per-suite differential campaigns | `rivemu-lockstep/docs/evidence/2026-11-02-campaigns/summary.txt`, `2026-11-03-campaigns-superblocks/`, `2026-11-09-campaigns-hart-turns/` | 18 suites × {QEMU 11.1.3 `--step-check`, Sail 0.16}: 36/36 PASS, last against the current code (`c5d2c64`) locally and in lockstep CI run 42565376242, which also ran the boot to the shell and Linux with H in trace lockstep with 0 divergences. |
+| Expanded `Suite::Vector` (random LMUL/SEW/mask, segments, indexed, reserved encodings) | `rivemu-lockstep` `3c57b83` | 256 blocks pass against Sail and QEMU after three RVV fixes. |
+| Boot lockstep P16/P26 (OpenSBI v1.7 + Linux 6.12 vs QEMU 11.1.3) | `rivemu-lockstep/docs/evidence/2026-11-02-boot-lockstep/run13-pass-30M-steps.log` | **30,000,000 instructions, 0 divergences** with `--check-csrs` (3M in run 10, 10M in run 12). Each earlier run stopped at a harness configuration difference or a rivemu bug (semihosting, `mstateen` reset); all are fixed. |
+| Trace-driven boot lockstep to the shell prompt | `rivemu-lockstep/docs/evidence/2026-11-03-boot-trace/` | OpenSBI + Linux 6.12 + BusyBox from the firmware entry to `~ # `: 3/3 runs, 358.6–362.8 M instructions each, 0 divergences; CI job `boot-trace` in rivemu-lockstep. |
+| H extension (`-cpu rv64,h=on`) | `rivemu-lockstep/docs/evidence/2026-11-03-h-extension/`; `crates/rivemu-cpu-riscv/tests/hypervisor.rs` | A 160-check test firmware (`rivemu-lockstep/firmware/h_test.S`) passes on QEMU 11.1.3 alone, on rivemu alone, and in trace lockstep (43,107 instructions, 61 exceptions, 4 interrupts, 0 divergences). OpenSBI + Linux with H on both sides reaches the shell prompt in lockstep with 0 divergences (364.9 M instructions). Two injected H bugs are each caught at the first trap they affect. QEMU differs from the spec in ten places around H (for example `mstatus.MPV` is not writable); the firmware's spec build adds 19 checks there, which the Sail model 0.16 and rivemu pass and QEMU fails 11 of. 11 rivemu unit tests cover the same ground. |
+| P17 on Apple Silicon | `evidence/2026-11-03/p17-threshold.txt`, `evidence/2026-11-03/p17-superblocks.txt`, `evidence/2026-11-03/p17-ci-apple-silicon.txt` | `tests/linux_perf.rs` with its own pass rule (20 boots, median **and** p95 under 8 / 10 s) on `macos-latest`, runs 59 to 65: medians 5.02 to 6.85 s SMP1 and 5.72 to 7.35 s SMP4, all under target; the full rule passed for both hart counts in **all 4 runs of the current emulator code** (`64173c6` onward: SMP1 p95 5.36 to 6.60 s, SMP4 p95 6.15 to 8.48 s) and in 6 of 9 runs overall; runs 59, 60 and 62, on earlier code, each missed one p95. The slow boots behind the misses are boots preempted about 10 times as often as the rest (getrusage per boot, run 42566176905). |
+| Sail multi-worker startup | `rivemu-lockstep/docs/evidence/2026-11-02-sail-startup/` | 25/25 clean 6-worker campaigns without the startup lock (was 17/24). |
+| CI hygiene | GitHub Actions on both PRs | `cargo fmt --check`, `clippy -D warnings`, MSRV 1.85, and `cargo deny` (rivemu) pass. rivemu-lockstep now has CI, including the differential suites. |
+
 ## Validation target
 
 - `qemu_rust` base: `f0471ad989d202c9b13341ab9325d1f2fdb2fe40`
@@ -61,17 +83,18 @@ built-in-SBI Linux test both pass with the fix.
 |---|---|---|
 | User-network breadth | Partial | Static ICMP, DHCP DISCOVER/REQUEST/ACK, external A-record resolution, outbound TCP/TLS package download, and TCP/UDP `hostfwd` pass guest E2E. Arbitrary outbound UDP NAT is not separately exercised, and the DNS proxy is synchronous and A-only. |
 | Default Debian 9p coverage | Partial | The downloaded default kernel printed `RUST_9P_MOUNT_ERR=No such device`. The test now reports optional coverage explicitly; `RIVEMU_REQUIRE_9P=1` makes mount/read/write mandatory and passed with the alternate kernel above. |
-| GPU and input guest operation | Partial | PCI enumeration and device unit tests pass; Linux scanout/input behavior is not asserted. |
-| P19 NVMe, vsock, Snapshot v2 exits | Partial | Device-level queue/stream/snapshot tests exist. No retained Linux mount, `AF_VSOCK`, or PCI/QCOW2 restore result proves the stated end-to-end exits. |
-| Poweroff and reboot | Partial | Clean poweroff is asserted. No current guest reboot integration result was retained. |
+| GPU and input guest operation | Verified 2026-11-02 | Linux could not use virtio-gpu at all (wrong command codes, SHM registers); fixed in `2f10801`. `linux_devices` now asserts `/dev/dri/card0`, `/dev/fb0`, the evdev devices, and pixels reaching the scanout. |
+| P19 NVMe, vsock, Snapshot v2 exits | Verified 2026-11-02, except disk state | `linux_devices`: Linux reads and writes NVMe, connects `AF_VSOCK` to CID 2, and NVMe and virtio-pci keep working after save/restore into a fresh machine. Snapshots do not contain disk contents, so no QCOW2 restore is claimed. |
+| Poweroff and reboot | Verified 2026-11-02 | `linux_devices`: `reboot -f` reaches `PowerEvent::Reset`, twice. |
 | SMP4 stability | Partial | The functional SMP4 boots pass and the isolated P17 campaign completed 20/20 SMP4 shell boots, but there is no repeated full device-smoke campaign. |
-| P17 `< 8 s` single-hart / `< 10 s` SMP4 | Failed | An isolated exact-boundary campaign (post-`Machine::new()` to first `~ # `, 2 warmups + 20 recorded samples each) measured SMP1 median/p95 18.905/19.929 s and SMP4 21.103/22.175 s. |
-| `riscv-arch-test` privileged subset | Not verified | No runner result or signature artifact was found. The 244 official `riscv-tests` are a different suite. |
-| Guest PMU/perf | Not verified | Directed PMU semantics pass, but no guest `perf stat` or PMU-overflow integration result was retained. |
-| Boot lockstep P16/P26 | Not verified | The implementation and directed unit tests exist; no retained zero-divergence boot-v3 run was found. |
-| P27-P32 Sail/QEMU differential claims | Partial | Directed CPU tests and the generic `suite=all` campaigns pass, but those campaigns do not prove every explicit per-suite exit. QEMU's ordinary-suite checkpoint comparison can also miss a transient difference overwritten before the checkpoint. |
+| P17 `< 8 s` single-hart / `< 10 s` SMP4 | **Met by the repository's rule on the current code** (4 of 4 CI runs on Apple Silicon; 6 of 9 since the rule was first run, earlier code failed 3 of 5), 2026-11-09 | `docs/PLAN.md` defines the target on Apple Silicon. CI job `p17-bench (macos-latest)` (GitHub's M1-class arm64 runner) runs the P17 fixture (`tests/linux_perf.rs`: Debian inputs, `Machine::new()` to the first `~ # `) for the PR head and its base on the same runner, 9 samples each. Up to `8247296` the ratio to base on macOS stayed at 0.37, so slower runners missed 8 s (8.96 s at `27ddcbf`, base 24.49 s; 8.79 s at `8247296`, base 23.95 s). `21acfa8` (superblocks, a fetch fast TLB, cheaper block chains; `evidence/2026-11-03/p17-superblocks.txt`) cut the P17 boot's host instructions by 15% and the macOS ratio to 0.245: run 41636562098, on the slowest macOS runner so far (base 25.36 / 29.30 s), **6.22 s** SMP1 (p95 7.67; samples 5.76 to 7.67 s) and **7.03 s** SMP4 (p95 11.40: the three round-1 samples, 10.0 to 11.4 s, fell in a slow period of the runner that also shows in base, 30.9 and 34.5 s against 24 to 25 s later; the other six are 6.4 to 7.6 s). Ubuntu runner, same run: 4.96 / 5.47 s (base 20.68 / 23.92 s). A second macOS runner with the same code (`4bbacc7`, run 41640005441): **6.94 s** SMP1 / **6.59 s** SMP4 medians (p95 10.53 / 9.38; the two SMP1 samples above 8 s are again from round 1, which was slow for base too). A third runner (`23d425f`, run 41642509507): **5.92 s** SMP1 (p95 6.46, all 9 samples under 8 s) / **7.15 s** SMP4. Over the three runs, 25 of 27 SMP1 samples are under 8 s and 23 of 27 SMP4 samples under 10 s; every sample above target falls in one round of a job whose base samples are slow at the same time. The repository's own pass rule, run as written in CI (`tests/linux_perf.rs` with `RIVEMU_LINUX_PERF_ASSERT_THRESHOLDS=1`: 2 warm-ups, 20 boots, median and nearest-rank p95), passed for both hart counts in 5 of 8 runs: run 61 (`a51877e`) 5.02 / 5.47 s SMP1 and 5.72 / 5.80 s SMP4 (median / p95), run 63 (`0fddeb1`) 5.37 / 5.67 and 5.75 / 6.03 s, and all three runs of the current code (`64173c6`): 5.48 / 5.69 and 5.79 / 6.15 s, 5.55 / 6.60 and 6.07 / 8.13 s, 5.28 / 5.36 and 6.48 / 7.99 s; run 59 missed the SMP4 p95 (10.87 s), run 60 the SMP1 p95 (8.12 s), run 62 the SMP4 p95 (10.17 s), each from 2 or 3 consecutive slow boots. Those boots executed the same number of guest instructions as the others and did not sleep, and a native calibration loop beside them was only 10 to 18% slower while they took 40 to 100% longer, Since `304f269` every boot also records its CPU time and context switches (getrusage): in run 42566176905 the slow boots had 1,444 to 2,455 involuntary context switches against 87 to 469 for the others, spent only 0.1 to 0.5 s off the CPU, and used about 20% more CPU time for the same guest work, the cost of refilling host caches after each preemption; the register-only calibration loop does not pay it. So the tail is other work on the shared runner preempting the boot thread (`evidence/2026-11-03/p17-threshold.txt`). Earlier rounds are in `evidence/2026-11-03/p17-ci-apple-silicon.txt`; the H code costs +0.095% host instructions with H off (`evidence/2026-11-03/h-extension-cost.txt`). |
+| `riscv-arch-test` privileged subset | Verified 2026-11-02 | 418/418 (`tests/arch-test/README.md`). |
+| Guest PMU/perf | Verified 2026-11-02 (counting) | `linux_devices`: `riscv-pmu-sbi` probes 16 firmware and 31 hardware counters, and `perf_event_open` counts instructions. PMU overflow interrupts are not asserted. |
+| Boot lockstep P16/P26 | **Verified to the shell prompt**, 2026-11-03 | `rivemu-lockstep boot-trace` (QEMU at full speed with a trace plugin; rivemu checks every instruction, mirrors QEMU's interrupts, and takes QEMU's results for device-dependent reads): OpenSBI v1.7 + Linux 6.12 + BusyBox from the firmware entry to `~ # `, three runs of 358.6 M to 362.8 M instructions with 12,129 to 13,077 interrupts, **0 divergences** (`rivemu-lockstep/docs/evidence/2026-11-03-boot-trace/`). An injected `sraiw` bug is caught after 18.2 M instructions. The GDB-stepped `boot` mode reached 30,000,000 instructions with `--check-csrs` on 2026-11-02. Limits: one hart; rivemu runs through `Hart::step`, so the block and inline fast paths are covered by the equivalence tests, riscv-arch-test and the Linux E2E tests instead. |
+| H extension | **Implemented; verified against QEMU and the Sail model**, 2026-11-03 | See the 2026-11-03 table above. Not covered: a KVM guest under Linux; guest external interrupts (GEILEN = 0, no AIA); `htinst`/`mtinst` are always written as 0 (allowed); Sail runs the firmware standalone, not in lockstep; the third-party `riscv-hyp-tests` suite was not run (building it was not permitted in the cloud session). |
+| P27-P32 Sail/QEMU differential claims | Verified per suite 2026-11-02 | All 18 suites pass against Sail and against QEMU with `--step-check`. The Vector suite needed rework first; it had ignored its RNG. |
 | Benchmarks | Partial | The repeated exact-boundary P17 boot benchmark is retained. No CoreMark, Dhrystone, or criterion history was found. |
-| CI hygiene | Partial | `git diff --check` passes, and the changed lockstep Sail file passes targeted `rustfmt --check`. Repo-wide formatting checks fail on broad existing drift, while `clippy -D warnings` stops on five untouched `qemu_rust` vector warnings and three unchanged lockstep QEMU-test warnings. `cargo-deny` is not installed. No broad unrelated rewrite was made. |
+| CI hygiene | Verified 2026-11-02 | Both repositories pass `cargo fmt --check` and `clippy --all-targets -D warnings` in CI, rivemu also MSRV 1.85 and `cargo deny check`, and rivemu-lockstep runs `cargo deny` through `cargo-deny-action`. In the cloud session `cargo-deny` could not be installed locally, so its results come from CI only. |
 
 ## Retained validation transcripts
 
@@ -137,15 +160,25 @@ kernel bug was fixed.
 
 ## Remaining validation work
 
-1. Optimize or revise P17: the exact repeated benchmark now proves that the
-   `< 8 s` SMP1 and `< 10 s` SMP4 targets are not met.
-2. Decide whether CI should supply the 9p-capable kernel and enable
-   `RIVEMU_REQUIRE_9P=1`; local strict mount/read/write evidence is now green.
-3. Add retained guest E2E results for reboot, NVMe, vsock, GPU/input, PMU/perf,
-   and Snapshot v2.
-4. Add an explicit arbitrary outbound-UDP NAT guest test; DHCP/DNS, outbound
-   TCP/TLS, and both TCP/UDP `hostfwd` directions are already covered.
-5. Run the privileged `riscv-arch-test` subset and retain its signatures.
-6. Run final workspace formatting, lint, dependency-policy, and CI checks after
-   the current source changes are settled.
+Ranked; details in [`REVIEW-20261102.md`](REVIEW-20261102.md) §6.
 
+1. P17 passes `tests/linux_perf.rs`'s rule (median and p95 of 20 boots under
+   8 / 10 s) in all 4 CI runs of the current code on GitHub's macOS runners,
+   after 3 misses in 5 runs of earlier code
+   (`evidence/2026-11-03/p17-threshold.txt`). The slow boots on these shared
+   runners are preempted boots (10 to 20 times the involuntary context
+   switches); which process preempts them is not recorded.
+   The slow boots that set the p95 are not explained by guest work, idle
+   time or the calibration loop. Next: more speed headroom, a CPU-time vs
+   wall-time measure per boot, and a run on dedicated Apple hardware.
+2. Trace lockstep: SMP (trace every hart), and a mode that runs rivemu's
+   block path (`Hart::run`) instead of `Hart::step` between records.
+3. H extension: boot a KVM guest under Linux (needs a KVM-enabled kernel
+   and a VMM in the image); guest external interrupts (AIA/IMSIC); run
+   `riscv-hyp-tests`.
+4. riscv-arch-test runs in CI (job `arch-test`, 1251/1251 in run 41568117929; the ELFs are cached by configuration).
+5. `linux_devices` now runs in CI (job `linux-devices`; the images build in
+   about 20 min and are then cached).
+6. Decide whether CI should supply the 9p-capable kernel and enable
+   `RIVEMU_REQUIRE_9P=1`.
+7. Add an explicit arbitrary outbound-UDP NAT guest test.

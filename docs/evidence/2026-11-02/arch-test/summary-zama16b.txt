@@ -1,0 +1,8 @@
+binary: /home/user/rivemu/target/release/rivemu-system-riscv64 (rivemu-system-riscv64 version 0.1.0)
+binary sha256: 9071cd7bd6f03d08f9f74e0d6841586f02d396807d35165cb2e314e3f54c8a4a
+elfs: /home/user/act-work/rivemu-rv64/elfs
+args: -nographic -semihosting -M virt -cpu rv64,smdbltrp=on -bios <elf>; timeout 60s
+total: 1251
+PASS: 1251
+FAIL: 0
+TIMEOUT: 0
