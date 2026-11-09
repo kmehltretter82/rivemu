@@ -27,18 +27,23 @@
 # 62   d287c03  125990729515  5.671 / 6.164  pass      6.873 / 10.175  MISS      FAILED
 # 63   0fddeb1  128973305414  5.366 / 5.671  pass      5.749 /  6.026  pass      ok
 # 64   64173c6  128976557381  5.484 / 5.689  pass      5.786 /  6.151  pass      ok
+# 64b  64173c6  128983965850  5.547 / 6.603  pass      6.070 /  8.131  pass      ok   (re-run, attempt 2)
+# 65   69ac15d  128983572403  5.278 / 5.361  pass      6.482 /  7.987  pass      ok
 #
 # (63 is 0fddeb1: d287c03 plus documentation. 64 is 64173c6: hart turns of
-# 50,000 instructions instead of 10,000, the current emulator code. Runs 63
-# and 64 ran on 2026-11-09, at the same time on two runners.)
+# 50,000 instructions instead of 10,000, the current emulator code; 64b is
+# the same run re-run, and 65 is 69ac15d, 64173c6 plus documentation. Runs
+# 63 to 65 ran on 2026-11-09.)
 #
 # Result: every median is under its target (SMP1 5.02 to 6.85 s, SMP4 5.72 to
-# 7.35 s). The full rule passed for both hart counts in 3 of the 6 runs (61,
-# 63, 64), including the only run of the current code (64). On the code of
-# 07fa5fe (runs 60 to 63) it passed in 2 of 4. So the rule passes on the
-# current code, but one run per commit is not enough to call it robust on
-# GitHub's shared macOS runners: the p95 failed in runs 59, 60 and 62
-# because of 2 or 3 consecutive slow boots in a run. Runs 63 and 64 show
+# 7.35 s). The full rule passed for both hart counts in 5 of the 8 runs, in
+# all 3 runs of the current code (64, 64b, 65; SMP4 p95 6.15, 8.13 and
+# 7.99 s) and in the last 4 runs in a row. On the code of 07fa5fe (runs 60
+# to 63) it passed in 2 of 4: the p95 failed in runs 59, 60 and 62 because
+# of 2 or 3 consecutive slow boots in a run. Three runs are still a small
+# sample on shared runners, and run 64b's compare step had SMP4 boots of
+# 8.3 to 10.0 s, so the tail has not gone away; it stayed under the p95
+# limit in these runs. Runs 63 and 64 show
 # no measurable effect of the hart-turn change on macOS (SMP4 medians 5.749
 # and 5.786 s); the local x86 gain was 5%.
 #
@@ -100,6 +105,20 @@ P17_THRESHOLD,smp=1,threshold_seconds=8.00,median_and_p95_below=true
 P17_RESULT,smp=4,samples_seconds=[5.809744, 6.002385917, 6.150662458, 6.318856584, 5.756402917, 6.036199583, 5.965726541, 5.996558416, 5.98391125, 5.8187175, 5.9153945, 5.673191375, 5.762699458, 5.377230417, 5.752066541, 5.511270792, 5.504310375, 5.503433791, 5.43162525, 5.486388917],median_seconds=5.786222,p95_seconds=6.150662
 P17_THRESHOLD,smp=4,threshold_seconds=10.00,median_and_p95_below=true
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 261.11s
+#
+# run 64b (64173c6, attempt 2)
+P17_RESULT,smp=1,samples_seconds=[5.506435875, 5.536195166, 5.33121675, 5.205356208, 5.479905209, 5.348013042, 5.538634375, 5.614766708, 6.047155833, 6.159157084, 6.375588791, 5.55864025, 5.554459125, 5.380060792, 7.071810792, 6.603433541, 5.9786413750000005, 5.443757125, 5.62309675, 5.3969555],median_seconds=5.546547,p95_seconds=6.603434
+P17_THRESHOLD,smp=1,threshold_seconds=8.00,median_and_p95_below=true
+P17_RESULT,smp=4,samples_seconds=[5.76037075, 5.910365208, 6.237033083, 5.781833542, 5.650897209, 6.078439625, 6.122174583, 6.309560417, 6.221889667, 6.062392708, 6.011648209, 5.788739709, 5.598835667, 6.372947625, 6.079605625, 6.011679083, 5.747150334, 6.835018, 8.130697542, 8.538358416],median_seconds=6.070416,p95_seconds=8.130698
+P17_THRESHOLD,smp=4,threshold_seconds=10.00,median_and_p95_below=true
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 277.63s
+#
+# run 65 (69ac15d)
+P17_RESULT,smp=1,samples_seconds=[5.3581395, 5.246171292, 5.296750333, 5.182835375, 5.293047416, 5.187381916, 5.361390333, 5.206202459, 5.303866042, 5.18486125, 5.299927375, 5.183333292, 5.3140230410000004, 5.295734875, 5.639336833, 5.140333459, 5.279318792, 5.162806583, 5.276395542, 5.2462105],median_seconds=5.277857,p95_seconds=5.361390
+P17_THRESHOLD,smp=1,threshold_seconds=8.00,median_and_p95_below=true
+P17_RESULT,smp=4,samples_seconds=[6.055905833, 7.01387225, 7.987345625, 6.959303333, 6.47492875, 6.729077375, 6.20926775, 7.793930417, 8.222629833, 6.489284541, 5.789207875, 5.952209417, 6.2627602079999996, 6.331980041, 5.923561542, 6.757947833, 6.789074458, 6.3854675, 7.50096525, 6.452671584],median_seconds=6.482107,p95_seconds=7.987346
+P17_THRESHOLD,smp=4,threshold_seconds=10.00,median_and_p95_below=true
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 274.29s
 #
 # run 62, SMP4 samples around the slow pair (P17_SAMPLE / P17_CALIB lines):
 P17_SAMPLE,smp=4,phase=recorded,index=4,insns=1899021901,idle=0.000000,seconds=7.814941
