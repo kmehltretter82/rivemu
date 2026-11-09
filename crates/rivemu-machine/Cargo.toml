@@ -21,3 +21,6 @@ thiserror.workspace = true
 
 [lints]
 workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

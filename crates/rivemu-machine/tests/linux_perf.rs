@@ -67,6 +67,54 @@ struct Boot {
     elapsed: Duration,
     instructions: u64,
     idle: Duration,
+    usage: Usage,
+}
+
+/// Process resource usage over the timed part of one boot. CPU time well
+/// below wall time, or many involuntary context switches, means the boot
+/// thread was not running (another process or VM had the CPU); CPU time
+/// close to wall time means it ran but the CPU did less per second.
+#[derive(Clone, Copy, Default)]
+struct Usage {
+    cpu_seconds: f64,
+    involuntary_switches: i64,
+    voluntary_switches: i64,
+    minor_faults: i64,
+}
+
+#[cfg(unix)]
+// `c_long` is i64 on the CI hosts but narrower on some unix targets.
+#[allow(clippy::unnecessary_cast)]
+fn usage_now() -> Usage {
+    let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage fills the whole struct it is given and returns 0;
+    // RUSAGE_SELF is always a valid target.
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) };
+    assert_eq!(rc, 0, "getrusage failed");
+    // SAFETY: the call succeeded, so every field is initialized.
+    let ru = unsafe { ru.assume_init() };
+    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    Usage {
+        cpu_seconds: secs(ru.ru_utime) + secs(ru.ru_stime),
+        involuntary_switches: ru.ru_nivcsw as i64,
+        voluntary_switches: ru.ru_nvcsw as i64,
+        minor_faults: ru.ru_minflt as i64,
+    }
+}
+
+#[cfg(not(unix))]
+fn usage_now() -> Usage {
+    Usage::default()
+}
+
+fn usage_since(start: Usage) -> Usage {
+    let now = usage_now();
+    Usage {
+        cpu_seconds: now.cpu_seconds - start.cpu_seconds,
+        involuntary_switches: now.involuntary_switches - start.involuntary_switches,
+        voluntary_switches: now.voluntary_switches - start.voluntary_switches,
+        minor_faults: now.minor_faults - start.minor_faults,
+    }
 }
 
 fn boot_to_shell_once(files: &Artifacts, smp: u32, timeout: Duration) -> Boot {
@@ -84,6 +132,7 @@ fn boot_to_shell_once(files: &Artifacts, smp: u32, timeout: Duration) -> Boot {
     .expect("machine init");
 
     // P17 deliberately excludes image loading and machine construction.
+    let usage_start = usage_now();
     let start = Instant::now();
     let mut idle = Duration::ZERO;
     let mut console = String::new();
@@ -95,10 +144,12 @@ fn boot_to_shell_once(files: &Artifacts, smp: u32, timeout: Duration) -> Boot {
         if !bytes.is_empty() {
             console.push_str(&String::from_utf8_lossy(&bytes));
             if console.contains("~ # ") {
+                let elapsed = start.elapsed();
                 return Boot {
-                    elapsed: start.elapsed(),
+                    elapsed,
                     instructions: machine.executed,
                     idle,
+                    usage: usage_since(usage_start),
                 };
             }
             if console.contains("Kernel panic")
@@ -146,10 +197,16 @@ fn timed_boot(files: &Artifacts, smp: u32, timeout: Duration, phase: &str, index
     let boot = boot_to_shell_once(files, smp, timeout);
     let after = calibrate();
     let seconds = boot.elapsed.as_secs_f64();
+    // `seconds=` stays the last field: the scripts read it with `.*seconds=`.
+    let u = boot.usage;
     eprintln!(
-        "P17_SAMPLE,smp={smp},phase={phase},index={index},insns={},idle={:.6},seconds={seconds:.6}",
+        "P17_SAMPLE,smp={smp},phase={phase},index={index},insns={},idle={:.6},cpu={:.6},ivcsw={},vcsw={},minflt={},seconds={seconds:.6}",
         boot.instructions,
-        boot.idle.as_secs_f64()
+        boot.idle.as_secs_f64(),
+        u.cpu_seconds,
+        u.involuntary_switches,
+        u.voluntary_switches,
+        u.minor_faults
     );
     eprintln!(
         "P17_CALIB,smp={smp},phase={phase},index={index},before={before:.6},after={after:.6}"

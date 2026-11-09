@@ -51,7 +51,7 @@ done
 # workload (tests/linux_perf.rs `calibrate`). A boot taken while the runner
 # was slow shows a slow calibration next to it.
 echo
-echo "label smp round index seconds guest_insns idle_s calib_before calib_after (recorded samples; calibration median per label and hart count first)"
+echo "label smp round index seconds guest_insns idle_s cpu_s ivcsw calib_before calib_after (recorded samples; cpu_s is process CPU time and ivcsw involuntary context switches over the boot, '-' where the build does not record them; calibration median per label and hart count first)"
 for spec in "$@"; do
     label="${spec%%=*}"
     for smp in 1 4; do
@@ -61,9 +61,9 @@ for spec in "$@"; do
                 END { if (NR) printf "%s %d calibration median %.3f s, max %.3f s\n", l, s, (NR % 2) ? v[(NR + 1) / 2] : (v[NR / 2] + v[NR / 2 + 1]) / 2, v[NR] }'
         paste -d' ' \
             <(grep "^$label,.*P17_SAMPLE,smp=$smp,phase=recorded" "$samples" \
-                | sed 's/^[^,]*,round=\([0-9]*\),.*index=\([0-9]*\),/\1 \2 /; s/insns=//; s/idle=//; s/seconds=//; s/,/ /g' \
-                | awk '{ if (NF == 3) print $1, $2, $3, "-", "-"; else print $1, $2, $5, $3, $4 }') \
+                | sed 's/^[^,]*,round=\([0-9]*\),.*index=\([0-9]*\),/\1 \2 /; s/insns=//; s/idle=//; s/cpu=//; s/ivcsw=//; s/vcsw=//; s/minflt=//; s/seconds=//; s/,/ /g' \
+                | awk '{ if (NF == 3) print $1, $2, $3, "-", "-", "-", "-"; else if (NF == 5) print $1, $2, $5, $3, $4, "-", "-"; else print $1, $2, $NF, $3, $4, $5, $6 }') \
             <(grep "^$label,.*P17_CALIB,smp=$smp,phase=recorded" "$samples" | sed 's/.*before=//; s/,after=/ /') \
-            | awk -v l="$label" -v s="$smp" '{ print l, s, $1, $2, $3, $4, $5, $6, $7 }'
+            | awk -v l="$label" -v s="$smp" '{ print l, s, $1, $2, $3, $4, $5, $6, $7, $8, $9 }'
     done
 done
