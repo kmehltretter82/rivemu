@@ -29,6 +29,7 @@
 # 64   64173c6  128976557381  5.484 / 5.689  pass      5.786 /  6.151  pass      ok
 # 64b  64173c6  128983965850  5.547 / 6.603  pass      6.070 /  8.131  pass      ok   (re-run, attempt 2)
 # 65   69ac15d  128983572403  5.278 / 5.361  pass      6.482 /  7.987  pass      ok
+# 69   304f269  128993062585  5.264 / 5.453  pass      6.668 /  8.475  pass      ok   (adds getrusage per boot)
 #
 # (63 is 0fddeb1: d287c03 plus documentation. 64 is 64173c6: hart turns of
 # 50,000 instructions instead of 10,000, the current emulator code; 64b is
@@ -36,9 +37,9 @@
 # 63 to 65 ran on 2026-11-09.)
 #
 # Result: every median is under its target (SMP1 5.02 to 6.85 s, SMP4 5.72 to
-# 7.35 s). The full rule passed for both hart counts in 5 of the 8 runs, in
-# all 3 runs of the current code (64, 64b, 65; SMP4 p95 6.15, 8.13 and
-# 7.99 s) and in the last 4 runs in a row. On the code of 07fa5fe (runs 60
+# 7.35 s). The full rule passed for both hart counts in 6 of the 9 runs, in
+# all 4 runs of the current emulator code (64, 64b, 65, 69; SMP4 p95 6.15,
+# 8.13, 7.99 and 8.48 s) and in the last 5 runs in a row. On the code of 07fa5fe (runs 60
 # to 63) it passed in 2 of 4: the p95 failed in runs 59, 60 and 62 because
 # of 2 or 3 consecutive slow boots in a run. Three runs are still a small
 # sample on shared runners, and run 64b's compare step had SMP4 boots of
@@ -138,3 +139,57 @@ P17_SAMPLE,smp=1,phase=recorded,index=1,seconds=8.476548
 P17_CALIB,smp=1,phase=recorded,index=1,before=0.147267,after=0.155302
 P17_SAMPLE,smp=1,phase=recorded,index=2,seconds=6.305263
 P17_CALIB,smp=1,phase=recorded,index=2,before=0.148019,after=0.132338
+#
+# What the slow boots are (304f269, run 42566176905): every P17_SAMPLE line
+# now carries the process CPU time and context switches over the boot
+# (getrusage). The compare step's head boots on macOS:
+#
+#   smp round index  wall s   cpu s   wall-cpu  invol. switches  guest insns
+#   1   1     0      8.654    8.401   0.252     2237             1.985 G
+#   1   1     1      8.419    8.133   0.286     2403             2.010 G
+#   1   1     2      8.078    7.798   0.281     2455             1.982 G
+#   1   2..3  0..2   6.343 to 7.061, cpu within 0.02 s of wall,  87 to 373,  1.929 to 1.968 G
+#   4   1     0      8.978    8.510   0.469     2125             1.931 G
+#   4   1     1      9.325    9.229   0.097     1444             1.944 G
+#   4   1     2      8.698    8.576   0.123     1947             1.911 G
+#   4   3     1      8.593    8.371   0.222     2093             1.917 G
+#   4   other 5      7.650 to 8.832, cpu within 0.04 s of wall,  174 to 469
+#
+# The slow boots are the ones with 10 to 20 times more involuntary context
+# switches: another runnable thread on the VM took the CPU from the boot
+# about 2,000 times instead of about 200. The time spent off the CPU is
+# small (0.1 to 0.5 s); most of the extra wall time is extra CPU time
+# (single-hart 7.80 to 8.40 s against 6.34 to 7.05 s, for guest work within
+# 3%). That is what preemption costs a program whose speed depends on host
+# caches: after each switch, the block cache, TLB tables and guest RAM
+# lines must be fetched again. The calibration loop keeps its state in
+# registers, so it barely slows down, which is why it did not track these
+# boots. The boots clustered in round 1 of the compare step, right after
+# both builds; which process competes is not recorded (a guess would be
+# macOS indexing or scanning the newly built files).
+#
+# run 69 (304f269)
+P17_RESULT,smp=1,samples_seconds=[5.370520417, 5.340633958, 5.221954083, 5.234409625, 5.317469167, 5.222456917, 5.304521875, 5.460140041, 5.182031458, 5.235593417, 5.352355917, 5.275928334, 5.262087417, 5.254596834, 5.231688375, 5.213301959, 5.265518667, 5.25296125, 5.453106958, 5.305402917],median_seconds=5.263803,p95_seconds=5.453107
+P17_THRESHOLD,smp=1,threshold_seconds=8.00,median_and_p95_below=true
+P17_RESULT,smp=4,samples_seconds=[5.553729958, 5.712403208, 7.167457084, 6.135871917, 7.3241075, 8.362756625, 8.645697583, 8.475353917, 7.845958416, 6.671662292, 6.550448333, 6.661009417, 7.363519875, 6.130154375, 6.075250791, 6.789923084, 6.946350042, 6.664654667, 6.430889583, 6.474996375],median_seconds=6.668158,p95_seconds=8.475354
+P17_THRESHOLD,smp=4,threshold_seconds=10.00,median_and_p95_below=true
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 279.43s
+# compare step, per sample (label smp round index seconds guest_insns idle_s cpu_s ivcsw calib_before calib_after):
+head 1 1 0 8.653685 1985389836 0.000000 8.401254 2237 0.166341 0.153736
+head 1 1 1 8.418963 2010344105 0.000000 8.132721 2403 0.140720 0.165157
+head 1 1 2 8.078242 1982317051 0.000000 7.797667 2455 0.160714 0.150898
+head 1 2 0 6.963701 1967835764 0.000000 6.952129 120 0.159532 0.144282
+head 1 2 1 7.061160 1960157820 0.000000 7.047359 373 0.148967 0.149579
+head 1 2 2 6.975999 1963718919 0.000000 6.956787 224 0.150186 0.161490
+head 1 3 0 6.343340 1929238660 0.000000 6.339507 87 0.145350 0.159386
+head 1 3 1 6.648402 1946294135 0.000000 6.642614 179 0.157561 0.156172
+head 1 3 2 6.755880 1966276866 0.000000 6.745051 152 0.146887 0.148370
+head 4 1 0 8.978367 1931198291 0.000000 8.509528 2125 0.150251 0.145028
+head 4 1 1 9.325321 1944115842 0.000000 9.228772 1444 0.146486 0.153871
+head 4 1 2 8.698445 1910799282 0.000000 8.575880 1947 0.156478 0.135060
+head 4 2 0 8.499126 1923576719 0.000000 8.465518 455 0.154005 0.160204
+head 4 2 1 8.446600 1907924130 0.000000 8.425290 469 0.167058 0.149495
+head 4 2 2 7.650286 1908823443 0.000000 7.623021 174 0.149799 0.155804
+head 4 3 0 8.832444 1938531389 0.000000 8.811868 210 0.139078 0.153888
+head 4 3 1 8.592931 1916777348 0.000000 8.370571 2093 0.159881 0.166785
+head 4 3 2 8.334327 1901296443 0.000000 8.320934 183 0.171582 0.158361
