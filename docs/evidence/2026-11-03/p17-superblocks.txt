@@ -101,3 +101,12 @@
 #    under 8 s; SMP4 medians 7.03 / 6.59 / 7.15 s, 23 of 27 samples under
 #    10 s. Every sample above target falls in one round of a job whose base
 #    samples are slow at the same time.
+#
+# 8. After this: typed register fields in block instructions (07fa5fe, -5.1%
+#    host instructions on the from-source boot) and the 20-sample threshold
+#    test as tests/linux_perf.rs defines it, run in CI on macOS with guest
+#    instruction counts, idle time and a calibration loop per boot. Medians
+#    stayed under target in all four runs; the median-and-p95 rule passed for
+#    both hart counts in 1 of 4. The over-target samples above (sections 5
+#    to 7) were called slow periods of the runner; the per-boot controls
+#    added since then do not confirm that: see p17-threshold.txt.

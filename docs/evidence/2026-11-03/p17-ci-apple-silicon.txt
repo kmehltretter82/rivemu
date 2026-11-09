@@ -18,6 +18,13 @@
 # 21acfa8   41636562098    6.224 ( 7.670)      7.026 (11.401)     25.361 / 29.304
 # 4bbacc7   41640005441    6.940 (10.527)      6.593 ( 9.376)     22.045 / 25.250
 # 23d425f   41642509507    5.923 ( 6.456)      7.145 (10.545)     23.834 / 28.110
+# 07fa5fe   41649914819    6.855 ( 8.255)      7.343 ( 8.427)     24.386 / 27.328
+# a51877e   41653070068    5.344 ( 7.004)      5.823 ( 6.520)     19.908 / 22.477
+# d287c03   41657246964    5.663 ( 6.700)      6.336 ( 7.242)     21.214 / 23.848
+#   (07fa5fe: typed register fields; a51877e and d287c03 change only the test
+#   harness. 07fa5fe's medians are recomputed from its per-sample table: that
+#   run's summary line also counted the calibration lines. The same jobs ran
+#   the 20-sample threshold test: p17-threshold.txt.)
 #   (21acfa8: superblocks, fetch fast TLB; see p17-superblocks.txt. Its SMP4 p95
 #   is the round-1 samples, 10.0 to 11.4 s, in a slow period of the runner that
 #   shows in base too.)

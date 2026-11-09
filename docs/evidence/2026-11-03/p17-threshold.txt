@@ -1,0 +1,97 @@
+# P17 threshold test on Apple Silicon (CI job "p17-bench (macos-latest)", step
+# "P17 threshold check on Apple Silicon"), 2026-11-03.
+#
+# The test is tests/linux_perf.rs as the repository defines it, with
+# RIVEMU_LINUX_PERF_ASSERT_THRESHOLDS=1: 2 warm-up boots and 20 recorded boots
+# per hart count (Debian inputs, Machine::new() to the first "~ # "). It
+# passes only if the median AND the nearest-rank p95 are under 8 s
+# (single-hart) and 10 s (-smp 4). Since d287c03 both hart counts run before
+# the test fails; before that, a single-hart miss stopped it (run 60 has no
+# SMP4 result). The step is continue-on-error, so a miss does not fail CI.
+#
+# Controls printed with every sample (since a51877e; calibration since 9f70597):
+#   insns  guest instructions the boot executed (more guest work would show here)
+#   idle   wall time slept with every hart in WFI
+#   calib  a native 60 M-iteration xorshift loop timed before and after the boot
+#
+# Emulator code: 9f70597 = 21acfa8 + docs + calibration; 07fa5fe adds typed
+# register fields in block instructions (-5.1% host instructions on the
+# deterministic from-source boot under callgrind, 20,341 M -> 19,296 M);
+# a51877e and d287c03 change only the test harness and scripts (git diff
+# --stat 07fa5fe d287c03: linux_perf.rs, p17-compare.sh, ci.yml).
+#
+# run  commit   job id        SMP1 median / p95        SMP4 median / p95         result
+# 59   9f70597  125961465566  6.848 / 7.304  pass      7.345 / 10.875  MISS      FAILED
+# 60   07fa5fe  125965029042  5.949 / 8.124  MISS      (not run)                 FAILED
+# 61   a51877e  125976059089  5.017 / 5.468  pass      5.722 /  5.802  pass      ok
+# 62   d287c03  125990729515  5.671 / 6.164  pass      6.873 / 10.175  MISS      FAILED
+#
+# Result: every median is under its target (SMP1 5.02 to 6.85 s, SMP4 5.72 to
+# 7.35 s), and the full rule passed for both hart counts in 1 of the 4 runs.
+# P17 is therefore NOT met as tests/linux_perf.rs defines it on GitHub's
+# shared macOS runners: the p95 fails because of 2 or 3 consecutive slow
+# boots in a run.
+#
+# What the controls show about the slow boots:
+#   run 60, SMP1 recorded 0 and 1 (8.12, 8.48 s; the other 18: 5.31 to 6.57 s):
+#     calibration 0.147 to 0.155 s against 0.12 to 0.15 s for the rest of the
+#     step. That runner was slower overall (compare step: calibration median
+#     0.147 s, base SMP1 24.39 s; run 61: 0.125 s and 19.91 s).
+#   run 62, SMP4 recorded 5 and 6 (10.18, 10.17 s; median 6.87 s):
+#     insns 1,911,595,343 and 1,913,768,435 (the other 18: 1.870 to 1.910 G),
+#     idle 0, calibration 0.150 to 0.157 s against a median of about 0.135 s.
+#   run 59, SMP4 recorded 7, 8 and 9 (10.87, 10.26, 14.57 s): calibration at
+#     most 18% above its median (no instruction counts yet).
+# The guest did the same work and did not sleep. The calibration loop was 10
+# to 18% slower beside these boots, while the boots took 40 to 100% longer
+# than the median, so a uniformly slower CPU does not explain them either. The
+# cause is not identified; a register-only loop does not see memory or cache
+# contention, or a stall on the host. Getting the tail under target on shared
+# runners needs either more speed headroom or a measurement on dedicated
+# Apple hardware; neither is done.
+#
+# Verbatim result lines from the job logs:
+#
+# run 59 (9f70597)
+P17_RESULT,smp=1,samples_seconds=[6.753488625, 6.587932875, 6.939242833, 6.869725375, 6.718346041, 7.304353709, 7.183289958, 7.148819, 7.732150292, 7.120607834, 6.53383175, 6.98569025, 6.651725667, 6.712607542, 6.7487942499999996, 6.664980667, 6.8837019999999995, 6.826022583, 6.706226917, 7.211660834],median_seconds=6.847874,p95_seconds=7.304354
+P17_RESULT,smp=4,samples_seconds=[6.32536525, 6.762012875, 6.393399833, 6.93365, 8.724510542, 7.445772042, 7.947212959, 10.874563292, 10.259365, 14.56601475, 6.141578625, 5.927201917, 6.892501208, 8.322613375, 9.160089083999999, 9.309066333, 7.298931625, 7.179564334, 7.125572666, 7.391896875],median_seconds=7.345414,p95_seconds=10.874563
+thread 'p17_linux_to_shell_benchmark' (61376) panicked at crates/rivemu-machine/tests/linux_perf.rs:200:13:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 343.86s
+#
+# run 60 (07fa5fe)
+P17_RESULT,smp=1,samples_seconds=[8.123511583, 8.476548375, 6.305262791, 5.884897458, 6.020847709, 6.077520708, 6.184142125, 5.954808583, 6.569726458, 5.625545, 5.8461507919999995, 5.651786041, 5.308707708, 5.5565679580000005, 5.45240775, 5.473617542, 5.534936709, 6.562874333, 5.942621042, 6.395429666],median_seconds=5.948715,p95_seconds=8.123512
+thread 'p17_linux_to_shell_benchmark' (57040) panicked at crates/rivemu-machine/tests/linux_perf.rs:200:13:
+P17 smp=1 threshold 8.00s missed: median=5.948715s p95=8.123512s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 143.33s
+#
+# run 61 (a51877e)
+P17_RESULT,smp=1,samples_seconds=[5.169114375, 5.282479416, 5.286203583, 5.090504417, 4.9933228750000005, 5.038968541, 4.972998125, 4.93855475, 4.934211458, 5.19644525, 4.916033, 4.994946792, 4.885660791, 4.980319209, 4.900214166, 5.043750417, 4.955665291, 5.241476292, 5.468410958, 5.851438291],median_seconds=5.016958,p95_seconds=5.468411
+P17_RESULT,smp=4,samples_seconds=[5.786993791, 5.722870209, 5.786371458, 5.569854875, 5.761330667, 5.7072330000000004, 5.626414792, 5.6454785, 5.802299834, 5.766115125, 5.626032041, 5.711421792, 5.776832833, 5.807392084, 5.5616135, 5.740739375, 5.743386875, 5.705423916, 5.72088175, 5.684362041],median_seconds=5.721876,p95_seconds=5.802300
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 250.34s
+#
+# run 62 (d287c03)
+P17_RESULT,smp=1,samples_seconds=[5.577400792, 5.658239417, 5.502854833, 5.660939708, 5.90330025, 5.782221334, 5.864297, 5.554563833, 5.824377, 5.503652625, 5.737117458, 5.885352917, 6.164197042, 5.6978275, 5.652625958, 5.681691375, 5.49495175, 6.243336416, 5.563500416, 5.548983417],median_seconds=5.671316,p95_seconds=6.164197
+P17_THRESHOLD,smp=1,threshold_seconds=8.00,median_and_p95_below=true
+P17_RESULT,smp=4,samples_seconds=[6.338188666, 5.704018375, 5.9057837079999995, 6.755829167, 7.814940791, 10.183287416, 10.174560834, 8.1843675, 6.653249417, 6.8828375, 7.347587083, 6.862274, 6.242068917, 6.853346625, 6.843009917, 7.234641958, 6.938216875, 7.105232167, 7.00398125, 6.797631958],median_seconds=6.872556,p95_seconds=10.174561
+P17_THRESHOLD,smp=4,threshold_seconds=10.00,median_and_p95_below=false
+thread 'p17_linux_to_shell_benchmark' (50969) panicked at crates/rivemu-machine/tests/linux_perf.rs:234:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 294.65s
+#
+# run 62, SMP4 samples around the slow pair (P17_SAMPLE / P17_CALIB lines):
+P17_SAMPLE,smp=4,phase=recorded,index=4,insns=1899021901,idle=0.000000,seconds=7.814941
+P17_CALIB,smp=4,phase=recorded,index=4,before=0.149763,after=0.140678
+P17_SAMPLE,smp=4,phase=recorded,index=5,insns=1911595343,idle=0.000000,seconds=10.183287
+P17_CALIB,smp=4,phase=recorded,index=5,before=0.156610,after=0.149554
+P17_SAMPLE,smp=4,phase=recorded,index=6,insns=1913768435,idle=0.000000,seconds=10.174561
+P17_CALIB,smp=4,phase=recorded,index=6,before=0.152328,after=0.150596
+P17_SAMPLE,smp=4,phase=recorded,index=7,insns=1910276878,idle=0.000000,seconds=8.184368
+P17_CALIB,smp=4,phase=recorded,index=7,before=0.151289,after=0.131927
+P17_SAMPLE,smp=4,phase=recorded,index=8,insns=1899943920,idle=0.000000,seconds=6.653249
+P17_CALIB,smp=4,phase=recorded,index=8,before=0.135274,after=0.133397
+#
+# run 60, SMP1 calibration beside the two slow boots (index 0's line is not in
+# the excerpt fetched; index 1 onward):
+P17_SAMPLE,smp=1,phase=recorded,index=1,seconds=8.476548
+P17_CALIB,smp=1,phase=recorded,index=1,before=0.147267,after=0.155302
+P17_SAMPLE,smp=1,phase=recorded,index=2,seconds=6.305263
+P17_CALIB,smp=1,phase=recorded,index=2,before=0.148019,after=0.132338
