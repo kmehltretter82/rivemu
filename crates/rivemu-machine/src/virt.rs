@@ -76,8 +76,12 @@ pub const VIRTIO_IRQ: u32 = 1;
 pub const PCIE_IRQ: u32 = 32;
 /// Number of PLIC sources (including the reserved source 0).
 pub const PLIC_NUM_SOURCES: usize = 96;
-/// Instructions each hart executes per scheduling slice.
-pub const QUANTUM: u64 = 10_000;
+/// Instructions each hart executes per scheduling slice. The harts take
+/// turns on one host thread; each turn reloads that hart's block cache and
+/// TLB tables into the host caches, so a short turn costs host time. At
+/// 50,000 a turn is about 0.2 ms of guest time on a 250 MIPS host, still far
+/// below QEMU's round-robin slice and a Linux timer tick.
+pub const QUANTUM: u64 = 50_000;
 /// Longest time the machine loop sleeps while all harts are idle.
 pub const MAX_IDLE: Duration = Duration::from_millis(10);
 
