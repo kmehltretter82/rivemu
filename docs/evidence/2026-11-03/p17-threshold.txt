@@ -25,12 +25,22 @@
 # 60   07fa5fe  125965029042  5.949 / 8.124  MISS      (not run)                 FAILED
 # 61   a51877e  125976059089  5.017 / 5.468  pass      5.722 /  5.802  pass      ok
 # 62   d287c03  125990729515  5.671 / 6.164  pass      6.873 / 10.175  MISS      FAILED
+# 63   0fddeb1  128973305414  5.366 / 5.671  pass      5.749 /  6.026  pass      ok
+# 64   64173c6  128976557381  5.484 / 5.689  pass      5.786 /  6.151  pass      ok
+#
+# (63 is 0fddeb1: d287c03 plus documentation. 64 is 64173c6: hart turns of
+# 50,000 instructions instead of 10,000, the current emulator code. Runs 63
+# and 64 ran on 2026-11-09, at the same time on two runners.)
 #
 # Result: every median is under its target (SMP1 5.02 to 6.85 s, SMP4 5.72 to
-# 7.35 s), and the full rule passed for both hart counts in 1 of the 4 runs.
-# P17 is therefore NOT met as tests/linux_perf.rs defines it on GitHub's
-# shared macOS runners: the p95 fails because of 2 or 3 consecutive slow
-# boots in a run.
+# 7.35 s). The full rule passed for both hart counts in 3 of the 6 runs (61,
+# 63, 64), including the only run of the current code (64). On the code of
+# 07fa5fe (runs 60 to 63) it passed in 2 of 4. So the rule passes on the
+# current code, but one run per commit is not enough to call it robust on
+# GitHub's shared macOS runners: the p95 failed in runs 59, 60 and 62
+# because of 2 or 3 consecutive slow boots in a run. Runs 63 and 64 show
+# no measurable effect of the hart-turn change on macOS (SMP4 medians 5.749
+# and 5.786 s); the local x86 gain was 5%.
 #
 # What the controls show about the slow boots:
 #   run 60, SMP1 recorded 0 and 1 (8.12, 8.48 s; the other 18: 5.31 to 6.57 s):
@@ -76,6 +86,20 @@ P17_RESULT,smp=4,samples_seconds=[6.338188666, 5.704018375, 5.9057837079999995, 
 P17_THRESHOLD,smp=4,threshold_seconds=10.00,median_and_p95_below=false
 thread 'p17_linux_to_shell_benchmark' (50969) panicked at crates/rivemu-machine/tests/linux_perf.rs:234:5:
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 294.65s
+#
+# run 63 (0fddeb1)
+P17_RESULT,smp=1,samples_seconds=[5.432456625, 5.671021583, 5.468778084, 5.273965333, 5.44152375, 5.286350583, 5.513682375, 5.222403334, 5.351803167, 5.2687677090000005, 5.380510375, 5.39421125, 5.301932708, 5.344521209, 5.3794175, 5.316733833, 5.700025375, 5.348411834, 5.325303041, 5.463234833],median_seconds=5.365610,p95_seconds=5.671022
+P17_THRESHOLD,smp=1,threshold_seconds=8.00,median_and_p95_below=true
+P17_RESULT,smp=4,samples_seconds=[6.168586042, 6.025882916, 5.84109425, 5.629054459, 5.969238375, 5.678544208, 5.90970025, 5.7700255, 5.787488834, 5.728346334, 5.706655167, 5.815683333, 5.721135916, 5.862611334, 5.715011625, 5.71760675, 5.686623667, 5.626725792, 5.880170584, 5.639494083],median_seconds=5.749186,p95_seconds=6.025883
+P17_THRESHOLD,smp=4,threshold_seconds=10.00,median_and_p95_below=true
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 258.61s
+#
+# run 64 (64173c6)
+P17_RESULT,smp=1,samples_seconds=[5.6057982079999995, 5.304138584, 5.2916795, 5.379053709, 5.478044208, 5.602823875, 5.531601, 5.610098542, 5.483670042, 5.564710458, 5.43380525, 5.689159917, 5.910158667, 5.538949167, 5.449048375, 5.483161792, 5.484116834, 5.456496667, 5.5214353339999995, 5.472225416],median_seconds=5.483893,p95_seconds=5.689160
+P17_THRESHOLD,smp=1,threshold_seconds=8.00,median_and_p95_below=true
+P17_RESULT,smp=4,samples_seconds=[5.809744, 6.002385917, 6.150662458, 6.318856584, 5.756402917, 6.036199583, 5.965726541, 5.996558416, 5.98391125, 5.8187175, 5.9153945, 5.673191375, 5.762699458, 5.377230417, 5.752066541, 5.511270792, 5.504310375, 5.503433791, 5.43162525, 5.486388917],median_seconds=5.786222,p95_seconds=6.150662
+P17_THRESHOLD,smp=4,threshold_seconds=10.00,median_and_p95_below=true
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 261.11s
 #
 # run 62, SMP4 samples around the slow pair (P17_SAMPLE / P17_CALIB lines):
 P17_SAMPLE,smp=4,phase=recorded,index=4,insns=1899021901,idle=0.000000,seconds=7.814941

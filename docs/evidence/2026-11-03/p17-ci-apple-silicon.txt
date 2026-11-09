@@ -21,8 +21,12 @@
 # 07fa5fe   41649914819    6.855 ( 8.255)      7.343 ( 8.427)     24.386 / 27.328
 # a51877e   41653070068    5.344 ( 7.004)      5.823 ( 6.520)     19.908 / 22.477
 # d287c03   41657246964    5.663 ( 6.700)      6.336 ( 7.242)     21.214 / 23.848
+# 0fddeb1   42559737622    6.412 ( 9.248)      7.014 ( 7.719)     23.264 / 25.074
+# 64173c6   42560799243    5.708 ( 9.087)      6.065 ( 7.749)     20.661 / 24.425
 #   (07fa5fe: typed register fields; a51877e and d287c03 change only the test
-#   harness. 07fa5fe's medians are recomputed from its per-sample table: that
+#   harness; 0fddeb1 only documentation; 64173c6 gives each hart 50,000
+#   instructions per turn. 0fddeb1's SMP1 median is computed from its per-sample
+#   table, as is 07fa5fe's: that
 #   run's summary line also counted the calibration lines. The same jobs ran
 #   the 20-sample threshold test: p17-threshold.txt.)
 #   (21acfa8: superblocks, fetch fast TLB; see p17-superblocks.txt. Its SMP4 p95

@@ -110,3 +110,20 @@
 #    both hart counts in 1 of 4. The over-target samples above (sections 5
 #    to 7) were called slow periods of the runner; the per-boot controls
 #    added since then do not confirm that: see p17-threshold.txt.
+#
+# 9. 64173c6 (2026-11-09): a hart turn of 50,000 instructions instead of
+#    10,000. The harts take turns on one host thread. From-source boot,
+#    local x86 host:
+#      callgrind, -icount shift=3: -smp 1 19.71 G host instructions for
+#        366 M guest; -smp 4 22.68 G for 397 M (+6% per guest instruction)
+#      wall time: -smp 4 ran at about 180 MIPS against 225 MIPS at -smp 1,
+#        so most of the -smp 4 gap is host cache behavior, not work
+#      interleaved A/B, -smp 4, 8 rounds: 10,000 median 2.615 s (188 MIPS,
+#        499.7 M guest instructions); 50,000 median 2.480 s (201 MIPS,
+#        497.9 M), faster in 7 of 8 pairs; 200,000 no faster, +2.6% guest
+#        instructions; -smp 1 2.10 s vs 2.06 s
+#    Workspace tests and Linux device E2E 6/6 pass.
+#    macOS CI, at the same time on two runners: run 63 (0fddeb1, 10,000)
+#    SMP4 threshold-test median 5.749 s, run 64 (64173c6, 50,000) 5.786 s:
+#    no measurable effect on Apple Silicon. Both runs passed the
+#    median-and-p95 rule (p17-threshold.txt).
